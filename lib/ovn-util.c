@@ -350,6 +350,32 @@ default_sb_db(void)
     return def;
 }
 
+const char *
+default_ic_nb_db(void)
+{
+    static char *def;
+    if (!def) {
+        def = getenv("OVN_IC_NB_DB");
+        if (!def) {
+            def = xasprintf("unix:%s/ovn_ic_nb_db.sock", ovn_rundir());
+        }
+    }
+    return def;
+}
+
+const char *
+default_ic_sb_db(void)
+{
+    static char *def;
+    if (!def) {
+        def = getenv("OVN_IC_SB_DB");
+        if (!def) {
+            def = xasprintf("unix:%s/ovn_ic_sb_db.sock", ovn_rundir());
+        }
+    }
+    return def;
+}
+
 char *
 get_abs_unix_ctl_path(void)
 {
@@ -378,6 +404,7 @@ static const char *OVN_NB_LSP_TYPES[] = {
     "vtep",
     "external",
     "virtual",
+    "remote",
 };
 
 bool
@@ -422,4 +449,103 @@ ovn_logical_flow_hash(const struct uuid *logical_datapath,
     hash = hash_string(pipeline, hash);
     hash = hash_string(match, hash);
     return hash_string(actions, hash);
+}
+
+bool
+datapath_is_switch(const struct sbrec_datapath_binding *ldp)
+{
+    return smap_get(&ldp->external_ids, "logical-switch") != NULL;
+}
+
+struct tnlid_node {
+    struct hmap_node hmap_node;
+    uint32_t tnlid;
+};
+
+void
+ovn_destroy_tnlids(struct hmap *tnlids)
+{
+    struct tnlid_node *node;
+    HMAP_FOR_EACH_POP (node, hmap_node, tnlids) {
+        free(node);
+    }
+    hmap_destroy(tnlids);
+}
+
+void
+ovn_add_tnlid(struct hmap *set, uint32_t tnlid)
+{
+    struct tnlid_node *node = xmalloc(sizeof *node);
+    hmap_insert(set, &node->hmap_node, hash_int(tnlid, 0));
+    node->tnlid = tnlid;
+}
+
+bool
+ovn_tnlid_in_use(const struct hmap *set, uint32_t tnlid)
+{
+    const struct tnlid_node *node;
+    HMAP_FOR_EACH_IN_BUCKET (node, hmap_node, hash_int(tnlid, 0), set) {
+        if (node->tnlid == tnlid) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static uint32_t
+next_tnlid(uint32_t tnlid, uint32_t min, uint32_t max)
+{
+    return tnlid + 1 <= max ? tnlid + 1 : min;
+}
+
+uint32_t
+ovn_allocate_tnlid(struct hmap *set, const char *name, uint32_t min,
+                   uint32_t max, uint32_t *hint)
+{
+    for (uint32_t tnlid = next_tnlid(*hint, min, max); tnlid != *hint;
+         tnlid = next_tnlid(tnlid, min, max)) {
+        if (!ovn_tnlid_in_use(set, tnlid)) {
+            ovn_add_tnlid(set, tnlid);
+            *hint = tnlid;
+            return tnlid;
+        }
+    }
+
+    static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 1);
+    VLOG_WARN_RL(&rl, "all %s tunnel ids exhausted", name);
+    return 0;
+}
+
+char *
+ovn_chassis_redirect_name(const char *port_name)
+{
+    return xasprintf("cr-%s", port_name);
+}
+
+bool
+ip46_parse_cidr(const char *str, struct v46_ip *prefix, unsigned int *plen)
+{
+    memset(prefix, 0, sizeof *prefix);
+
+    char *error = ip_parse_cidr(str, &prefix->ipv4, plen);
+    if (!error) {
+        prefix->family = AF_INET;
+        return true;
+    }
+    free(error);
+    error = ipv6_parse_cidr(str, &prefix->ipv6, plen);
+    if (!error) {
+        prefix->family = AF_INET6;
+        return true;
+    }
+    free(error);
+    return false;
+}
+
+bool
+ip46_equals(const struct v46_ip *addr1, const struct v46_ip *addr2)
+{
+    return (addr1->family == addr2->family &&
+            (addr1->family == AF_INET ? addr1->ipv4 == addr2->ipv4 :
+             IN6_ARE_ADDR_EQUAL(&addr1->ipv6, &addr2->ipv6)));
 }

@@ -263,7 +263,7 @@ static void ip_mcast_sync(
     struct ovsdb_idl_index *sbrec_igmp_groups,
     struct ovsdb_idl_index *sbrec_ip_multicast)
     OVS_REQUIRES(pinctrl_mutex);
-static void pinctrl_ip_mcast_handle_igmp(
+static void pinctrl_ip_mcast_handle(
     struct rconn *swconn,
     const struct flow *ip_flow,
     struct dp_packet *pkt_in,
@@ -299,6 +299,19 @@ static void svc_monitors_run(struct rconn *swconn,
                              long long int *svc_monitors_next_run_time)
     OVS_REQUIRES(pinctrl_mutex);
 static void svc_monitors_wait(long long int svc_monitors_next_run_time);
+
+static void pinctrl_compose_ipv4(struct dp_packet *packet,
+                                 struct eth_addr eth_src,
+                                 struct eth_addr eth_dst, ovs_be32 ipv4_src,
+                                 ovs_be32 ipv4_dst, uint8_t ip_proto,
+                                 uint8_t ttl, uint16_t ip_payload_len);
+static void pinctrl_compose_ipv6(struct dp_packet *packet,
+                                 struct eth_addr eth_src,
+                                 struct eth_addr eth_dst,
+                                 struct in6_addr *ipv6_src,
+                                 struct in6_addr *ipv6_dst,
+                                 uint8_t ip_proto, uint8_t ttl,
+                                 uint16_t ip_payload_len);
 
 COVERAGE_DEFINE(pinctrl_drop_put_mac_binding);
 COVERAGE_DEFINE(pinctrl_drop_buffered_packets_map);
@@ -546,6 +559,7 @@ set_actions_and_enqueue_msg(struct rconn *swconn,
 
 struct buffer_info {
     struct ofpbuf ofpacts;
+    ofp_port_t ofp_port;
     struct dp_packet *p;
 };
 
@@ -616,6 +630,8 @@ buffered_push_packet(struct buffered_packets *bp,
     ofpbuf_init(&bi->ofpacts, 4096);
 
     reload_metadata(&bi->ofpacts, md);
+    bi->ofp_port = md->flow.in_port.ofp_port;
+
     struct ofpact_resubmit *resubmit = ofpact_put_RESUBMIT(&bi->ofpacts);
     resubmit->in_port = OFPP_CONTROLLER;
     resubmit->table_id = OFTABLE_REMOTE_OUTPUT;
@@ -650,7 +666,7 @@ buffered_send_packets(struct rconn *swconn, struct buffered_packets *bp,
             .ofpacts = bi->ofpacts.data,
             .ofpacts_len = bi->ofpacts.size,
         };
-        match_set_in_port(&po.flow_metadata, OFPP_CONTROLLER);
+        match_set_in_port(&po.flow_metadata, bi->ofp_port);
         queue_msg(swconn, ofputil_encode_packet_out(&po, proto));
 
         ofpbuf_uninit(&bi->ofpacts);
@@ -911,60 +927,49 @@ pinctrl_handle_tcp_reset(struct rconn *swconn, const struct flow *ip_flow,
     struct dp_packet packet;
 
     dp_packet_use_stub(&packet, packet_stub, sizeof packet_stub);
-    dp_packet_clear(&packet);
     packet.packet_type = htonl(PT_ETH);
-
-    struct eth_header *eh = dp_packet_put_zeros(&packet, sizeof *eh);
-    eh->eth_dst = ip_flow->dl_dst;
-    eh->eth_src = ip_flow->dl_src;
-
     if (get_dl_type(ip_flow) == htons(ETH_TYPE_IPV6)) {
-        struct ip6_hdr *nh = dp_packet_put_zeros(&packet, sizeof *nh);
-
-        eh->eth_type = htons(ETH_TYPE_IPV6);
-        dp_packet_set_l3(&packet, nh);
-        nh->ip6_vfc = 0x60;
-        nh->ip6_nxt = IPPROTO_TCP;
-        nh->ip6_plen = htons(TCP_HEADER_LEN);
-        packet_set_ipv6(&packet, &ip_flow->ipv6_src, &ip_flow->ipv6_dst,
-                        ip_flow->nw_tos, ip_flow->ipv6_label, 255);
+        pinctrl_compose_ipv6(&packet, ip_flow->dl_src, ip_flow->dl_dst,
+                             (struct in6_addr *)&ip_flow->ipv6_src,
+                             (struct in6_addr *)&ip_flow->ipv6_dst,
+                             IPPROTO_TCP, 63, TCP_HEADER_LEN);
     } else {
-        struct ip_header *nh = dp_packet_put_zeros(&packet, sizeof *nh);
-
-        eh->eth_type = htons(ETH_TYPE_IP);
-        dp_packet_set_l3(&packet, nh);
-        nh->ip_ihl_ver = IP_IHL_VER(5, 4);
-        nh->ip_tot_len = htons(IP_HEADER_LEN + TCP_HEADER_LEN);
-        nh->ip_proto = IPPROTO_TCP;
-        nh->ip_frag_off = htons(IP_DF);
-        packet_set_ipv4(&packet, ip_flow->nw_src, ip_flow->nw_dst,
-                        ip_flow->nw_tos, 255);
+        pinctrl_compose_ipv4(&packet, ip_flow->dl_src, ip_flow->dl_dst,
+                             ip_flow->nw_src, ip_flow->nw_dst,
+                             IPPROTO_TCP, 63, TCP_HEADER_LEN);
     }
 
     struct tcp_header *th = dp_packet_put_zeros(&packet, sizeof *th);
-    struct tcp_header *tcp_in = dp_packet_l4(pkt_in);
     dp_packet_set_l4(&packet, th);
-    th->tcp_ctl = TCP_CTL(TCP_RST, 5);
-    if (ip_flow->tcp_flags & htons(TCP_ACK)) {
-        th->tcp_seq = tcp_in->tcp_ack;
+    th->tcp_dst = ip_flow->tp_src;
+    th->tcp_src = ip_flow->tp_dst;
+
+    th->tcp_ctl = htons((5 << 12) | TCP_RST | TCP_ACK);
+    put_16aligned_be32(&th->tcp_seq, 0);
+
+    struct tcp_header *tcp_in = dp_packet_l4(pkt_in);
+    uint32_t tcp_seq = ntohl(get_16aligned_be32(&tcp_in->tcp_seq)) + 1;
+    put_16aligned_be32(&th->tcp_ack, htonl(tcp_seq));
+
+    uint32_t csum;
+    if (get_dl_type(ip_flow) == htons(ETH_TYPE_IPV6)) {
+        csum = packet_csum_pseudoheader6(dp_packet_l3(&packet));
     } else {
-        uint32_t tcp_seq, ack_seq, tcp_len;
-
-        tcp_seq = ntohl(get_16aligned_be32(&tcp_in->tcp_seq));
-        tcp_len = TCP_OFFSET(tcp_in->tcp_ctl) * 4;
-        ack_seq = tcp_seq + dp_packet_l4_size(pkt_in) - tcp_len;
-        put_16aligned_be32(&th->tcp_ack, htonl(ack_seq));
-        put_16aligned_be32(&th->tcp_seq, 0);
+        csum = packet_csum_pseudoheader(dp_packet_l3(&packet));
     }
-    packet_set_tcp_port(&packet, ip_flow->tp_dst, ip_flow->tp_src);
-
-    if (ip_flow->vlans[0].tci & htons(VLAN_CFI)) {
-        eth_push_vlan(&packet, htons(ETH_TYPE_VLAN_8021Q),
-                      ip_flow->vlans[0].tci);
-    }
+    csum = csum_continue(csum, th, dp_packet_size(&packet) -
+                        ((const unsigned char *)th -
+                        (const unsigned char *)dp_packet_eth(&packet)));
+    th->tcp_csum = csum_finish(csum);
 
     set_actions_and_enqueue_msg(swconn, &packet, md, userdata);
     dp_packet_uninit(&packet);
+}
+
+static bool
+is_dhcp_flags_broadcast(ovs_be16 flags)
+{
+    return flags & htons(DHCP_BROADCAST_FLAG);
 }
 
 /* Called with in the pinctrl_handler thread context. */
@@ -1191,7 +1196,16 @@ pinctrl_handle_put_dhcp_opts(
 
     udp->udp_len = htons(new_l4_size);
 
+    /* Send a broadcast IP frame when BROADCAST flag is set. */
     struct ip_header *out_ip = dp_packet_l3(&pkt_out);
+    ovs_be32 ip_dst;
+    if (!is_dhcp_flags_broadcast(dhcp_data->flags)) {
+        ip_dst = *offer_ip;
+    } else {
+        ip_dst = htonl(0xffffffff);
+    }
+    put_16aligned_be32(&out_ip->ip_dst, ip_dst);
+
     out_ip->ip_tot_len = htons(pkt_out.l4_ofs - pkt_out.l3_ofs + new_l4_size);
     udp->udp_csum = 0;
     /* Checksum needs to be initialized to zero. */
@@ -1908,8 +1922,8 @@ process_packet_in(struct rconn *swconn, const struct ofp_header *msg)
                            &userdata);
         break;
     case ACTION_OPCODE_IGMP:
-        pinctrl_ip_mcast_handle_igmp(swconn, &headers, &packet,
-                                     &pin.flow_metadata, &userdata);
+        pinctrl_ip_mcast_handle(swconn, &headers, &packet, &pin.flow_metadata,
+                                &userdata);
         break;
 
     case ACTION_OPCODE_PUT_ARP:
@@ -2413,13 +2427,14 @@ packet_put_ra_rdnss_opt(struct dp_packet *b, uint8_t num,
 
 static void
 packet_put_ra_dnssl_opt(struct dp_packet *b, ovs_be32 lifetime,
-                        char *dnssl_list)
+                        char *dnssl_data)
 {
+    char *dnssl_list, *t0, *r0 = NULL, dnssl[255] = {};
     size_t prev_l4_size = dp_packet_l4_size(b);
     size_t size = sizeof(struct ovs_nd_dnssl);
-    struct ip6_hdr *nh = dp_packet_l3(b);
-    char *t0, *r0 = NULL, dnssl[255] = {};
     int i = 0;
+
+    dnssl_list = xstrdup(dnssl_data);
 
     /* Multiple DNS Search List must be 'comma' separated
      * (e.g. "a.b.c, d.e.f"). Domain names must be encoded
@@ -2433,7 +2448,7 @@ packet_put_ra_dnssl_opt(struct dp_packet *b, ovs_be32 lifetime,
 
         size += strlen(t0) + 2;
         if (size > sizeof(dnssl)) {
-            return;
+            goto out;
         }
 
         for (t1 = strtok_r(t0, ".", &r1); t1;
@@ -2445,6 +2460,8 @@ packet_put_ra_dnssl_opt(struct dp_packet *b, ovs_be32 lifetime,
         dnssl[i++] = 0;
     }
     size = ROUND_UP(size, 8);
+
+    struct ip6_hdr *nh = dp_packet_l3(b);
     nh->ip6_plen = htons(prev_l4_size + size);
 
     struct ovs_nd_dnssl *nd_dnssl = dp_packet_put_uninit(b, sizeof *nd_dnssl);
@@ -2460,16 +2477,19 @@ packet_put_ra_dnssl_opt(struct dp_packet *b, ovs_be32 lifetime,
     uint32_t icmp_csum = packet_csum_pseudoheader6(dp_packet_l3(b));
     ra->icmph.icmp6_cksum = csum_finish(csum_continue(icmp_csum, ra,
                                                       prev_l4_size + size));
+out:
+    free(dnssl_list);
 }
 
 static void
 packet_put_ra_route_info_opt(struct dp_packet *b, ovs_be32 lifetime,
-                             char *route_list)
+                             char *route_data)
 {
     size_t prev_l4_size = dp_packet_l4_size(b);
-    struct ip6_hdr *nh = dp_packet_l3(b);
-    char *t0, *r0 = NULL;
+    char *route_list, *t0, *r0 = NULL;
     size_t size = 0;
+
+    route_list = xstrdup(route_data);
 
     for (t0 = strtok_r(route_list, ",", &r0); t0;
          t0 = strtok_r(NULL, ",", &r0)) {
@@ -2480,7 +2500,7 @@ packet_put_ra_route_info_opt(struct dp_packet *b, ovs_be32 lifetime,
         for (t1 = strtok_r(t0, "-", &r1), index = 0; t1;
              t1 = strtok_r(NULL, "-", &r1), index++) {
 
-            nd_rinfo.type = ND_OPT_ROUTE_INFO;
+            nd_rinfo.type = ND_OPT_ROUTE_INFO_TYPE;
             nd_rinfo.route_lifetime = lifetime;
 
             switch (index) {
@@ -2498,11 +2518,11 @@ packet_put_ra_route_info_opt(struct dp_packet *b, ovs_be32 lifetime,
                 uint8_t plen;
 
                 if (!extract_ip_addresses(t1, &route)) {
-                    return;
+                    goto out;
                 }
                 if (!route.n_ipv6_addrs) {
                     destroy_lport_addresses(&route);
-                    return;
+                    goto out;
                 }
 
                 nd_rinfo.prefix_len = route.ipv6_addrs->plen;
@@ -2517,17 +2537,20 @@ packet_put_ra_route_info_opt(struct dp_packet *b, ovs_be32 lifetime,
                 break;
             }
             default:
-                return;
+                goto out;
             }
         }
     }
 
+    struct ip6_hdr *nh = dp_packet_l3(b);
     nh->ip6_plen = htons(prev_l4_size + size);
     struct ovs_ra_msg *ra = dp_packet_l4(b);
     ra->icmph.icmp6_cksum = 0;
     uint32_t icmp_csum = packet_csum_pseudoheader6(dp_packet_l3(b));
     ra->icmph.icmp6_cksum = csum_finish(csum_continue(icmp_csum, ra,
                                                       prev_l4_size + size));
+out:
+    free(route_list);
 }
 
 /* Called with in the pinctrl_handler thread context. */
@@ -2567,11 +2590,11 @@ ipv6_ra_send(struct rconn *swconn, struct ipv6_ra_state *ra)
     }
     if (ra->config->dnssl.length) {
         packet_put_ra_dnssl_opt(&packet, htonl(0xffffffff),
-                                ra->config->dnssl.string);
+                                ds_cstr(&ra->config->dnssl));
     }
     if (ra->config->route_info.length) {
         packet_put_ra_route_info_opt(&packet, htonl(0xffffffff),
-                                     ra->config->route_info.string);
+                                     ds_cstr(&ra->config->route_info));
     }
 
     uint64_t ofpacts_stub[4096 / 8];
@@ -2948,10 +2971,17 @@ run_buffered_binding(struct ovsdb_idl_index *sbrec_mac_binding_by_lport_ip,
     bool notify = false;
 
     HMAP_FOR_EACH (ld, hmap_node, local_datapaths) {
+        /* MAC_Binding.logical_port will always belong to a
+         * a router datapath. Hence we can skip logical switch
+         * datapaths.
+         * */
+        if (datapath_is_switch(ld->datapath)) {
+            continue;
+        }
 
-        for (size_t i = 0; i < ld->n_ports; i++) {
+        for (size_t i = 0; i < ld->n_peer_ports; i++) {
 
-            const struct sbrec_port_binding *pb = ld->ports[i];
+            const struct sbrec_port_binding *pb = ld->peer_ports[i].local;
             struct buffered_packets *cur_qp, *next_qp;
             HMAP_FOR_EACH_SAFE (cur_qp, next_qp, hmap_node,
                                 &buffered_packets_map) {
@@ -3189,24 +3219,47 @@ pinctrl_compose_ipv4(struct dp_packet *packet, struct eth_addr eth_src,
     packet->packet_type = htonl(PT_ETH);
 
     struct eth_header *eh = dp_packet_put_zeros(packet, sizeof *eh);
-    eh->eth_dst = eth_dst;
-    eh->eth_src = eth_src;
-
     struct ip_header *nh = dp_packet_put_zeros(packet, sizeof *nh);
 
+    eh->eth_dst = eth_dst;
+    eh->eth_src = eth_src;
     eh->eth_type = htons(ETH_TYPE_IP);
     dp_packet_set_l3(packet, nh);
     nh->ip_ihl_ver = IP_IHL_VER(5, 4);
-    nh->ip_tot_len = htons(sizeof(struct ip_header) + ip_payload_len);
+    nh->ip_tot_len = htons(sizeof *nh + ip_payload_len);
     nh->ip_tos = IP_DSCP_CS6;
     nh->ip_proto = ip_proto;
     nh->ip_frag_off = htons(IP_DF);
 
-    /* Setting tos and ttl to 0 and 1 respectively. */
     packet_set_ipv4(packet, ipv4_src, ipv4_dst, 0, ttl);
 
     nh->ip_csum = 0;
     nh->ip_csum = csum(nh, sizeof *nh);
+}
+
+static void
+pinctrl_compose_ipv6(struct dp_packet *packet, struct eth_addr eth_src,
+                     struct eth_addr eth_dst, struct in6_addr *ipv6_src,
+                     struct in6_addr *ipv6_dst, uint8_t ip_proto, uint8_t ttl,
+                     uint16_t ip_payload_len)
+{
+    dp_packet_clear(packet);
+    packet->packet_type = htonl(PT_ETH);
+
+    struct eth_header *eh = dp_packet_put_zeros(packet, sizeof *eh);
+    struct ip6_hdr *nh = dp_packet_put_zeros(packet, sizeof *nh);
+
+    eh->eth_dst = eth_dst;
+    eh->eth_src = eth_src;
+    eh->eth_type = htons(ETH_TYPE_IPV6);
+    dp_packet_set_l3(packet, nh);
+    dp_packet_set_l4(packet, nh + 1);
+
+    nh->ip6_vfc = 0x60;
+    nh->ip6_nxt = ip_proto;
+    nh->ip6_plen = htons(ip_payload_len);
+
+    packet_set_ipv6(packet, ipv6_src, ipv6_dst, 0, 0, ttl);
 }
 
 /*
@@ -3214,7 +3267,8 @@ pinctrl_compose_ipv4(struct dp_packet *packet, struct eth_addr eth_src,
  */
 struct ip_mcast_snoop_cfg {
     bool enabled;
-    bool querier_enabled;
+    bool querier_v4_enabled;
+    bool querier_v6_enabled;
 
     uint32_t table_size;       /* Max number of allowed multicast groups. */
     uint32_t idle_time_s;      /* Idle timeout for multicast groups. */
@@ -3222,10 +3276,19 @@ struct ip_mcast_snoop_cfg {
     uint32_t query_max_resp_s; /* Multicast query max-response field. */
     uint32_t seq_no;           /* Used for flushing learnt groups. */
 
-    struct eth_addr query_eth_src; /* Src ETH address used for queries. */
-    struct eth_addr query_eth_dst; /* Dst ETH address used for queries. */
-    ovs_be32 query_ipv4_src;       /* Src IPv4 address used for queries. */
-    ovs_be32 query_ipv4_dst;       /* Dsc IPv4 address used for queries. */
+    struct eth_addr query_eth_src;    /* Src ETH address used for queries. */
+    struct eth_addr query_eth_v4_dst; /* Dst ETH address used for IGMP
+                                       * queries.
+                                       */
+    struct eth_addr query_eth_v6_dst; /* Dst ETH address used for MLD
+                                       * queries.
+                                       */
+
+    ovs_be32 query_ipv4_src; /* Src IPv4 address used for queries. */
+    ovs_be32 query_ipv4_dst; /* Dsc IPv4 address used for queries. */
+
+    struct in6_addr query_ipv6_src; /* Src IPv6 address used for queries. */
+    struct in6_addr query_ipv6_dst; /* Dsc IPv6 address used for queries. */
 };
 
 /*
@@ -3255,6 +3318,9 @@ struct ip_mcast_snoop_state {
 /* Only default vlan supported for now. */
 #define IP_MCAST_VLAN 1
 
+/* MLD router-alert IPv6 extension header value. */
+static const uint8_t mld_router_alert[4] = {0x05, 0x02, 0x00, 0x00};
+
 /* Multicast snooping information stored independently by datapath key.
  * Protected by pinctrl_mutex. pinctrl_handler has RW access and pinctrl_main
  * has RO access.
@@ -3268,7 +3334,7 @@ static struct ovs_list mcast_query_list;
 
 /* Multicast config information stored independently by datapath key.
  * Protected by pinctrl_mutex. pinctrl_handler has RO access and pinctrl_main
- * has RW access. Read accesses from pinctrl_ip_mcast_handle_igmp() can be
+ * has RW access. Read accesses from pinctrl_ip_mcast_handle() can be
  * performed without taking the lock as they are executed in the pinctrl_main
  * thread.
  */
@@ -3283,8 +3349,10 @@ ip_mcast_snoop_cfg_load(struct ip_mcast_snoop_cfg *cfg,
     memset(cfg, 0, sizeof *cfg);
     cfg->enabled =
         (ip_mcast->enabled && ip_mcast->enabled[0]);
-    cfg->querier_enabled =
+    bool querier_enabled =
         (cfg->enabled && ip_mcast->querier && ip_mcast->querier[0]);
+    cfg->querier_v4_enabled = querier_enabled;
+    cfg->querier_v6_enabled = querier_enabled;
 
     if (ip_mcast->table_size) {
         cfg->table_size = ip_mcast->table_size[0];
@@ -3315,30 +3383,56 @@ ip_mcast_snoop_cfg_load(struct ip_mcast_snoop_cfg *cfg,
 
     cfg->seq_no = ip_mcast->seq_no;
 
-    if (cfg->querier_enabled) {
+    if (querier_enabled) {
         /* Try to parse the source ETH address. */
         if (!ip_mcast->eth_src ||
                 !eth_addr_from_string(ip_mcast->eth_src,
                                       &cfg->query_eth_src)) {
             VLOG_WARN_RL(&rl,
                          "IGMP Querier enabled with invalid ETH src address");
-            /* Failed to parse the IPv4 source address. Disable the querier. */
-            cfg->querier_enabled = false;
+            /* Failed to parse the ETH source address. Disable the querier. */
+            cfg->querier_v4_enabled = false;
+            cfg->querier_v6_enabled = false;
         }
 
-        /* Try to parse the source IP address. */
-        if (!ip_mcast->ip4_src ||
-                !ip_parse(ip_mcast->ip4_src, &cfg->query_ipv4_src)) {
-            VLOG_WARN_RL(&rl,
-                         "IGMP Querier enabled with invalid IPv4 src address");
-            /* Failed to parse the IPv4 source address. Disable the querier. */
-            cfg->querier_enabled = false;
+        /* Try to parse the source IPv4 address. */
+        if (cfg->querier_v4_enabled) {
+            if (!ip_mcast->ip4_src ||
+                    !ip_parse(ip_mcast->ip4_src, &cfg->query_ipv4_src)) {
+                VLOG_WARN_RL(&rl,
+                            "IGMP Querier enabled with invalid IPv4 "
+                            "src address");
+                /* Failed to parse the IPv4 source address. Disable the
+                 * querier.
+                 */
+                cfg->querier_v4_enabled = false;
+            }
+
+            /* IGMP queries must be sent to 224.0.0.1. */
+            cfg->query_eth_v4_dst =
+                (struct eth_addr)ETH_ADDR_C(01, 00, 5E, 00, 00, 01);
+            cfg->query_ipv4_dst = htonl(0xe0000001);
         }
 
-        /* IGMP queries must be sent to 224.0.0.1. */
-        cfg->query_eth_dst =
-            (struct eth_addr)ETH_ADDR_C(01, 00, 5E, 00, 00, 01);
-        cfg->query_ipv4_dst = htonl(0xe0000001);
+        /* Try to parse the source IPv6 address. */
+        if (cfg->querier_v6_enabled) {
+            if (!ip_mcast->ip6_src ||
+                    !ipv6_parse(ip_mcast->ip6_src, &cfg->query_ipv6_src)) {
+                VLOG_WARN_RL(&rl,
+                            "MLD Querier enabled with invalid IPv6 "
+                            "src address");
+                /* Failed to parse the IPv6 source address. Disable the
+                 * querier.
+                 */
+                cfg->querier_v6_enabled = false;
+            }
+
+            /* MLD queries must be sent to ALL-HOSTS (ff02::1). */
+            cfg->query_eth_v6_dst =
+                (struct eth_addr)ETH_ADDR_C(33, 33, 00, 00, 00, 00);
+            cfg->query_ipv6_dst =
+                (struct in6_addr)IN6ADDR_ALL_HOSTS_INIT;
+        }
     }
 }
 
@@ -3446,9 +3540,15 @@ ip_mcast_snoop_configure(struct ip_mcast_snoop *ip_ms,
             ip_mcast_snoop_flush(ip_ms);
         }
 
-        if (ip_ms->cfg.querier_enabled && !cfg->querier_enabled) {
+        bool old_querier_enabled =
+            (ip_ms->cfg.querier_v4_enabled || ip_ms->cfg.querier_v6_enabled);
+
+        bool querier_enabled =
+            (cfg->querier_v4_enabled || cfg->querier_v6_enabled);
+
+        if (old_querier_enabled && !querier_enabled) {
             ovs_list_remove(&ip_ms->query_node);
-        } else if (!ip_ms->cfg.querier_enabled && cfg->querier_enabled) {
+        } else if (!old_querier_enabled && querier_enabled) {
             ovs_list_push_back(&mcast_query_list, &ip_ms->query_node);
         }
     } else {
@@ -3517,7 +3617,7 @@ ip_mcast_snoop_remove(struct ip_mcast_snoop *ip_ms)
 {
     hmap_remove(&mcast_snoop_map, &ip_ms->hmap_node);
 
-    if (ip_ms->cfg.querier_enabled) {
+    if (ip_ms->cfg.querier_v4_enabled || ip_ms->cfg.querier_v6_enabled) {
         ovs_list_remove(&ip_ms->query_node);
     }
 
@@ -3655,7 +3755,8 @@ ip_mcast_sync(struct ovsdb_idl_txn *ovnsb_idl_txn,
      * - or the group has expired.
      */
     SBREC_IGMP_GROUP_FOR_EACH_BYINDEX (sbrec_igmp, sbrec_igmp_groups) {
-        ovs_be32 group_addr;
+        ovs_be32 group_v4_addr;
+        struct in6_addr group_addr;
 
         if (!sbrec_igmp->datapath) {
             continue;
@@ -3672,14 +3773,15 @@ ip_mcast_sync(struct ovsdb_idl_txn *ovnsb_idl_txn,
             continue;
         }
 
-        if (!ip_parse(sbrec_igmp->address, &group_addr)) {
+        if (ip_parse(sbrec_igmp->address, &group_v4_addr)) {
+            group_addr = in6_addr_mapped_ipv4(group_v4_addr);
+        } else if (!ipv6_parse(sbrec_igmp->address, &group_addr)) {
             continue;
         }
 
         ovs_rwlock_rdlock(&ip_ms->ms->rwlock);
         struct mcast_group *mc_group =
-            mcast_snooping_lookup4(ip_ms->ms, group_addr,
-                                   IP_MCAST_VLAN);
+            mcast_snooping_lookup(ip_ms->ms, &group_addr, IP_MCAST_VLAN);
 
         if (!mc_group || ovs_list_is_empty(&mc_group->bundle_lru)) {
             igmp_group_delete(sbrec_igmp);
@@ -3733,54 +3835,29 @@ ip_mcast_sync(struct ovsdb_idl_txn *ovnsb_idl_txn,
     }
 }
 
-static void
-pinctrl_ip_mcast_handle_igmp(struct rconn *swconn OVS_UNUSED,
+static bool
+pinctrl_ip_mcast_handle_igmp(struct ip_mcast_snoop *ip_ms,
                              const struct flow *ip_flow,
                              struct dp_packet *pkt_in,
-                             const struct match *md,
-                             struct ofpbuf *userdata OVS_UNUSED)
-    OVS_NO_THREAD_SAFETY_ANALYSIS
+                             void *port_key_data)
 {
-    static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
-
-    /* This action only works for IP packets, and the switch should only send
-     * us IP packets this way, but check here just to be sure.
-     */
-    if (ip_flow->dl_type != htons(ETH_TYPE_IP)) {
-        VLOG_WARN_RL(&rl,
-                     "IGMP action on non-IP packet (eth_type 0x%"PRIx16")",
-                     ntohs(ip_flow->dl_type));
-        return;
-    }
-
-    int64_t dp_key = ntohll(md->flow.metadata);
-    uint32_t port_key = md->flow.regs[MFF_LOG_INPORT - MFF_REG0];
-
     const struct igmp_header *igmp;
     size_t offset;
 
     offset = (char *) dp_packet_l4(pkt_in) - (char *) dp_packet_data(pkt_in);
     igmp = dp_packet_at(pkt_in, offset, IGMP_HEADER_LEN);
     if (!igmp || csum(igmp, dp_packet_l4_size(pkt_in)) != 0) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
         VLOG_WARN_RL(&rl, "multicast snooping received bad IGMP checksum");
-        return;
+        return false;
     }
 
     ovs_be32 ip4 = ip_flow->igmp_group_ip4;
-
-    struct ip_mcast_snoop *ip_ms = ip_mcast_snoop_find(dp_key);
-    if (!ip_ms || !ip_ms->cfg.enabled) {
-        /* IGMP snooping is not configured or is disabled. */
-        return;
-    }
-
-    void *port_key_data = (void *)(uintptr_t)port_key;
-
     bool group_change = false;
 
+    /* Only default VLAN is supported for now. */
     ovs_rwlock_wrlock(&ip_ms->ms->rwlock);
     switch (ntohs(ip_flow->tp_src)) {
-     /* Only default VLAN is supported for now. */
     case IGMP_HOST_MEMBERSHIP_REPORT:
     case IGMPV2_HOST_MEMBERSHIP_REPORT:
         group_change =
@@ -3807,27 +3884,118 @@ pinctrl_ip_mcast_handle_igmp(struct rconn *swconn OVS_UNUSED,
         break;
     }
     ovs_rwlock_unlock(&ip_ms->ms->rwlock);
+    return group_change;
+}
 
-    if (group_change) {
-        notify_pinctrl_main();
+static bool
+pinctrl_ip_mcast_handle_mld(struct ip_mcast_snoop *ip_ms,
+                            const struct flow *ip_flow,
+                            struct dp_packet *pkt_in,
+                            void *port_key_data)
+{
+    const struct mld_header *mld;
+    size_t offset;
+
+    offset = (char *) dp_packet_l4(pkt_in) - (char *) dp_packet_data(pkt_in);
+    mld = dp_packet_at(pkt_in, offset, MLD_HEADER_LEN);
+
+    if (!mld || packet_csum_upperlayer6(dp_packet_l3(pkt_in),
+                                        mld, IPPROTO_ICMPV6,
+                                        dp_packet_l4_size(pkt_in)) != 0) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
+        VLOG_WARN_RL(&rl,
+                     "multicast snooping received bad MLD checksum");
+        return false;
+    }
+
+    bool group_change = false;
+
+    /* Only default VLAN is supported for now. */
+    ovs_rwlock_wrlock(&ip_ms->ms->rwlock);
+    switch (ntohs(ip_flow->tp_src)) {
+    case MLD_QUERY:
+        /* Shouldn't be receiving any of these since we are the multicast
+         * router. Store them for now.
+         */
+        if (!ipv6_addr_equals(&ip_flow->ipv6_src, &in6addr_any)) {
+            group_change =
+                mcast_snooping_add_mrouter(ip_ms->ms, IP_MCAST_VLAN,
+                                           port_key_data);
+        }
+        break;
+    case MLD_REPORT:
+    case MLD_DONE:
+    case MLD2_REPORT:
+        group_change =
+            mcast_snooping_add_mld(ip_ms->ms, pkt_in, IP_MCAST_VLAN,
+                                   port_key_data);
+        break;
+    }
+    ovs_rwlock_unlock(&ip_ms->ms->rwlock);
+    return group_change;
+}
+
+static void
+pinctrl_ip_mcast_handle(struct rconn *swconn OVS_UNUSED,
+                        const struct flow *ip_flow,
+                        struct dp_packet *pkt_in,
+                        const struct match *md,
+                        struct ofpbuf *userdata OVS_UNUSED)
+    OVS_NO_THREAD_SAFETY_ANALYSIS
+{
+    uint16_t dl_type = ntohs(ip_flow->dl_type);
+
+    /* This action only works for IP packets, and the switch should only send
+     * us IP packets this way, but check here just to be sure.
+     */
+    if (dl_type != ETH_TYPE_IP && dl_type != ETH_TYPE_IPV6) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
+        VLOG_WARN_RL(&rl,
+                     "IGMP action on non-IP packet (eth_type 0x%"PRIx16")",
+                     dl_type);
+        return;
+    }
+
+    int64_t dp_key = ntohll(md->flow.metadata);
+
+    struct ip_mcast_snoop *ip_ms = ip_mcast_snoop_find(dp_key);
+    if (!ip_ms || !ip_ms->cfg.enabled) {
+        /* IGMP snooping is not configured or is disabled. */
+        return;
+    }
+
+    uint32_t port_key = md->flow.regs[MFF_LOG_INPORT - MFF_REG0];
+    void *port_key_data = (void *)(uintptr_t)port_key;
+
+    switch (dl_type) {
+    case ETH_TYPE_IP:
+        if (pinctrl_ip_mcast_handle_igmp(ip_ms, ip_flow, pkt_in,
+                                         port_key_data)) {
+            notify_pinctrl_main();
+        }
+        break;
+    case ETH_TYPE_IPV6:
+        if (pinctrl_ip_mcast_handle_mld(ip_ms, ip_flow, pkt_in,
+                                        port_key_data)) {
+            notify_pinctrl_main();
+        }
+        break;
+    default:
+        OVS_NOT_REACHED();
+        break;
     }
 }
 
-static long long int
-ip_mcast_querier_send(struct rconn *swconn, struct ip_mcast_snoop *ip_ms,
-                      long long int current_time)
+static void
+ip_mcast_querier_send_igmp(struct rconn *swconn, struct ip_mcast_snoop *ip_ms)
 {
-    if (current_time < ip_ms->query_time_ms) {
-        return ip_ms->query_time_ms;
-    }
-
     /* Compose a multicast query. */
     uint64_t packet_stub[128 / 8];
     struct dp_packet packet;
 
     dp_packet_use_stub(&packet, packet_stub, sizeof packet_stub);
     pinctrl_compose_ipv4(&packet, ip_ms->cfg.query_eth_src,
-                         ip_ms->cfg.query_eth_dst,
+                         ip_ms->cfg.query_eth_v4_dst,
                          ip_ms->cfg.query_ipv4_src,
                          ip_ms->cfg.query_ipv4_dst,
                          IPPROTO_IGMP, 1, sizeof(struct igmpv3_query_header));
@@ -3864,6 +4032,78 @@ ip_mcast_querier_send(struct rconn *swconn, struct ip_mcast_snoop *ip_ms,
     queue_msg(swconn, ofputil_encode_packet_out(&po, proto));
     dp_packet_uninit(&packet);
     ofpbuf_uninit(&ofpacts);
+}
+
+static void
+ip_mcast_querier_send_mld(struct rconn *swconn, struct ip_mcast_snoop *ip_ms)
+{
+    /* Compose a multicast query. */
+    uint64_t packet_stub[128 / 8];
+    struct dp_packet packet;
+
+    dp_packet_use_stub(&packet, packet_stub, sizeof packet_stub);
+    pinctrl_compose_ipv6(&packet, ip_ms->cfg.query_eth_src,
+                         ip_ms->cfg.query_eth_v6_dst,
+                         &ip_ms->cfg.query_ipv6_src,
+                         &ip_ms->cfg.query_ipv6_dst,
+                         IPPROTO_HOPOPTS, 1,
+                         IPV6_EXT_HEADER_LEN + MLD_QUERY_HEADER_LEN);
+
+    struct ipv6_ext_header *ext_hdr =
+        dp_packet_put_zeros(&packet, IPV6_EXT_HEADER_LEN);
+    packet_set_ipv6_ext_header(ext_hdr, IPPROTO_ICMPV6, 0, mld_router_alert,
+                               ARRAY_SIZE(mld_router_alert));
+
+    struct mld_header *mh =
+        dp_packet_put_zeros(&packet, MLD_QUERY_HEADER_LEN);
+    dp_packet_set_l4(&packet, mh);
+
+    /* MLD query max-response in milliseconds. */
+    uint16_t max_response = ip_ms->cfg.query_max_resp_s * 1000;
+    uint8_t qqic = ip_ms->cfg.query_max_resp_s;
+    struct in6_addr unspecified = { { { 0 } } };
+    packet_set_mld_query(&packet, max_response, &unspecified, false, 0, qqic);
+
+    /* Inject multicast query. */
+    uint64_t ofpacts_stub[4096 / 8];
+    struct ofpbuf ofpacts = OFPBUF_STUB_INITIALIZER(ofpacts_stub);
+    enum ofp_version version = rconn_get_version(swconn);
+    put_load(ip_ms->dp_key, MFF_LOG_DATAPATH, 0, 64, &ofpacts);
+    put_load(OVN_MCAST_FLOOD_TUNNEL_KEY, MFF_LOG_OUTPORT, 0, 32, &ofpacts);
+    put_load(1, MFF_LOG_FLAGS, MLF_LOCAL_ONLY, 1, &ofpacts);
+    struct ofpact_resubmit *resubmit = ofpact_put_RESUBMIT(&ofpacts);
+    resubmit->in_port = OFPP_CONTROLLER;
+    resubmit->table_id = OFTABLE_LOCAL_OUTPUT;
+
+    struct ofputil_packet_out po = {
+        .packet = dp_packet_data(&packet),
+        .packet_len = dp_packet_size(&packet),
+        .buffer_id = UINT32_MAX,
+        .ofpacts = ofpacts.data,
+        .ofpacts_len = ofpacts.size,
+    };
+    match_set_in_port(&po.flow_metadata, OFPP_CONTROLLER);
+    enum ofputil_protocol proto = ofputil_protocol_from_ofp_version(version);
+    queue_msg(swconn, ofputil_encode_packet_out(&po, proto));
+    dp_packet_uninit(&packet);
+    ofpbuf_uninit(&ofpacts);
+}
+
+static long long int
+ip_mcast_querier_send(struct rconn *swconn, struct ip_mcast_snoop *ip_ms,
+                      long long int current_time)
+{
+    if (current_time < ip_ms->query_time_ms) {
+        return ip_ms->query_time_ms;
+    }
+
+    if (ip_ms->cfg.querier_v4_enabled) {
+        ip_mcast_querier_send_igmp(swconn, ip_ms);
+    }
+
+    if (ip_ms->cfg.querier_v6_enabled) {
+        ip_mcast_querier_send_mld(swconn, ip_ms);
+    }
 
     /* Set the next query time. */
     ip_ms->query_time_ms = current_time + ip_ms->cfg.query_interval_s * 1000;

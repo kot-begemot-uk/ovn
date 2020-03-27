@@ -17,12 +17,20 @@
 #define OVN_UTIL_H 1
 
 #include "lib/packets.h"
+#include "include/ovn/version.h"
+
+#define ovn_set_program_name(name) \
+    ovs_set_program_name(name, OVN_PACKAGE_VERSION)
+
+#define ovn_print_version(MIN_OFP, MAX_OFP) \
+    ovs_print_version(MIN_OFP, MAX_OFP)
 
 struct nbrec_logical_router_port;
 struct sbrec_logical_flow;
 struct uuid;
 struct eth_addr;
 struct sbrec_port_binding;
+struct sbrec_datapath_binding;
 
 struct ipv4_netaddr {
     ovs_be32 addr;            /* 192.168.10.123 */
@@ -72,6 +80,8 @@ char *alloc_nat_zone_key(const struct uuid *key, const char *type);
 
 const char *default_nb_db(void);
 const char *default_sb_db(void);
+const char *default_ic_nb_db(void);
+const char *default_ic_sb_db(void);
 char *get_abs_unix_ctl_path(void);
 
 struct ovsdb_idl_table_class;
@@ -86,5 +96,32 @@ uint32_t ovn_logical_flow_hash(const struct uuid *logical_datapath,
                                uint8_t table_id, const char *pipeline,
                                uint16_t priority,
                                const char *match, const char *actions);
+bool datapath_is_switch(const struct sbrec_datapath_binding *);
 
+#define OVN_MAX_DP_KEY ((1u << 24) - 1)
+#define OVN_MAX_DP_GLOBAL_NUM ((1u << 16) - 1)
+#define OVN_MIN_DP_KEY_LOCAL 1
+#define OVN_MAX_DP_KEY_LOCAL (OVN_MAX_DP_KEY - OVN_MAX_DP_GLOBAL_NUM)
+#define OVN_MIN_DP_KEY_GLOBAL (OVN_MAX_DP_KEY_LOCAL + 1)
+#define OVN_MAX_DP_KEY_GLOBAL OVN_MAX_DP_KEY
+struct hmap;
+void ovn_destroy_tnlids(struct hmap *tnlids);
+void ovn_add_tnlid(struct hmap *set, uint32_t tnlid);
+bool ovn_tnlid_in_use(const struct hmap *set, uint32_t tnlid);
+uint32_t ovn_allocate_tnlid(struct hmap *set, const char *name, uint32_t min,
+                            uint32_t max, uint32_t *hint);
+
+char *ovn_chassis_redirect_name(const char *port_name);
+
+/* An IPv4 or IPv6 address */
+struct v46_ip {
+    int family;
+    union {
+        ovs_be32 ipv4;
+        struct in6_addr ipv6;
+    };
+};
+bool ip46_parse_cidr(const char *str, struct v46_ip *prefix,
+                     unsigned int *plen);
+bool ip46_equals(const struct v46_ip *addr1, const struct v46_ip *addr2);
 #endif

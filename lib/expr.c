@@ -2059,7 +2059,7 @@ expr_simplify_condition(struct expr *expr,
 struct expr *
 expr_simplify(struct expr *expr,
               bool (*is_chassis_resident)(const void *c_aux,
-                                          const char *port_name),
+                                        const char *port_name),
               const void *c_aux)
 {
     struct expr *sub, *next;
@@ -2649,7 +2649,7 @@ expr_normalize_and(struct expr *expr)
 
     struct expr *sub;
     LIST_FOR_EACH (sub, node, &expr->andor) {
-        if (sub->type == EXPR_T_CMP) {
+        if (sub->type == EXPR_T_CMP || sub->type == EXPR_T_CONDITION) {
             continue;
         }
 
@@ -2706,7 +2706,8 @@ expr_normalize_or(struct expr *expr)
                 expr_insert_andor(expr, next, new);
             }
         } else {
-            ovs_assert(sub->type == EXPR_T_CMP);
+            ovs_assert(sub->type == EXPR_T_CMP ||
+                       sub->type == EXPR_T_CONDITION);
         }
     }
     if (ovs_list_is_empty(&expr->andor)) {

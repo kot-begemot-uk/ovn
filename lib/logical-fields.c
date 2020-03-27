@@ -138,6 +138,8 @@ ovn_init_symtab(struct shash *symtab)
     expr_symtab_add_predicate(symtab, "eth.bcast",
                               "eth.dst == ff:ff:ff:ff:ff:ff");
     expr_symtab_add_subfield(symtab, "eth.mcast", NULL, "eth.dst[40]");
+    expr_symtab_add_predicate(symtab, "eth.mcastv6",
+                              "eth.dst[32..47] == 0x3333");
 
     expr_symtab_add_field(symtab, "vlan.tci", MFF_VLAN_TCI, NULL, false);
     expr_symtab_add_predicate(symtab, "vlan.present", "vlan.tci[12]");
@@ -158,7 +160,8 @@ ovn_init_symtab(struct shash *symtab)
     expr_symtab_add_field(symtab, "ip4.dst", MFF_IPV4_DST, "ip4", false);
     expr_symtab_add_predicate(symtab, "ip4.src_mcast",
                               "ip4.src[28..31] == 0xe");
-    expr_symtab_add_predicate(symtab, "ip4.mcast", "ip4.dst[28..31] == 0xe");
+    expr_symtab_add_predicate(symtab, "ip4.mcast",
+                              "eth.mcast && ip4.dst[28..31] == 0xe");
 
     expr_symtab_add_predicate(symtab, "icmp4", "ip4 && ip.proto == 1");
     expr_symtab_add_field(symtab, "icmp4.type", MFF_ICMPV4_TYPE, "icmp4",
@@ -171,6 +174,27 @@ ovn_init_symtab(struct shash *symtab)
     expr_symtab_add_field(symtab, "ip6.src", MFF_IPV6_SRC, "ip6", false);
     expr_symtab_add_field(symtab, "ip6.dst", MFF_IPV6_DST, "ip6", false);
     expr_symtab_add_field(symtab, "ip6.label", MFF_IPV6_LABEL, "ip6", false);
+
+    /* Predefined IPv6 multicast groups (RFC 4291, 2.7.1). */
+    expr_symtab_add_predicate(symtab, "ip6.mcast_rsvd",
+                              "ip6.dst[116..127] == 0xff0 && "
+                              "ip6.dst[0..111] == 0x0");
+    expr_symtab_add_predicate(symtab, "ip6.mcast_all_nodes",
+                              "ip6.dst == ff01::1 || ip6.dst == ff02::1");
+    expr_symtab_add_predicate(symtab, "ip6.mcast_all_rtrs",
+                              "ip6.dst == ff01::2 || ip6.dst == ff02::2 || "
+                              "ip6.dst == ff05::2");
+    expr_symtab_add_predicate(symtab, "ip6.mcast_sol_node",
+                              "ip6.dst == ff02::1:ff00:0000/104");
+    expr_symtab_add_predicate(symtab, "ip6.mcast_flood",
+                              "eth.mcastv6 && "
+                              "(ip6.mcast_rsvd || "
+                              "ip6.mcast_all_nodes || "
+                              "ip6.mcast_all_rtrs || "
+                              "ip6.mcast_sol_node)");
+
+    expr_symtab_add_predicate(symtab, "ip6.mcast",
+                              "eth.mcastv6 && ip6.dst[120..127] == 0xff");
 
     expr_symtab_add_predicate(symtab, "icmp6", "ip6 && ip.proto == 58");
     expr_symtab_add_field(symtab, "icmp6.type", MFF_ICMPV6_TYPE, "icmp6",
@@ -207,6 +231,16 @@ ovn_init_symtab(struct shash *symtab)
     expr_symtab_add_field(symtab, "nd.sll", MFF_ND_SLL, "nd_ns", false);
     expr_symtab_add_field(symtab, "nd.tll", MFF_ND_TLL, "nd_na", false);
 
+    /* MLDv1 packets use link-local source addresses
+     * (RFC 2710 and RFC 3810).
+     */
+    expr_symtab_add_predicate(symtab, "mldv1",
+                              "ip6.src == fe80::/10 && "
+                              "icmp6.type == {130, 131, 132}");
+    /* MLDv2 packets are sent to ff02::16 (RFC 3810, 5.2.14) */
+    expr_symtab_add_predicate(symtab, "mldv2",
+                              "ip6.dst == ff02::16 && icmp6.type == 143");
+
     expr_symtab_add_predicate(symtab, "tcp", "ip.proto == 6");
     expr_symtab_add_field(symtab, "tcp.src", MFF_TCP_SRC, "tcp", false);
     expr_symtab_add_field(symtab, "tcp.dst", MFF_TCP_DST, "tcp", false);
@@ -220,12 +254,6 @@ ovn_init_symtab(struct shash *symtab)
     expr_symtab_add_field(symtab, "sctp.src", MFF_SCTP_SRC, "sctp", false);
     expr_symtab_add_field(symtab, "sctp.dst", MFF_SCTP_DST, "sctp", false);
 
-    shash_init(&ovnfield_by_name);
-    for (int i = 0; i < OVN_FIELD_N_IDS; i++) {
-        const struct ovn_field *of = &ovn_fields[i];
-        ovs_assert(of->id == i); /* Fields must be in the enum order. */
-        shash_add_once(&ovnfield_by_name, of->name, of);
-    }
     expr_symtab_add_ovn_field(symtab, "icmp4.frag_mtu", OVN_ICMP4_FRAG_MTU);
 }
 
@@ -250,14 +278,35 @@ string_to_event(const char *s)
     return -1;
 }
 
-const struct ovn_field *
-ovn_field_from_name(const char *name)
-{
-    return shash_find_data(&ovnfield_by_name, name);
-}
-
-void
+static void
 ovn_destroy_ovnfields(void)
 {
     shash_destroy(&ovnfield_by_name);
+}
+
+static void
+ovn_do_init_ovnfields(void)
+{
+    shash_init(&ovnfield_by_name);
+    for (int i = 0; i < OVN_FIELD_N_IDS; i++) {
+       const struct ovn_field *of = &ovn_fields[i];
+       ovs_assert(of->id == i); /* Fields must be in the enum order. */
+       shash_add_once(&ovnfield_by_name, of->name, of);
+    }
+    atexit(ovn_destroy_ovnfields);
+}
+
+static void
+ovn_init_ovnfields(void)
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, ovn_do_init_ovnfields);
+}
+
+const struct ovn_field *
+ovn_field_from_name(const char *name)
+{
+    ovn_init_ovnfields();
+
+    return shash_find_data(&ovnfield_by_name, name);
 }

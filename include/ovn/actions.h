@@ -61,6 +61,7 @@ struct ovn_extend_table;
     OVNACT(CT_DNAT,           ovnact_ct_nat)          \
     OVNACT(CT_SNAT,           ovnact_ct_nat)          \
     OVNACT(CT_LB,             ovnact_ct_lb)           \
+    OVNACT(SELECT,            ovnact_select)          \
     OVNACT(CT_CLEAR,          ovnact_null)            \
     OVNACT(CLONE,             ovnact_nest)            \
     OVNACT(ARP,               ovnact_nest)            \
@@ -89,7 +90,8 @@ struct ovn_extend_table;
     OVNACT(CHECK_PKT_LARGER,  ovnact_check_pkt_larger) \
     OVNACT(TRIGGER_EVENT,     ovnact_controller_event) \
     OVNACT(BIND_VPORT,        ovnact_bind_vport)       \
-    OVNACT(HANDLE_SVC_CHECK,  ovnact_handle_svc_check)
+    OVNACT(HANDLE_SVC_CHECK,  ovnact_handle_svc_check) \
+    OVNACT(FWD_GROUP,         ovnact_fwd_group)
 
 /* enum ovnact_type, with a member OVNACT_<ENUM> for each action. */
 enum OVS_PACKED_ENUM ovnact_type {
@@ -251,6 +253,20 @@ struct ovnact_ct_lb {
     uint8_t ltable;             /* Logical table ID of next table. */
 };
 
+struct ovnact_select_dst {
+    uint16_t id;
+    uint16_t weight;
+};
+
+/* OVNACT_SELECT. */
+struct ovnact_select {
+    struct ovnact ovnact;
+    struct ovnact_select_dst *dsts;
+    size_t n_dsts;
+    uint8_t ltable;             /* Logical table ID of next table. */
+    struct expr_field res_field;
+};
+
 /* OVNACT_ARP, OVNACT_ND_NA, OVNACT_CLONE. */
 struct ovnact_nest {
     struct ovnact ovnact;
@@ -357,6 +373,15 @@ struct ovnact_bind_vport {
 struct ovnact_handle_svc_check {
     struct ovnact ovnact;
     struct expr_field port;     /* Logical port name. */
+};
+
+/* OVNACT_FWD_GROUP. */
+struct ovnact_fwd_group {
+    struct ovnact ovnact;
+    bool liveness;
+    char **child_ports;       /* Logical ports */
+    size_t n_child_ports;
+    uint8_t ltable;           /* Logical table ID of next table. */
 };
 
 /* Internal use by the helpers below. */
@@ -620,6 +645,13 @@ struct ovnact_encode_params {
      * '*portp' and returns true; otherwise, returns false. */
     bool (*lookup_port)(const void *aux, const char *port_name,
                         unsigned int *portp);
+
+    /* Looks up tunnel port to a chassis by its port name.  If found, stores
+     * its openflow port number in '*ofport' and returns true;
+     * otherwise, returns false. */
+    bool (*tunnel_ofport)(const void *aux, const char *port_name,
+                          ofp_port_t *ofport);
+
     const void *aux;
 
     /* 'true' if the flow is for a switch. */

@@ -94,6 +94,7 @@ Clint Byrum                        clint@fewbar.com
 Cong Wang                          amwang@redhat.com
 Conner Herriges                    conner.herriges@ibm.com
 Damien Millescamps                 damien.millescamps@6wind.com
+Damijan Skvarc                     damjan.skvarc@gmail.com
 Dan Carpenter                      dan.carpenter@oracle.com
 Dan McGregor                       dan.mcgregor@usask.ca
 Dan Wendlandt
@@ -166,6 +167,7 @@ Hui Kang                           kangh@us.ibm.com
 Hyong Youb Kim                     hyonkim@cisco.com
 Ian Campbell                       Ian.Campbell@citrix.com
 Ian Stokes                         ian.stokes@intel.com
+Ihar Hrachyshka                    ihrachys@redhat.com
 Ilya Maximets                      i.maximets@samsung.com
 Iman Tabrizian                     tabrizian@outlook.com
 Isaku Yamahata                     yamahata@valinux.co.jp
@@ -236,6 +238,7 @@ Luis E. P.                         l31g@hotmail.com
 Lukasz Rzasik                      lukasz.rzasik@gmail.com
 Madhu Challa                       challa@noironetworks.com
 Manohar K C                        manukc@gmail.com
+Manoj Sharma                       manoj.sharma@nutanix.com
 Marcin Mirecki                     mmirecki@redhat.com
 Mario Cabrera                      mario.cabrera@hpe.com
 Mark D. Gray                       mark.d.gray@intel.com
@@ -367,6 +370,7 @@ Tony van der Peet                  tony.vanderpeet@alliedtelesis.co.nz
 Tonghao Zhang                      xiangxia.m.yue@gmail.com
 Valient Gough                      vgough@pobox.com
 Venkata Anil Kommaddi              vkommadi@redhat.com
+Venu Iyer                          venugopali@nvidia.com
 Vishal Deep Ajmera                 vishal.deep.ajmera@ericsson.com
 Vivien Bernet-Rollande             vbr@soprive.net
 wangqianyu                         wang.qianyu@zte.com.cn
