@@ -967,6 +967,8 @@ ovn-nbctl --wait=sb lsp-set-options S1-R1 router-port=R1-S1
 
 ovn-nbctl lrp-set-gateway-chassis R1-S1 gw1
 
+sleep 1
+
 uuid=`ovn-sbctl --columns=_uuid --bare find Port_Binding logical_port=cr-R1-S1`
 echo "CR-LRP UUID is: " $uuid
 
