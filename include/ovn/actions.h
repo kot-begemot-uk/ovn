@@ -91,7 +91,8 @@ struct ovn_extend_table;
     OVNACT(TRIGGER_EVENT,     ovnact_controller_event) \
     OVNACT(BIND_VPORT,        ovnact_bind_vport)       \
     OVNACT(HANDLE_SVC_CHECK,  ovnact_handle_svc_check) \
-    OVNACT(FWD_GROUP,         ovnact_fwd_group)
+    OVNACT(FWD_GROUP,         ovnact_fwd_group)       \
+    OVNACT(DHCP6_REPLY,       ovnact_null)
 
 /* enum ovnact_type, with a member OVNACT_<ENUM> for each action. */
 enum OVS_PACKED_ENUM ovnact_type {
@@ -233,6 +234,13 @@ struct ovnact_ct_nat {
         struct in6_addr ipv6;
         ovs_be32 ipv4;
     };
+
+    struct {
+       bool exists;
+       uint16_t port_lo;
+       uint16_t port_hi;
+    } port_range;
+
     uint8_t ltable;             /* Logical table ID of next table. */
 };
 
@@ -577,6 +585,11 @@ enum action_opcode {
      *     MFF_LOG_INPORT = port
      */
     ACTION_OPCODE_HANDLE_SVC_CHECK,
+    /* handle_dhcpv6_reply { ...actions ...}."
+     *
+     *  The actions, in OpenFlow 1.3 format, follow the action_header.
+     */
+    ACTION_OPCODE_DHCP6_SERVER,
 };
 
 /* Header. */

@@ -770,6 +770,38 @@ parse_ct_nat(struct action_context *ctx, const char *name,
         }
         lexer_get(ctx->lexer);
 
+        if (lexer_match(ctx->lexer, LEX_T_COMMA)) {
+
+           if (ctx->lexer->token.type != LEX_T_INTEGER ||
+               ctx->lexer->token.format != LEX_F_DECIMAL) {
+              lexer_syntax_error(ctx->lexer, "expecting Integer for port "
+                                 "range");
+           }
+
+           cn->port_range.port_lo = ntohll(ctx->lexer->token.value.integer);
+           lexer_get(ctx->lexer);
+
+           if (lexer_match(ctx->lexer, LEX_T_HYPHEN)) {
+
+               if (ctx->lexer->token.type != LEX_T_INTEGER) {
+                   lexer_syntax_error(ctx->lexer, "expecting Integer for port "
+                                      "range");
+               }
+               cn->port_range.port_hi = ntohll(
+                                        ctx->lexer->token.value.integer);
+
+               if (cn->port_range.port_hi <= cn->port_range.port_lo) {
+                   lexer_syntax_error(ctx->lexer, "range high should be "
+                                      "greater than range lo");
+               }
+               lexer_get(ctx->lexer);
+           } else {
+               cn->port_range.port_hi = 0;
+           }
+
+           cn->port_range.exists = true;
+        }
+
         if (!lexer_force_match(ctx->lexer, LEX_T_RPAREN)) {
             return;
         }
@@ -799,6 +831,17 @@ format_ct_nat(const struct ovnact_ct_nat *cn, const char *name, struct ds *s)
         ipv6_format_addr(&cn->ipv6, s);
         ds_put_char(s, ')');
     }
+
+    if (cn->port_range.exists) {
+        ds_chomp(s, ')');
+        ds_put_format(s, ",%d", cn->port_range.port_lo);
+
+        if (cn->port_range.port_hi) {
+            ds_put_format(s, "-%d", cn->port_range.port_hi);
+        }
+        ds_put_char(s, ')');
+    }
+
     ds_put_char(s, ';');
 }
 
@@ -859,6 +902,11 @@ encode_ct_nat(const struct ovnact_ct_nat *cn,
         } else {
             nat->flags |= NX_NAT_F_DST;
         }
+    }
+
+    if (cn->port_range.exists) {
+       nat->range.proto.min = cn->port_range.port_lo;
+       nat->range.proto.max = cn->port_range.port_hi;
     }
 
     ofpacts->header = ofpbuf_push_uninit(ofpacts, nat_offset);
@@ -1957,10 +2005,12 @@ validate_empty_lb_backends(struct action_context *ctx,
             }
             break;
         case EMPTY_LB_PROTOCOL:
-            if (strcmp(c->string, "tcp") && strcmp(c->string, "udp")) {
+            if (strcmp(c->string, "tcp") &&
+                strcmp(c->string, "udp") &&
+                strcmp(c->string, "sctp")) {
                 lexer_error(ctx->lexer,
-                    "Load balancer protocol '%s' is not 'tcp' or 'udp'",
-                    c->string);
+                    "Load balancer protocol '%s' is not 'tcp', 'udp', "
+                    "or 'sctp'", c->string);
                 return;
             }
             break;
@@ -2309,6 +2359,20 @@ static void
 ovnact_put_opts_free(struct ovnact_put_opts *pdo)
 {
     free_gen_options(pdo->options, pdo->n_options);
+}
+
+static void
+format_DHCP6_REPLY(const struct ovnact_null *a OVS_UNUSED, struct ds *s)
+{
+    ds_put_cstr(s, "handle_dhcpv6_reply;");
+}
+
+static void
+encode_DHCP6_REPLY(const struct ovnact_null *a OVS_UNUSED,
+                   const struct ovnact_encode_params *ep OVS_UNUSED,
+                   struct ofpbuf *ofpacts)
+{
+    encode_controller_op(ACTION_OPCODE_DHCP6_SERVER, ofpacts);
 }
 
 static void
@@ -3258,6 +3322,8 @@ parse_action(struct action_context *ctx)
         parse_handle_svc_check(ctx);
     } else if (lexer_match_id(ctx->lexer, "fwd_group")) {
         parse_fwd_group_action(ctx);
+    } else if (lexer_match_id(ctx->lexer, "handle_dhcpv6_reply")) {
+        ovnact_put_DHCP6_REPLY(ctx->ovnacts);
     } else {
         lexer_syntax_error(ctx->lexer, "expecting action");
     }

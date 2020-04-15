@@ -2694,6 +2694,33 @@ op_get_name(const struct ovn_port *op)
 }
 
 static void
+ovn_update_ipv6_prefix(struct hmap *ports)
+{
+    const struct ovn_port *op;
+    HMAP_FOR_EACH (op, key_node, ports) {
+        if (!op->nbrp) {
+            continue;
+        }
+
+        char prefix[IPV6_SCAN_LEN + 6];
+        unsigned aid;
+        const char *ipv6_pd_list = smap_get(&op->sb->options,
+                                            "ipv6_ra_pd_list");
+        if (!ipv6_pd_list ||
+            !ovs_scan(ipv6_pd_list, "%u:%s", &aid, prefix)) {
+            continue;
+        }
+
+        struct sset ipv6_prefix_set = SSET_INITIALIZER(&ipv6_prefix_set);
+        sset_add(&ipv6_prefix_set, prefix);
+        nbrec_logical_router_port_set_ipv6_prefix(op->nbrp,
+                                            sset_array(&ipv6_prefix_set),
+                                            sset_count(&ipv6_prefix_set));
+        sset_destroy(&ipv6_prefix_set);
+    }
+}
+
+static void
 ovn_port_update_sbrec(struct northd_context *ctx,
                       struct ovsdb_idl_index *sbrec_chassis_by_name,
                       const struct ovn_port *op,
@@ -2823,6 +2850,13 @@ ovn_port_update_sbrec(struct northd_context *ctx,
                 smap_add(&new, "l3gateway-chassis", chassis_name);
             }
         }
+
+        const char *ipv6_pd_list = smap_get(&op->sb->options,
+                                            "ipv6_ra_pd_list");
+        if (ipv6_pd_list) {
+            smap_add(&new, "ipv6_ra_pd_list", ipv6_pd_list);
+        }
+
         sbrec_port_binding_set_options(op->sb, &new);
         smap_destroy(&new);
 
@@ -3178,10 +3212,21 @@ ovn_lb_create(struct northd_context *ctx, struct hmap *lbs,
         lb->vips[n_vips].backend_ips = xstrdup(node->value);
 
         struct nbrec_load_balancer_health_check *lb_health_check = NULL;
-        for (size_t i = 0; i < nbrec_lb->n_health_check; i++) {
-            if (!strcmp(nbrec_lb->health_check[i]->vip, node->key)) {
-                lb_health_check = nbrec_lb->health_check[i];
-                break;
+        if (nbrec_lb->protocol && !strcmp(nbrec_lb->protocol, "sctp")) {
+            if (nbrec_lb->n_health_check > 0) {
+                static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 1);
+                VLOG_WARN_RL(&rl,
+                             "SCTP load balancers do not currently support "
+                             "health checks. Not creating health checks for "
+                             "load balancer " UUID_FMT,
+                             UUID_ARGS(&nbrec_lb->header_.uuid));
+            }
+        } else {
+            for (size_t i = 0; i < nbrec_lb->n_health_check; i++) {
+                if (!strcmp(nbrec_lb->health_check[i]->vip, node->key)) {
+                    lb_health_check = nbrec_lb->health_check[i];
+                    break;
+                }
             }
         }
 
@@ -4677,12 +4722,12 @@ build_pre_acls(struct ovn_datapath *od, struct hmap *lflows)
          * unreachable packets. */
         ovn_lflow_add(lflows, od, S_SWITCH_IN_PRE_ACL, 110,
                       "nd || nd_rs || nd_ra || icmp4.type == 3 || "
-                      "icmp6.type == 1 || (tcp && tcp.flags == 20)",
-                      "next;");
+                      "icmp6.type == 1 || (tcp && tcp.flags == 20) || "
+                      "(udp && udp.src == 546 && udp.dst == 547)", "next;");
         ovn_lflow_add(lflows, od, S_SWITCH_OUT_PRE_ACL, 110,
                       "nd || nd_rs || nd_ra || icmp4.type == 3 || "
-                      "icmp6.type == 1 || (tcp && tcp.flags == 20)",
-                      "next;");
+                      "icmp6.type == 1 || (tcp && tcp.flags == 20) ||"
+                      "(udp && udp.src == 546 && udp.dst == 547)", "next;");
 
         /* Ingress and Egress Pre-ACL Table (Priority 100).
          *
@@ -5563,10 +5608,13 @@ build_lb_rules(struct ovn_datapath *od, struct hmap *lflows, struct ovn_lb *lb)
 
         const char *proto = NULL;
         if (lb_vip->vip_port) {
-            if (lb->nlb->protocol && !strcmp(lb->nlb->protocol, "udp")) {
-                proto = "udp";
-            } else {
-                proto = "tcp";
+            proto = "tcp";
+            if (lb->nlb->protocol) {
+                if (!strcmp(lb->nlb->protocol, "udp")) {
+                    proto = "udp";
+                } else if (!strcmp(lb->nlb->protocol, "sctp")) {
+                    proto = "sctp";
+                }
             }
         }
 
@@ -7574,7 +7622,7 @@ static void
 add_router_lb_flow(struct hmap *lflows, struct ovn_datapath *od,
                    struct ds *match, struct ds *actions, int priority,
                    const char *lb_force_snat_ip, struct lb_vip *lb_vip,
-                   bool is_udp, struct nbrec_load_balancer *lb,
+                   const char *proto, struct nbrec_load_balancer *lb,
                    struct shash *meter_groups, struct sset *nat_entries)
 {
     build_empty_lb_event_flow(od, lflows, lb_vip, lb, S_ROUTER_IN_DNAT,
@@ -7629,11 +7677,10 @@ add_router_lb_flow(struct hmap *lflows, struct ovn_datapath *od,
          * S_ROUTER_IN_DNAT stage. */
         struct ds unsnat_match = DS_EMPTY_INITIALIZER;
         ds_put_format(&unsnat_match, "%s && %s.dst == %s && %s",
-                      ip_match, ip_match, lb_vip->vip,
-                      is_udp ? "udp" : "tcp");
+                      ip_match, ip_match, lb_vip->vip, proto);
         if (lb_vip->vip_port) {
-            ds_put_format(&unsnat_match, " && %s.dst == %d",
-                          is_udp ? "udp" : "tcp", lb_vip->vip_port);
+            ds_put_format(&unsnat_match, " && %s.dst == %d", proto,
+                          lb_vip->vip_port);
         }
 
         ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_UNSNAT, 120,
@@ -7659,7 +7706,7 @@ add_router_lb_flow(struct hmap *lflows, struct ovn_datapath *od,
 
         if (backend->port) {
             ds_put_format(&undnat_match, " && %s.src == %d) || ",
-                          is_udp ? "udp" : "tcp", backend->port);
+                          proto, backend->port);
         } else {
             ds_put_cstr(&undnat_match, ") || ");
         }
@@ -7735,6 +7782,11 @@ copy_ra_to_sb(struct ovn_port *op, const char *address_mode)
             continue;
         }
         ds_put_format(&s, "%s/%u ", addrs->network_s, addrs->plen);
+    }
+
+    const char *ra_pd_list = smap_get(&op->sb->options, "ipv6_ra_pd_list");
+    if (ra_pd_list) {
+        ds_put_cstr(&s, ra_pd_list);
     }
     /* Remove trailing space */
     ds_chomp(&s, ' ');
@@ -8480,7 +8532,34 @@ build_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
         free(snat_ips);
     }
 
-    /* Logical router ingress table 3: IP Input for IPv6. */
+    /* DHCPv6 reply handling */
+    HMAP_FOR_EACH (op, key_node, ports) {
+        if (!op->nbrp) {
+            continue;
+        }
+
+        if (op->derived) {
+            continue;
+        }
+
+        struct lport_addresses lrp_networks;
+        if (!extract_lrp_networks(op->nbrp, &lrp_networks)) {
+            continue;
+        }
+
+        for (size_t i = 0; i < lrp_networks.n_ipv6_addrs; i++) {
+            ds_clear(&actions);
+            ds_clear(&match);
+            ds_put_format(&match, "ip6.dst == %s && udp.src == 547 &&"
+                          " udp.dst == 546",
+                          lrp_networks.ipv6_addrs[i].addr_s);
+            ds_put_format(&actions, "reg0 = 0; handle_dhcpv6_reply;");
+            ovn_lflow_add(lflows, op->od, S_ROUTER_IN_IP_INPUT, 100,
+                          ds_cstr(&match), ds_cstr(&actions));
+        }
+    }
+
+    /* Logical router ingress table 1: IP Input for IPv6. */
     HMAP_FOR_EACH (op, key_node, ports) {
         if (!op->nbrp) {
             continue;
@@ -8837,7 +8916,13 @@ build_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
                                       is_v6 ? "6" : "4", nat->logical_ip);
                     } else {
                         ds_put_format(&actions, "flags.loopback = 1; "
-                                      "ct_dnat(%s);", nat->logical_ip);
+                                      "ct_dnat(%s", nat->logical_ip);
+
+                        if (strlen(nat->external_port_range)) {
+                            ds_put_format(&actions, ",%s",
+                                          nat->external_port_range);
+                        }
+                        ds_put_format(&actions, ");");
                     }
 
                     ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_DNAT, 100,
@@ -8865,8 +8950,12 @@ build_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
                         ds_put_format(&actions, "ip%s.dst=%s; next;",
                                       is_v6 ? "6" : "4", nat->logical_ip);
                     } else {
-                        ds_put_format(&actions, "ct_dnat(%s);",
-                                      nat->logical_ip);
+                        ds_put_format(&actions, "ct_dnat(%s", nat->logical_ip);
+                        if (strlen(nat->external_port_range)) {
+                            ds_put_format(&actions, ",%s",
+                                          nat->external_port_range);
+                        }
+                        ds_put_format(&actions, ");");
                     }
 
                     ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_DNAT, 100,
@@ -8970,8 +9059,14 @@ build_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
                         ds_put_format(&actions, "ip%s.src=%s; next;",
                                       is_v6 ? "6" : "4", nat->external_ip);
                     } else {
-                        ds_put_format(&actions, "ct_snat(%s);",
+                        ds_put_format(&actions, "ct_snat(%s",
                                       nat->external_ip);
+
+                        if (strlen(nat->external_port_range)) {
+                            ds_put_format(&actions, ",%s",
+                                          nat->external_port_range);
+                        }
+                        ds_put_format(&actions, ");");
                     }
 
                     /* The priority here is calculated such that the
@@ -9008,8 +9103,13 @@ build_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
                         ds_put_format(&actions, "ip%s.src=%s; next;",
                                       is_v6 ? "6" : "4", nat->external_ip);
                     } else {
-                        ds_put_format(&actions, "ct_snat(%s);",
+                        ds_put_format(&actions, "ct_snat(%s",
                                       nat->external_ip);
+                        if (strlen(nat->external_port_range)) {
+                            ds_put_format(&actions, ",%s",
+                                          nat->external_port_range);
+                        }
+                        ds_put_format(&actions, ");");
                     }
 
                     /* The priority here is calculated such that the
@@ -9208,15 +9308,13 @@ build_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
 
                 int prio = 110;
                 bool is_udp = nullable_string_is_equal(nb_lb->protocol, "udp");
+                bool is_sctp = nullable_string_is_equal(nb_lb->protocol,
+                                                        "sctp");
+                const char *proto = is_udp ? "udp" : is_sctp ? "sctp" : "tcp";
 
                 if (lb_vip->vip_port) {
-                    if (is_udp) {
-                        ds_put_format(&match, " && udp && udp.dst == %d",
-                                      lb_vip->vip_port);
-                    } else {
-                        ds_put_format(&match, " && tcp && tcp.dst == %d",
-                                      lb_vip->vip_port);
-                    }
+                    ds_put_format(&match, " && %s && %s.dst == %d", proto,
+                                  proto, lb_vip->vip_port);
                     prio = 120;
                 }
 
@@ -9225,7 +9323,7 @@ build_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
                                   od->l3redirect_port->json_key);
                 }
                 add_router_lb_flow(lflows, od, &match, &actions, prio,
-                                   lb_force_snat_ip, lb_vip, is_udp,
+                                   lb_force_snat_ip, lb_vip, proto,
                                    nb_lb, meter_groups, &nat_entries);
             }
         }
@@ -9242,6 +9340,24 @@ build_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
 
         if (!op->lrp_networks.n_ipv6_addrs) {
             continue;
+        }
+
+        struct smap options;
+        /* enable IPv6 prefix delegation */
+        bool prefix_delegation = smap_get_bool(&op->nbrp->options,
+                                               "prefix_delegation", false);
+        if (prefix_delegation) {
+            smap_clone(&options, &op->sb->options);
+            smap_add(&options, "ipv6_prefix_delegation", "true");
+            sbrec_port_binding_set_options(op->sb, &options);
+            smap_destroy(&options);
+        }
+
+        if (smap_get_bool(&op->nbrp->options, "prefix", false)) {
+            smap_clone(&options, &op->sb->options);
+            smap_add(&options, "ipv6_prefix", "true");
+            sbrec_port_binding_set_options(op->sb, &options);
+            smap_destroy(&options);
         }
 
         const char *address_mode = smap_get(
@@ -10943,6 +11059,7 @@ ovnnb_db_run(struct northd_context *ctx,
     build_meter_groups(ctx, &meter_groups);
     build_lflows(ctx, datapaths, ports, &port_groups, &mcast_groups,
                  &igmp_groups, &meter_groups, &lbs);
+    ovn_update_ipv6_prefix(ports);
 
     sync_address_sets(ctx);
     sync_port_groups(ctx);
