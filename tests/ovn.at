@@ -24,26 +24,29 @@ m4_divert_text([PREPARE_TESTS],
         test $rcv_n -ge $exp_n])
      sort $exp_text > expout
    }
+   ovn_check_packets_remove_broadcast__ () {
+     echo "checking packets in $1 against $2:"
+     rcv_pcap=$1
+     rcv_text=`echo "$rcv_pcap.packets" | sed 's/\.pcap//'`
+     exp_text=$2
+     exp_n=`wc -l < "$exp_text"`
+     OVS_WAIT_UNTIL(
+       [$PYTHON "$ovs_srcdir/utilities/ovs-pcap.in" $rcv_pcap > $rcv_text
+        sed -i '/ffffffffffff/d' $rcv_text
+        rcv_n=`wc -l < "$rcv_text"`
+        echo "rcv_n=$rcv_n exp_n=$exp_n"
+        test $rcv_n -ge $exp_n])
+     sort $exp_text > expout
+   }
 ])
+
 m4_define([OVN_CHECK_PACKETS],
   [ovn_check_packets__ "$1" "$2"
    AT_CHECK([sort $rcv_text], [0], [expout])])
 
 m4_define([OVN_CHECK_PACKETS_REMOVE_BROADCAST],
-  [ovn_check_packets__ () {
-   echo "checking packets in $1 against $2:"
-   rcv_pcap=$1
-   exp_text=$2
-   exp_n=`wc -l < "$exp_text"`
-   OVS_WAIT_UNTIL(
-     [$PYTHON "$top_srcdir/ovs/utilities/ovs-pcap.in" $rcv_pcap > $rcv_text
-      sed -i '/ffffffffffff/d' $rcv_text
-      rcv_n=`wc -l < "$rcv_text"`
-      echo "rcv_n=$rcv_n exp_n=$exp_n"
-      test $rcv_n -ge $exp_n])
-   sort $exp_text > expout
- }
-])
+  [ovn_check_packets_remove_broadcast__ "$1" "$2"
+   AT_CHECK([sort $rcv_text], [0], [expout])])
 
 AT_BANNER([OVN components])
 
@@ -136,7 +139,6 @@ fe:x => error("Invalid numeric constant.")
 (){}[[]]==!=<<=>>=!&&||..,;=<->--: => ( ) { } [[ ]] == != < <= > >= ! && || .. , ; = <-> -- :
 & => error("`&' is only valid as part of `&&'.")
 | => error("`|' is only valid as part of `||'.")
-- => error("`-' is only valid as part of `--'.")
 
 ^ => error("Invalid character `^' in input.")
 ])
@@ -1049,15 +1051,29 @@ ct_dnat(192.168.1.2);
 ct_dnat(fd11::2);
     encodes as ct(commit,table=19,zone=NXM_NX_REG11[0..15],nat(dst=fd11::2))
     has prereqs ip
+ct_dnat(192.168.1.2, 1-3000);
+    formats as ct_dnat(192.168.1.2,1-3000);
+    encodes as ct(commit,table=19,zone=NXM_NX_REG11[0..15],nat(dst=192.168.1.2:1-3000))
+    has prereqs ip
 
 ct_dnat(192.168.1.2, 192.168.1.3);
-    Syntax error at `,' expecting `)'.
+    Syntax error at `192.168.1.3' expecting Integer for port range.
 ct_dnat(foo);
     Syntax error at `foo' expecting IPv4 or IPv6 address.
 ct_dnat(foo, bar);
     Syntax error at `foo' expecting IPv4 or IPv6 address.
 ct_dnat();
     Syntax error at `)' expecting IPv4 or IPv6 address.
+ct_dnat(192.168.1.2, foo);
+    Syntax error at `foo' expecting Integer for port range.
+ct_dnat(192.168.1.2, 1000-foo);
+    Syntax error at `foo' expecting Integer for port range.
+ct_dnat(192.168.1.2, 1000);
+    formats as ct_dnat(192.168.1.2,1000);
+    encodes as ct(commit,table=19,zone=NXM_NX_REG11[0..15],nat(dst=192.168.1.2:1000))
+    has prereqs ip
+ct_dnat(192.168.1.2, 1000-100);
+    Syntax error at `100' range high should be greater than range lo.
 
 # ct_snat
 ct_snat;
@@ -1069,16 +1085,29 @@ ct_snat(192.168.1.2);
 ct_snat(fd11::2);
     encodes as ct(commit,table=19,zone=NXM_NX_REG12[0..15],nat(src=fd11::2))
     has prereqs ip
+ct_snat(192.168.1.2, 1-3000);
+    formats as ct_snat(192.168.1.2,1-3000);
+    encodes as ct(commit,table=19,zone=NXM_NX_REG12[0..15],nat(src=192.168.1.2:1-3000))
+    has prereqs ip
 
 ct_snat(192.168.1.2, 192.168.1.3);
-    Syntax error at `,' expecting `)'.
+    Syntax error at `192.168.1.3' expecting Integer for port range.
 ct_snat(foo);
     Syntax error at `foo' expecting IPv4 or IPv6 address.
 ct_snat(foo, bar);
     Syntax error at `foo' expecting IPv4 or IPv6 address.
 ct_snat();
     Syntax error at `)' expecting IPv4 or IPv6 address.
-
+ct_snat(192.168.1.2, foo);
+    Syntax error at `foo' expecting Integer for port range.
+ct_snat(192.168.1.2, 1000-foo);
+    Syntax error at `foo' expecting Integer for port range.
+ct_snat(192.168.1.2, 1000);
+    formats as ct_snat(192.168.1.2,1000);
+    encodes as ct(commit,table=19,zone=NXM_NX_REG12[0..15],nat(src=192.168.1.2:1000))
+    has prereqs ip
+ct_snat(192.168.1.2, 1000-100);
+    Syntax error at `100' range high should be greater than range lo.
 # ct_clear
 ct_clear;
     encodes as ct_clear
@@ -1423,8 +1452,8 @@ trigger_event(event = "empty_lb_backends", meter="event-elb" vip = "10.0.0.1:80"
     encodes as controller(userdata=00.00.00.0f.00.00.00.00.00.00.00.00.00.01.00.0b.31.30.2e.30.2e.30.2e.31.3a.38.30.00.02.00.03.74.63.70.00.03.00.24.31.32.33.34.35.36.37.38.2d.61.62.63.64.2d.39.38.37.36.2d.66.65.64.63.2d.31.31.31.31.39.66.38.65.37.64.36.63,meter_id=5)
 
 # Testing invalid vip results in extra error messages from socket-util.c
-trigger_event(event = "empty_lb_backends", vip = "10.0.0.1:80", protocol = "sctp", load_balancer = "12345678-abcd-9876-fedc-11119f8e7d6c");
-    Load balancer protocol 'sctp' is not 'tcp' or 'udp'
+trigger_event(event = "empty_lb_backends", vip = "10.0.0.1:80", protocol = "aarp", load_balancer = "12345678-abcd-9876-fedc-11119f8e7d6c");
+    Load balancer protocol 'aarp' is not 'tcp', 'udp', or 'sctp'
 trigger_event(event = "empty_lb_backends", vip = "10.0.0.1:80", protocol = "tcp", load_balancer = "bacon");
     Load balancer 'bacon' is not a UUID
 
@@ -1524,6 +1553,10 @@ fwd_group();
 
 fwd_group(liveness="false", childports="eth0", "lsp1");
     Syntax error at `"false"' expecting `,'.
+
+# prefix delegation
+handle_dhcpv6_reply;
+    encodes as controller(userdata=00.00.00.13.00.00.00.00)
 
 # Miscellaneous negative tests.
 ;
@@ -11280,13 +11313,13 @@ options:rxq_pcap=${pcap_file}-rx.pcap
 # This function sends ipv6 packet
 test_ipv6() {
     local inport=$1 src_mac=$2 dst_mac=$3 src_ip=$4 dst_ip=$5
-    local dst_mcast_mac=$6 mcast_node_ip=$7 nd_target=$8
+    local dst_mcast_mac=$6 mcast_node_ip=$7 nd_target=$8 nd_src_ip=$9
 
     local packet=${dst_mac}${src_mac}86dd6000000000083aff${src_ip}${dst_ip}
     packet=${packet}8000000000000000
 
     src_mac=000002010204
-    expected_packet=${dst_mcast_mac}${src_mac}86dd6000000000203aff${src_ip}
+    expected_packet=${dst_mcast_mac}${src_mac}86dd6000000000203aff${nd_src_ip}
     expected_packet=${expected_packet}${mcast_node_ip}8700XXXX00000000
     expected_packet=${expected_packet}${nd_target}0101${src_mac}
 
@@ -11298,6 +11331,7 @@ test_ipv6() {
 src_mac=506400000002
 dst_mac=00000000af01
 src_ip=aef0000000000000526400fffe000002
+nd_src_ip=fe80000000000000020002fffe010204
 dst_ip=20010db800010000020002fffe010205
 dst_mcast_mac=3333ff010205
 mcast_node_ip=ff0200000000000000000001ff010205
@@ -11305,7 +11339,7 @@ nd_target=20010db800010000020002fffe010205
 # Send an IPv6 packet. Generated IPv6 Neighbor solicitation packet
 # should be received by the ports attached to br-phys.
 test_ipv6 1 $src_mac $dst_mac $src_ip $dst_ip $dst_mcast_mac \
-$mcast_node_ip $nd_target
+$mcast_node_ip $nd_target $nd_src_ip
 
 OVS_WAIT_WHILE([test 24 = $(wc -c hv1/br-phys_n1-tx.pcap | cut -d " " -f1)])
 OVS_WAIT_WHILE([test 24 = $(wc -c hv1/br-phys-tx.pcap | cut -d " " -f1)])
@@ -11338,7 +11372,7 @@ dst_mcast_mac=3333ff011305
 mcast_node_ip=ff0200000000000000000001ff011305
 nd_target=20010db800010000020002fffe011305
 test_ipv6 1 $src_mac $dst_mac $src_ip $dst_ip $dst_mcast_mac \
-$mcast_node_ip $nd_target
+$mcast_node_ip $nd_target $nd_src_ip
 
 OVS_WAIT_WHILE([test 24 = $(wc -c hv1/br-phys_n1-tx.pcap | cut -d " " -f1)])
 OVS_WAIT_WHILE([test 24 = $(wc -c hv1/br-phys-tx.pcap | cut -d " " -f1)])
@@ -14262,7 +14296,7 @@ send_na() {
 get_nd() {
     local eth_src=$1 src_ip=$2 dst_ip=$3 ta=$4
     local ip6_hdr=6000000000203aff${src_ip}${dst_ip}
-    request=3333ff000010${eth_src}86dd${ip6_hdr}8700357600000000${ta}0101${eth_src}
+    request=3333ff000010${eth_src}86dd${ip6_hdr}870051f400000000${ta}0101${eth_src}
 
     echo $request
 }
@@ -14325,6 +14359,8 @@ router_mac1=000002010203
 router_ip=$(ip_to_hex 172 16 1 1)
 router_ip6=20020000000000000000000000000001
 
+nd_src_ip6=fe80000000000000020002fffe010203
+
 dst_mac=001122334455
 dst_ip=$(ip_to_hex 172 16 1 10)
 dst_ip6=20020000000000000000000000000010
@@ -14342,7 +14378,7 @@ nd_ip=ff0200000000000000000001ff000010
 ip6_hdr=6000000000083afe${src_ip6}${dst_ip6}
 
 send_icmp6_packet 1 1 $src_mac $router_mac0 $src_ip6 $dst_ip6
-echo $(get_nd $router_mac1 $src_ip6 $nd_ip $dst_ip6) >> expected
+echo $(get_nd $router_mac1 $nd_src_ip6 $nd_ip $dst_ip6) >> expected
 echo "${dst_mac}${router_mac1}86dd${ip6_hdr}8000dcb662f00001" >> expected
 send_na 2 1 $dst_mac $router_mac1 $dst_ip6 $router_ip6
 
@@ -14891,6 +14927,11 @@ ovs-vsctl -- add-port br-int hv1-vif2 -- \
     options:tx_pcap=hv1/vif2-tx.pcap \
     options:rxq_pcap=hv1/vif2-rx.pcap \
     ofport-request=2
+ovs-vsctl -- add-port br-int hv1-vif3 -- \
+    set interface hv1-vif3 \
+    options:tx_pcap=hv1/vif3-tx.pcap \
+    options:rxq_pcap=hv1/vif3-rx.pcap \
+    ofport-request=3
 
 sim_add hv2
 as hv2
@@ -14984,6 +15025,21 @@ logical_port=sw0-vir) = x], [0], [])
 AT_CHECK([test x$(ovn-sbctl --bare --columns virtual_parent find port_binding \
 logical_port=sw0-vir) = x])
 
+# Try to bind sw0-vir directly to an OVS port. This should be ignored by
+# ovn-controller.
+as hv1
+ovs-vsctl set interface hv1-vif3 external-ids:iface-id=sw0-vir
+
+AT_CHECK([test x$(ovn-sbctl --bare --columns chassis find port_binding \
+logical_port=sw0-vir) = x], [0], [])
+
+# Cleanup hv1-vif3.
+as hv1
+ovs-vsctl del-port hv1-vif3
+
+AT_CHECK([test x$(ovn-sbctl --bare --columns chassis find port_binding \
+logical_port=sw0-vir) = x], [0], [])
+
 # From sw0-p0 send GARP for 10.0.0.10. hv1 should claim sw0-vir
 # and sw0-p1 should be its virtual_parent.
 eth_src=505400000003
@@ -15006,6 +15062,24 @@ ovn-sbctl dump-flows lr0 | grep lr_in_arp_resolve | grep "reg0 == 10.0.0.10" \
 AT_CHECK([cat lflows.txt], [0], [dnl
   table=12(lr_in_arp_resolve  ), priority=100  , match=(outport == "lr0-sw0" && reg0 == 10.0.0.10), action=(eth.dst = 50:54:00:00:00:03; next;)
 ])
+
+# Forcibly clear virtual_parent. ovn-controller should release the binding
+# gracefully.
+pb_uuid=$(ovn-sbctl --bare --columns _uuid find port_binding logical_port=sw0-vir)
+ovn-sbctl clear port_binding $pb_uuid virtual_parent
+
+OVS_WAIT_UNTIL([test x$(ovn-sbctl --bare --columns chassis find port_binding \
+logical_port=sw0-vir) = x])
+
+# From sw0-p0 resend GARP for 10.0.0.10. hv1 should reclaim sw0-vir
+# and sw0-p1 should be its virtual_parent.
+send_garp 1 1 $eth_src $eth_dst $spa $tpa
+
+OVS_WAIT_UNTIL([test x$(ovn-sbctl --bare --columns chassis find port_binding \
+logical_port=sw0-vir) = x$hv1_ch_uuid], [0], [])
+
+AT_CHECK([test x$(ovn-sbctl --bare --columns virtual_parent find port_binding \
+logical_port=sw0-vir) = xsw0-p1])
 
 # From sw0-p3 send GARP for 10.0.0.10. hv1 should claim sw0-vir
 # and sw0-p3 should be its virtual_parent.
@@ -17874,6 +17948,123 @@ AT_CHECK([cat lflows.txt], [0], [dnl
 ])
 
 OVN_CLEANUP([hv1], [hv2])
+AT_CLEANUP
+
+AT_SETUP([ovn -- SCTP Load balancer health checks])
+AT_KEYWORDS([lb sctp])
+
+# Currently this test just ensures that no service monitors get created when
+# An SCTP load balancer is configured to use health checks. Once SCTP load
+# balancers are modified to allow health checks, this test should be altered
+# to ensure the health check succeeds.
+
+ovn_start
+
+# Set up same network as previous health check test. As long as health checks
+# aren't allowed for SCTP load balancers, the network will not be used for
+# much. However, having the network in place will make it easy to alter when
+# health checks are allowed.
+
+net_add n1
+
+sim_add hv1
+as hv1
+ovs-vsctl add-br br-phys
+ovn_attach n1 br-phys 192.168.0.1
+ovs-vsctl -- add-port br-int hv1-vif1 -- \
+    set interface hv1-vif1 external-ids:iface-id=sw0-p1 \
+    options:tx_pcap=hv1/vif1-tx.pcap \
+    options:rxq_pcap=hv1/vif1-rx.pcap \
+    ofport-request=1
+ovs-vsctl -- add-port br-int hv1-vif2 -- \
+    set interface hv1-vif2 external-ids:iface-id=sw0-p2 \
+    options:tx_pcap=hv1/vif2-tx.pcap \
+    options:rxq_pcap=hv1/vif2-rx.pcap \
+    ofport-request=2
+
+sim_add hv2
+as hv2
+ovs-vsctl add-br br-phys
+ovn_attach n1 br-phys 192.168.0.2
+ovs-vsctl -- add-port br-int hv2-vif1 -- \
+    set interface hv2-vif1 external-ids:iface-id=sw1-p1 \
+    options:tx_pcap=hv2/vif1-tx.pcap \
+    options:rxq_pcap=hv2/vif1-rx.pcap \
+    ofport-request=1
+
+ovn-nbctl ls-add sw0
+
+ovn-nbctl lsp-add sw0 sw0-p1
+ovn-nbctl lsp-set-addresses sw0-p1 "50:54:00:00:00:03 10.0.0.3"
+ovn-nbctl lsp-set-port-security sw0-p1 "50:54:00:00:00:03 10.0.0.3"
+
+ovn-nbctl lsp-add sw0 sw0-p2
+ovn-nbctl lsp-set-addresses sw0-p2 "50:54:00:00:00:04 10.0.0.4"
+ovn-nbctl lsp-set-port-security sw0-p2 "50:54:00:00:00:04 10.0.0.4"
+
+# Create the second logical switch with one port
+ovn-nbctl ls-add sw1
+ovn-nbctl lsp-add sw1 sw1-p1
+ovn-nbctl lsp-set-addresses sw1-p1 "40:54:00:00:00:03 20.0.0.3"
+ovn-nbctl lsp-set-port-security sw1-p1 "40:54:00:00:00:03 20.0.0.3"
+
+# Create a logical router and attach both logical switches
+ovn-nbctl lr-add lr0
+ovn-nbctl lrp-add lr0 lr0-sw0 00:00:00:00:ff:01 10.0.0.1/24
+ovn-nbctl lsp-add sw0 sw0-lr0
+ovn-nbctl lsp-set-type sw0-lr0 router
+ovn-nbctl lsp-set-addresses sw0-lr0 router
+ovn-nbctl lsp-set-options sw0-lr0 router-port=lr0-sw0
+
+ovn-nbctl lrp-add lr0 lr0-sw1 00:00:00:00:ff:02 20.0.0.1/24
+ovn-nbctl lsp-add sw1 sw1-lr0
+ovn-nbctl lsp-set-type sw1-lr0 router
+ovn-nbctl lsp-set-addresses sw1-lr0 router
+ovn-nbctl lsp-set-options sw1-lr0 router-port=lr0-sw1
+
+ovn-nbctl lb-add lb1 10.0.0.10:80 10.0.0.3:80,20.0.0.3:80 sctp
+
+ovn-nbctl --wait=sb set load_balancer . ip_port_mappings:10.0.0.3=sw0-p1:10.0.0.2
+ovn-nbctl --wait=sb set load_balancer . ip_port_mappings:20.0.0.3=sw1-p1:10.0.0.2
+
+ovn-nbctl --wait=sb -- --id=@hc create \
+Load_Balancer_Health_Check vip="10.0.0.10\:80" -- add Load_Balancer . \
+health_check @hc
+
+ovn-nbctl --wait=sb ls-lb-add sw0 lb1
+ovn-nbctl --wait=sb ls-lb-add sw1 lb1
+ovn-nbctl --wait=sb lr-lb-add lr0 lb1
+
+ovn-nbctl ls-add public
+ovn-nbctl lrp-add lr0 lr0-public 00:00:20:20:12:13 172.168.0.100/24
+ovn-nbctl lsp-add public public-lr0
+ovn-nbctl lsp-set-type public-lr0 router
+ovn-nbctl lsp-set-addresses public-lr0 router
+ovn-nbctl lsp-set-options public-lr0 router-port=lr0-public
+
+# localnet port
+ovn-nbctl lsp-add public ln-public
+ovn-nbctl lsp-set-type ln-public localnet
+ovn-nbctl lsp-set-addresses ln-public unknown
+ovn-nbctl lsp-set-options ln-public network_name=public
+
+# schedule the gw router port to a chassis. Change the name of the chassis
+ovn-nbctl --wait=hv lrp-set-gateway-chassis lr0-public hv1 20
+
+OVN_POPULATE_ARP
+ovn-nbctl --wait=hv sync
+
+# And now for the anticlimax. We need to ensure that there is no
+# service monitor in the southbound db.
+
+AT_CHECK([test 0 = `ovn-sbctl --bare --columns _uuid find \
+service_monitor | sed '/^$/d' | wc -l`])
+
+# Let's also be sure the warning message about SCTP load balancers is
+# is in the ovn-northd log
+
+AT_CHECK([test 1 = `grep -c "SCTP load balancers do not currently support health checks" northd/ovn-northd.log`])
+
 AT_CLEANUP
 
 AT_SETUP([ovn -- ARP/ND request broadcast limiting])
