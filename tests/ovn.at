@@ -9318,6 +9318,7 @@ OVN_CHECK_PACKETS([hv3/vif1-tx.pcap], [hv3-vif1.expected])
 
 # Now add bridge-mappings on hv2, which should make everything work
 as hv2 ovs-vsctl set open . external-ids:ovn-bridge-mappings=phys:br-phys
+sleep 1
 
 # Wait until the patch ports are created in hv2 to connect br-int to br-phys
 OVS_WAIT_UNTIL([test 1 = `as hv2 ovs-vsctl show | \
@@ -17356,17 +17357,18 @@ ovs-vsctl add-br br-phys
 ovs-vsctl set open . external-ids:ovn-bridge-mappings=phys:br-phys
 ovn_attach n1 br-phys 192.168.0.1
 
-ovs-vsctl add-port br-int vif11 -- \
-    set Interface vif11 external-ids:iface-id=lp11 \
-                          options:tx_pcap=hv1/vif11-tx.pcap \
-                          options:rxq_pcap=hv1/vif11-rx.pcap \
-                          ofport-request=11
 
 lsp_name=lp11
 
 ovn-nbctl lsp-add ls1 lp11
 ovn-nbctl lsp-set-addresses lp11 "f0:00:00:00:00:11"
 ovn-nbctl lsp-set-port-security lp11 f0:00:00:00:00:11
+
+ovs-vsctl add-port br-int vif11 -- \
+    set Interface vif11 external-ids:iface-id=lp11 \
+                          options:tx_pcap=hv1/vif11-tx.pcap \
+                          options:rxq_pcap=hv1/vif11-rx.pcap \
+                          ofport-request=11
 
 OVS_WAIT_UNTIL([test x`ovn-nbctl lsp-get-up lp11` = xup])
 
