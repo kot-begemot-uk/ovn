@@ -447,6 +447,18 @@ is_our_chassis(const struct sbrec_chassis *chassis_rec,
     const struct ovsrec_interface *iface_rec
         = shash_find_data(lport_to_iface, binding_rec->logical_port);
 
+    /* Ports of type "virtual" should never be explicitly bound to an OVS
+     * port in the integration bridge. If that's the case, ignore the binding
+     * and log a warning.
+     */
+    if (iface_rec && !strcmp(binding_rec->type, "virtual")) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
+        VLOG_WARN_RL(&rl,
+                     "Virtual port %s should not be bound to OVS port %s",
+                     binding_rec->logical_port, iface_rec->name);
+        return false;
+    }
+
     bool our_chassis = false;
     if (iface_rec
         || (binding_rec->parent_port && binding_rec->parent_port[0] &&
@@ -625,22 +637,26 @@ consider_local_virtual_port(struct ovsdb_idl_index *sbrec_port_binding_by_name,
                             const struct sbrec_chassis *chassis_rec,
                             const struct sbrec_port_binding *binding_rec)
 {
+    if (binding_rec->virtual_parent) {
+        const struct sbrec_port_binding *parent =
+            lport_lookup_by_name(sbrec_port_binding_by_name,
+                                 binding_rec->virtual_parent);
+        if (parent && parent->chassis == chassis_rec) {
+            return;
+        }
+    }
+
     /* pinctrl module takes care of binding the ports of type 'virtual'.
      * Release such ports if their virtual parents are no longer claimed by
      * this chassis.
      */
-    const struct sbrec_port_binding *parent =
-        lport_lookup_by_name(sbrec_port_binding_by_name,
-                             binding_rec->virtual_parent);
-    if (!parent || parent->chassis != chassis_rec) {
-        VLOG_INFO("Releasing lport %s from this chassis.",
-                  binding_rec->logical_port);
-        if (binding_rec->encap) {
-            sbrec_port_binding_set_encap(binding_rec, NULL);
-        }
-        sbrec_port_binding_set_chassis(binding_rec, NULL);
-        sbrec_port_binding_set_virtual_parent(binding_rec, NULL);
+    VLOG_INFO("Releasing lport %s from this chassis.",
+              binding_rec->logical_port);
+    if (binding_rec->encap) {
+        sbrec_port_binding_set_encap(binding_rec, NULL);
     }
+    sbrec_port_binding_set_chassis(binding_rec, NULL);
+    sbrec_port_binding_set_virtual_parent(binding_rec, NULL);
 }
 
 static void
