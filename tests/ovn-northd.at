@@ -696,6 +696,8 @@ ovn-nbctl lsp-set-type sw2-lr2 router
 ovn-nbctl lsp-set-addresses sw2-lr2 router
 ovn-nbctl lsp-set-options sw2-lr2 router-port=lr2-sw2
 
+ovn-nbctl --wait=sb sync
+
 # Bind sw2-p1 to comp1
 ovn-sbctl lsp-bind sw2-p1 comp1
 # Wait until sw2-p1 is up
