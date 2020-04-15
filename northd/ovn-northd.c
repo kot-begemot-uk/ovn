@@ -47,6 +47,7 @@
 #include "unixctl.h"
 #include "util.h"
 #include "uuid.h"
+#include "async-io.h"
 #include "openvswitch/vlog.h"
 
 VLOG_DEFINE_THIS_MODULE(ovn_northd);
@@ -11725,6 +11726,7 @@ main(int argc, char *argv[])
     unixctl_command_register("status", "", 0, 0, ovn_northd_status, &state);
 
     daemonize_complete();
+    async_io_enable();
 
     /* We want to detect (almost) all changes to the ovn-nb db. */
     struct ovsdb_idl_loop ovnnb_idl_loop = OVSDB_IDL_LOOP_INITIALIZER(
