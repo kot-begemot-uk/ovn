@@ -63,6 +63,7 @@
 #include "timeval.h"
 #include "timer.h"
 #include "stopwatch.h"
+#include "async-io.h"
 #include "lib/inc-proc-eng.h"
 
 VLOG_DEFINE_THIS_MODULE(main);
@@ -1739,6 +1740,7 @@ main(int argc, char *argv[])
                              &exit_args);
 
     daemonize_complete();
+    async_io_enable();
 
     pinctrl_init();
     lflow_init();

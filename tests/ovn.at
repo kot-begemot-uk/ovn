@@ -17439,6 +17439,9 @@ ovs-vsctl add-port br-int vif11 -- \
 lsp_name=lp11
 
 ovn-nbctl lsp-add ls1 lp11
+OVS_WAIT_UNTIL([test $(as hv1 ovs-vsctl --bare --columns _uuid list \
+    interface patch-br-int-to-ln1 | wc -l)] = 1)
+
 ovn-nbctl lsp-set-addresses lp11 "f0:00:00:00:00:11"
 ovn-nbctl lsp-set-port-security lp11 f0:00:00:00:00:11
 
