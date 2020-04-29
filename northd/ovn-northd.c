@@ -1085,7 +1085,7 @@ build_datapaths(struct northd_context *ctx, struct hmap *datapaths,
             if (tunnel_key && ovn_tnlid_in_use(&global_dp_tnlids, tunnel_key)) {
                 static struct vlog_rate_limit rl =
                     VLOG_RATE_LIMIT_INIT(1, 1);
-                VLOG_WARN_RL(&rl, "Cannot create datapath binding for "
+                VLOG_WARN_RL(&rl, "(nb_only) Cannot create datapath binding for "
                              "logical switch %s due to duplicate key set "
                              "in other_config:requested-tnl-key: %"PRId64,
                              od->nbs->name, tunnel_key);
@@ -1105,6 +1105,7 @@ build_datapaths(struct northd_context *ctx, struct hmap *datapaths,
     }
 
     /* Sync from northbound to southbound record for od existed in both. */
+
     LIST_FOR_EACH (od, list, &both) {
         if (od->nbs) {
             int64_t tunnel_key = smap_get_int(&od->nbs->other_config,
@@ -1114,7 +1115,7 @@ build_datapaths(struct northd_context *ctx, struct hmap *datapaths,
                 if (ovn_tnlid_in_use(&global_dp_tnlids, tunnel_key)) {
                     static struct vlog_rate_limit rl =
                         VLOG_RATE_LIMIT_INIT(1, 1);
-                    VLOG_WARN_RL(&rl, "Cannot update datapath binding key for "
+                    VLOG_WARN_RL(&rl, "(both) Cannot update datapath binding key for "
                                  "logical switch %s due to duplicate key set "
                                  "in other_config:requested-tnl-key: %"PRId64,
                                  od->nbs->name, tunnel_key);
