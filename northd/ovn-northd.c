@@ -879,7 +879,7 @@ destroy_mcast_info_for_datapath(struct ovn_datapath *od)
         destroy_mcast_info_for_switch_datapath(od);
     }
 
-    ovn_destroy_tnlids(&od->mcast_info.group_tnlids);
+    ovn_destroy_local_update_global_tnlids(&od->mcast_info.group_tnlids, &global_dp_tnlids);
 }
 
 static void
