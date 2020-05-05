@@ -505,9 +505,12 @@ init_mcast_port_info(struct mcast_port_info *mcast_info,
 static uint32_t
 ovn_mcast_group_allocate_key(struct mcast_info *mcast_info)
 {
-    return ovn_allocate_tnlid(&mcast_info->group_tnlids, "multicast group",
+    uint32_t retval =
+        ovn_allocate_tnlid(&mcast_info->group_tnlids, "multicast group",
                               OVN_MIN_IP_MULTICAST, OVN_MAX_IP_MULTICAST,
                               &mcast_info->group_tnlid_hint);
+    ovn_add_tnlid(&global_dp_tnlids, retval);
+    return retval;
 }
 
 /* The 'key' comes from nbs->header_.uuid or nbr->header_.uuid or
@@ -1042,8 +1045,11 @@ static uint32_t
 ovn_datapath_allocate_key(struct hmap *dp_tnlids)
 {
     static uint32_t hint;
-    return ovn_allocate_tnlid(dp_tnlids, "datapath", OVN_MIN_DP_KEY_LOCAL,
+    uint32_t retval = 
+        ovn_allocate_tnlid(dp_tnlids, "datapath", OVN_MIN_DP_KEY_LOCAL,
                               OVN_MAX_DP_KEY_LOCAL, &hint);
+    ovn_add_tnlid(&global_dp_tnlids, retval);
+    return retval;
 }
 
 /* Updates the southbound Datapath_Binding table so that it contains the
@@ -1091,7 +1097,6 @@ build_datapaths(struct northd_context *ctx, struct hmap *datapaths,
                 break;
             }
         }
-        ovn_add_tnlid_safe(&global_dp_tnlids, tunnel_key);
 
         od->sb = sbrec_datapath_binding_insert(ctx->ovnsb_txn);
         ovn_datapath_update_external_ids(od);
@@ -1115,7 +1120,6 @@ build_datapaths(struct northd_context *ctx, struct hmap *datapaths,
                     continue;
                 }
                 sbrec_datapath_binding_set_tunnel_key(od->sb, tunnel_key);
-                ovn_add_tnlid_safe(&global_dp_tnlids, od->sb->tunnel_key);
             }
         }
     }
@@ -1248,8 +1252,11 @@ ovn_port_find(const struct hmap *ports, const char *name)
 static uint32_t
 ovn_port_allocate_key(struct ovn_datapath *od)
 {
-    return ovn_allocate_tnlid(&od->port_tnlids, "port",
+    uint32_t retval =
+    ovn_allocate_tnlid(&od->port_tnlids, "port",
                               1, (1u << 15) - 1, &od->port_key_hint);
+    ovn_add_tnlid(&global_dp_tnlids, retval);
+    return retval;
 }
 
 /* Returns true if the logical switch port 'enabled' column is empty or
@@ -3067,7 +3074,6 @@ ovn_port_update_sbrec(struct northd_context *ctx,
                          op_get_name(op), tnl_key);
         } else {
             sbrec_port_binding_set_tunnel_key(op->sb, tnl_key);
-            ovn_add_tnlid_safe(&global_dp_tnlids, tnl_key);
         }
     }
 }
@@ -3487,7 +3493,6 @@ build_ports(struct northd_context *ctx,
             }
         }
 
-        ovn_add_tnlid_safe(&global_dp_tnlids, tunnel_key);
         ovn_port_set_sb(op, sbrec_port_binding_insert(ctx->ovnsb_txn));
         ovn_port_update_sbrec(ctx, sbrec_chassis_by_name, op,
                               &chassis_qdisc_queues,
@@ -3713,7 +3718,6 @@ ovn_igmp_group_add(struct northd_context *ctx, struct hmap *igmp_groups,
             igmp_group->mcgroup.key = mcgroup->tunnel_key;
             ovn_add_tnlid(&datapath->mcast_info.group_tnlids,
                           mcgroup->tunnel_key);
-            ovn_add_tnlid_safe(&global_dp_tnlids, mcgroup->tunnel_key);
         } else {
             igmp_group->mcgroup.key = 0;
         }
