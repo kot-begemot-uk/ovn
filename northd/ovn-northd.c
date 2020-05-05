@@ -878,7 +878,7 @@ destroy_mcast_info_for_datapath(struct ovn_datapath *od)
     if (od->nbs) {
         destroy_mcast_info_for_switch_datapath(od);
     }
-
+    // TODO - do we really need to destroy these?
     ovn_destroy_local_update_global_tnlids(&od->mcast_info.group_tnlids, &global_dp_tnlids);
 }
 
@@ -1062,11 +1062,11 @@ build_datapaths(struct northd_context *ctx, struct hmap *datapaths,
     /* First index the in-use datapath tunnel IDs. */
 
     struct ovn_datapath *od, *next;
-    if (!ovs_list_is_empty(&nb_only) || !ovs_list_is_empty(&both)) {
-        LIST_FOR_EACH (od, list, &both) {
-            ovn_add_tnlid_safe(&global_dp_tnlids, od->sb->tunnel_key);
-        }
-    }
+    //if (!ovs_list_is_empty(&nb_only) || !ovs_list_is_empty(&both)) {
+       // LIST_FOR_EACH (od, list, &both) {
+       //     ovn_add_tnlid_safe(&global_dp_tnlids, od->sb->tunnel_key);
+       // }
+    //}
 
     /* Add southbound record for each unmatched northbound record. */
     LIST_FOR_EACH (od, list, &nb_only) {
@@ -1091,6 +1091,7 @@ build_datapaths(struct northd_context *ctx, struct hmap *datapaths,
                 break;
             }
         }
+        ovn_add_tnlid_safe(&global_dp_tnlids, tunnel_key);
 
         od->sb = sbrec_datapath_binding_insert(ctx->ovnsb_txn);
         ovn_datapath_update_external_ids(od);
@@ -1114,6 +1115,7 @@ build_datapaths(struct northd_context *ctx, struct hmap *datapaths,
                     continue;
                 }
                 sbrec_datapath_binding_set_tunnel_key(od->sb, tunnel_key);
+                ovn_add_tnlid_safe(&global_dp_tnlids, od->sb->tunnel_key);
             }
         }
     }
@@ -3065,6 +3067,7 @@ ovn_port_update_sbrec(struct northd_context *ctx,
                          op_get_name(op), tnl_key);
         } else {
             sbrec_port_binding_set_tunnel_key(op->sb, tnl_key);
+            ovn_add_tnlid_safe(&global_dp_tnlids, tnl_key);
         }
     }
 }
@@ -3448,7 +3451,6 @@ build_ports(struct northd_context *ctx,
     /* For logical ports that are in both databases, index the in-use
      * tunnel_keys. */
     LIST_FOR_EACH (op, list, &both) {
-        ovn_add_tnlid(&op->od->port_tnlids, op->sb->tunnel_key);
         if (op->sb->tunnel_key > op->od->port_key_hint) {
             op->od->port_key_hint = op->sb->tunnel_key;
         }
@@ -3485,6 +3487,7 @@ build_ports(struct northd_context *ctx,
             }
         }
 
+        ovn_add_tnlid_safe(&global_dp_tnlids, tunnel_key);
         ovn_port_set_sb(op, sbrec_port_binding_insert(ctx->ovnsb_txn));
         ovn_port_update_sbrec(ctx, sbrec_chassis_by_name, op,
                               &chassis_qdisc_queues,
@@ -3710,6 +3713,7 @@ ovn_igmp_group_add(struct northd_context *ctx, struct hmap *igmp_groups,
             igmp_group->mcgroup.key = mcgroup->tunnel_key;
             ovn_add_tnlid(&datapath->mcast_info.group_tnlids,
                           mcgroup->tunnel_key);
+            ovn_add_tnlid_safe(&global_dp_tnlids, mcgroup->tunnel_key);
         } else {
             igmp_group->mcgroup.key = 0;
         }
