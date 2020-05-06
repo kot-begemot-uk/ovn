@@ -473,6 +473,27 @@ ovn_destroy_tnlids(struct hmap *tnlids)
 }
 
 void
+ovn_destroy_local_update_global_tnlids(struct hmap *local, struct hmap *global)
+{
+    struct tnlid_node *node, *gnode;
+    HMAP_FOR_EACH_POP (node, hmap_node, local) {
+        bool to_remove = false;
+
+        HMAP_FOR_EACH_IN_BUCKET (gnode, hmap_node, hash_int(node->tnlid, 0), global) {
+            if (gnode->tnlid == node->tnlid) {
+                to_remove = true;
+                break;
+            }
+        }
+        if (to_remove) {
+            hmap_remove(global, &gnode->hmap_node);
+        }
+        free(node);
+    }
+    hmap_destroy(local);
+}
+
+void
 ovn_add_tnlid(struct hmap *set, uint32_t tnlid)
 {
     struct tnlid_node *node = xmalloc(sizeof *node);
