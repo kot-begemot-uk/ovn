@@ -283,7 +283,8 @@ ovn_stage_to_datapath_type(enum ovn_stage stage)
     default: OVS_NOT_REACHED();
     }
 }
-    static struct hmap global_dp_tnlids = HMAP_INITIALIZER(&global_dp_tnlids);
+
+static struct hmap global_dp_tnlids = HMAP_INITIALIZER(&global_dp_tnlids);
 
 static void
 usage(void)
