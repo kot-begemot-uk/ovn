@@ -283,6 +283,8 @@ ovn_stage_to_datapath_type(enum ovn_stage stage)
     default: OVS_NOT_REACHED();
     }
 }
+
+static struct hmap global_dp_tnlids = HMAP_INITIALIZER(&global_dp_tnlids);
 
 static void
 usage(void)
@@ -504,9 +506,12 @@ init_mcast_port_info(struct mcast_port_info *mcast_info,
 static uint32_t
 ovn_mcast_group_allocate_key(struct mcast_info *mcast_info)
 {
-    return ovn_allocate_tnlid(&mcast_info->group_tnlids, "multicast group",
+    uint32_t retval =
+        ovn_allocate_tnlid(&mcast_info->group_tnlids, "multicast group",
                               OVN_MIN_IP_MULTICAST, OVN_MAX_IP_MULTICAST,
                               &mcast_info->group_tnlid_hint);
+    ovn_add_tnlid(&global_dp_tnlids, retval);
+    return retval;
 }
 
 /* The 'key' comes from nbs->header_.uuid or nbr->header_.uuid or
@@ -609,7 +614,7 @@ ovn_datapath_destroy(struct hmap *datapaths, struct ovn_datapath *od)
          * private list and once we've exited that function it is not safe to
          * use it. */
         hmap_remove(datapaths, &od->key_node);
-        ovn_destroy_tnlids(&od->port_tnlids);
+        ovn_destroy_local_update_global_tnlids(&od->port_tnlids, &global_dp_tnlids);
         bitmap_free(od->ipam_info.allocated_ipv4s);
         free(od->router_ports);
         ovn_ls_port_group_destroy(&od->nb_pgs);
@@ -877,8 +882,8 @@ destroy_mcast_info_for_datapath(struct ovn_datapath *od)
     if (od->nbs) {
         destroy_mcast_info_for_switch_datapath(od);
     }
-
-    ovn_destroy_tnlids(&od->mcast_info.group_tnlids);
+    // TODO - do we really need to destroy these?
+    ovn_destroy_local_update_global_tnlids(&od->mcast_info.group_tnlids, &global_dp_tnlids);
 }
 
 static void
@@ -1041,8 +1046,11 @@ static uint32_t
 ovn_datapath_allocate_key(struct hmap *dp_tnlids)
 {
     static uint32_t hint;
-    return ovn_allocate_tnlid(dp_tnlids, "datapath", OVN_MIN_DP_KEY_LOCAL,
+    uint32_t retval = 
+        ovn_allocate_tnlid(dp_tnlids, "datapath", OVN_MIN_DP_KEY_LOCAL,
                               OVN_MAX_DP_KEY_LOCAL, &hint);
+    ovn_add_tnlid(&global_dp_tnlids, retval);
+    return retval;
 }
 
 /* Updates the southbound Datapath_Binding table so that it contains the
@@ -1059,13 +1067,13 @@ build_datapaths(struct northd_context *ctx, struct hmap *datapaths,
     join_datapaths(ctx, datapaths, &sb_only, &nb_only, &both, lr_list);
 
     /* First index the in-use datapath tunnel IDs. */
-    struct hmap dp_tnlids = HMAP_INITIALIZER(&dp_tnlids);
+
     struct ovn_datapath *od, *next;
-    if (!ovs_list_is_empty(&nb_only) || !ovs_list_is_empty(&both)) {
-        LIST_FOR_EACH (od, list, &both) {
-            ovn_add_tnlid(&dp_tnlids, od->sb->tunnel_key);
-        }
-    }
+    //if (!ovs_list_is_empty(&nb_only) || !ovs_list_is_empty(&both)) {
+       // LIST_FOR_EACH (od, list, &both) {
+       //     ovn_add_tnlid_safe(&global_dp_tnlids, od->sb->tunnel_key);
+       // }
+    //}
 
     /* Add southbound record for each unmatched northbound record. */
     LIST_FOR_EACH (od, list, &nb_only) {
@@ -1074,7 +1082,7 @@ build_datapaths(struct northd_context *ctx, struct hmap *datapaths,
             tunnel_key = smap_get_int(&od->nbs->other_config,
                                       "requested-tnl-key",
                                       0);
-            if (tunnel_key && ovn_tnlid_in_use(&dp_tnlids, tunnel_key)) {
+            if (tunnel_key && ovn_tnlid_in_use(&global_dp_tnlids, tunnel_key)) {
                 static struct vlog_rate_limit rl =
                     VLOG_RATE_LIMIT_INIT(1, 1);
                 VLOG_WARN_RL(&rl, "(nb_only) Cannot create datapath binding for "
@@ -1085,7 +1093,7 @@ build_datapaths(struct northd_context *ctx, struct hmap *datapaths,
             }
         }
         if (!tunnel_key) {
-            tunnel_key = ovn_datapath_allocate_key(&dp_tnlids);
+            tunnel_key = ovn_datapath_allocate_key(&global_dp_tnlids);
             if (!tunnel_key) {
                 break;
             }
@@ -1104,7 +1112,7 @@ build_datapaths(struct northd_context *ctx, struct hmap *datapaths,
                                               "requested-tnl-key",
                                               0);
             if (tunnel_key && tunnel_key != od->sb->tunnel_key) {
-                if (ovn_tnlid_in_use(&dp_tnlids, tunnel_key)) {
+                if (ovn_tnlid_in_use(&global_dp_tnlids, tunnel_key)) {
                     static struct vlog_rate_limit rl =
                         VLOG_RATE_LIMIT_INIT(1, 1);
                     VLOG_WARN_RL(&rl, "(both) Cannot update datapath binding key for "
@@ -1118,7 +1126,6 @@ build_datapaths(struct northd_context *ctx, struct hmap *datapaths,
         }
     }
 
-    ovn_destroy_tnlids(&dp_tnlids);
 
     /* Delete southbound records without northbound matches. */
     LIST_FOR_EACH_SAFE (od, next, list, &sb_only) {
@@ -1247,8 +1254,11 @@ ovn_port_find(const struct hmap *ports, const char *name)
 static uint32_t
 ovn_port_allocate_key(struct ovn_datapath *od)
 {
-    return ovn_allocate_tnlid(&od->port_tnlids, "port",
+    uint32_t retval =
+    ovn_allocate_tnlid(&od->port_tnlids, "port",
                               1, (1u << 15) - 1, &od->port_key_hint);
+    ovn_add_tnlid(&global_dp_tnlids, retval);
+    return retval;
 }
 
 /* Returns true if the logical switch port 'enabled' column is empty or
@@ -3449,7 +3459,6 @@ build_ports(struct northd_context *ctx,
     /* For logical ports that are in both databases, index the in-use
      * tunnel_keys. */
     LIST_FOR_EACH (op, list, &both) {
-        ovn_add_tnlid(&op->od->port_tnlids, op->sb->tunnel_key);
         if (op->sb->tunnel_key > op->od->port_key_hint) {
             op->od->port_key_hint = op->sb->tunnel_key;
         }
