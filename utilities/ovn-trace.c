@@ -125,7 +125,11 @@ main(int argc, char *argv[])
     bool exiting = false;
     if (get_detach()) {
         daemonize_start(false);
-        int error = unixctl_server_create(unixctl_path, &server);
+
+        char *abs_unixctl_path = get_abs_unix_ctl_path(unixctl_path);
+        int error = unixctl_server_create(abs_unixctl_path, &server);
+        free(abs_unixctl_path);
+
         if (error) {
             ovs_fatal(error, "failed to create unixctl server");
         }
@@ -235,7 +239,7 @@ parse_options(int argc, char *argv[])
         OPT_CT,
         OPT_FRIENDLY_NAMES,
         OPT_NO_FRIENDLY_NAMES,
-        DAEMON_OPTION_ENUMS,
+        OVN_DAEMON_OPTION_ENUMS,
         SSL_OPTION_ENUMS,
         VLOG_OPTION_ENUMS,
         OPT_LB_DST,
@@ -256,7 +260,7 @@ parse_options(int argc, char *argv[])
         {"version", no_argument, NULL, 'V'},
         {"lb-dst", required_argument, NULL, OPT_LB_DST},
         {"select-id", required_argument, NULL, OPT_SELECT_ID},
-        DAEMON_LONG_OPTIONS,
+        OVN_DAEMON_LONG_OPTIONS,
         VLOG_LONG_OPTIONS,
         STREAM_SSL_LONG_OPTIONS,
         {NULL, 0, NULL, 0},
@@ -329,7 +333,7 @@ parse_options(int argc, char *argv[])
             printf("DB Schema %s\n", sbrec_get_db_version());
             exit(EXIT_SUCCESS);
 
-        DAEMON_OPTION_HANDLERS
+        OVN_DAEMON_OPTION_HANDLERS
         VLOG_OPTION_HANDLERS
         STREAM_SSL_OPTION_HANDLERS
 
@@ -2322,7 +2326,7 @@ trace_openflow(const struct ovntrace_flow *f, struct ovs_list *super)
 
     struct ofputil_flow_stats *fses;
     size_t n_fses;
-    int error = vconn_dump_flows(vconn, &fsr, OFPUTIL_P_OF13_OXM,
+    int error = vconn_dump_flows(vconn, &fsr, OFPUTIL_P_OF15_OXM,
                                  &fses, &n_fses);
     if (error) {
         ovntrace_node_append(super, OVNTRACE_NODE_ERROR,
@@ -2431,7 +2435,7 @@ trace(const char *dp_s, const char *flow_s)
     ds_put_char(&output, '\n');
 
     if (ovs) {
-        int retval = vconn_open_block(ovs, 1 << OFP13_VERSION, 0, -1, &vconn);
+        int retval = vconn_open_block(ovs, 1 << OFP15_VERSION, 0, -1, &vconn);
         if (retval) {
             VLOG_WARN("%s: connection failed (%s)", ovs, ovs_strerror(retval));
         }

@@ -65,6 +65,7 @@ Antonio Fischetti                  antonio.fischetti@intel.com
 Anupam Chanda
 Ariel Tubaltsev                    atubaltsev@vmware.com
 Arnoldo Lutz                       arnoldo.lutz.guevara@hpe.com
+Artem Teleshev                     artem.teleshev@gmail.com
 Arun Sharma                        arun.sharma@calsoftinc.com
 Aryan TaheriMonfared               aryan.taherimonfared@uis.no
 Asaf Penso                         asafp@mellanox.com
@@ -317,6 +318,7 @@ Romain Lenglet                     romain.lenglet@berabera.info
 Roni Bar Yanai                     roniba@mellanox.com
 Russell Bryant                     russell@ovn.org
 RYAN D. MOATS                      rmoats@us.ibm.com
+Ryan Goulding                      rgouldin@redhat.com
 Ryan Wilson
 Sairam Venugopal                   vsairam@vmware.com
 Sajjad Lateef
@@ -357,6 +359,7 @@ Thomas F. Herbert                  thomasfherbert@gmail.com
 Thomas Goirand                     zigo@debian.org
 Thomas Graf                        tgraf@noironetworks.com
 Thomas Lacroix                     thomas.lacroix@citrix.com
+Tim Rozet                          trozet@redhat.com
 Timo Puha                          timox.puha@intel.com
 Timothy Redaelli                   tredaelli@redhat.com
 Todd Deshane                       deshantm@gmail.com

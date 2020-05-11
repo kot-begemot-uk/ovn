@@ -1,7 +1,6 @@
 DOC_SOURCE = \
 	Documentation/group-selection-method-property.txt \
 	Documentation/_static/logo.png \
-	Documentation/_static/overview.png \
 	Documentation/conf.py \
 	Documentation/index.rst \
 	Documentation/contents.rst \
@@ -99,10 +98,7 @@ endif
 # rules.
 
 # rST formatted manpages under Documentation/ref.
-RST_MANPAGES = \
-	ovsdb-server.7.rst \
-	ovsdb.5.rst \
-	ovsdb.7.rst
+RST_MANPAGES =
 
 # rST formatted manpages that we don't want to install because they
 # document stuff that only works with a build tree, not with an

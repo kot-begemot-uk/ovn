@@ -319,11 +319,7 @@ parse_NEXT(struct action_context *ctx)
         }
     }
 
-    if (pipeline == OVNACT_P_EGRESS && ctx->pp->pipeline == OVNACT_P_INGRESS) {
-        lexer_error(ctx->lexer,
-                    "\"next\" action cannot advance from ingress to egress "
-                    "pipeline (use \"output\" action instead)");
-    } else if (table >= ctx->pp->n_tables) {
+    if (table >= ctx->pp->n_tables) {
         lexer_error(ctx->lexer,
                     "\"next\" action cannot advance beyond table %d.",
                     ctx->pp->n_tables - 1);
@@ -779,6 +775,9 @@ parse_ct_nat(struct action_context *ctx, const char *name,
            }
 
            cn->port_range.port_lo = ntohll(ctx->lexer->token.value.integer);
+           if (cn->port_range.port_lo == 0) {
+               lexer_syntax_error(ctx->lexer, "range can't be 0");
+           }
            lexer_get(ctx->lexer);
 
            if (lexer_match(ctx->lexer, LEX_T_HYPHEN)) {
@@ -792,7 +791,7 @@ parse_ct_nat(struct action_context *ctx, const char *name,
 
                if (cn->port_range.port_hi <= cn->port_range.port_lo) {
                    lexer_syntax_error(ctx->lexer, "range high should be "
-                                      "greater than range lo");
+                                      "greater than range low");
                }
                lexer_get(ctx->lexer);
            } else {
@@ -952,9 +951,18 @@ parse_ct_lb_action(struct action_context *ctx)
     struct ovnact_ct_lb_dst *dsts = NULL;
     size_t allocated_dsts = 0;
     size_t n_dsts = 0;
+    char *hash_fields = NULL;
 
-    if (lexer_match(ctx->lexer, LEX_T_LPAREN)) {
-        while (!lexer_match(ctx->lexer, LEX_T_RPAREN)) {
+    if (lexer_match(ctx->lexer, LEX_T_LPAREN) &&
+        !lexer_match(ctx->lexer, LEX_T_RPAREN)) {
+        if (!lexer_match_id(ctx->lexer, "backends") ||
+            !lexer_force_match(ctx->lexer, LEX_T_EQUALS)) {
+            lexer_syntax_error(ctx->lexer, "expecting backends");
+            return;
+        }
+
+        while (!lexer_match(ctx->lexer, LEX_T_SEMICOLON) &&
+               !lexer_match(ctx->lexer, LEX_T_RPAREN)) {
             struct ovnact_ct_lb_dst dst;
             if (lexer_match(ctx->lexer, LEX_T_LSQUARE)) {
                 /* IPv6 address and port */
@@ -1021,12 +1029,27 @@ parse_ct_lb_action(struct action_context *ctx)
             }
             dsts[n_dsts++] = dst;
         }
+
+        if (lexer_match_id(ctx->lexer, "hash_fields")) {
+            if (!lexer_match(ctx->lexer, LEX_T_EQUALS) ||
+                ctx->lexer->token.type != LEX_T_STRING ||
+                lexer_lookahead(ctx->lexer) != LEX_T_RPAREN) {
+                lexer_syntax_error(ctx->lexer, "invalid hash_fields");
+                free(dsts);
+                return;
+            }
+
+            hash_fields = xstrdup(ctx->lexer->token.s);
+            lexer_get(ctx->lexer);
+            lexer_get(ctx->lexer);
+        }
     }
 
     struct ovnact_ct_lb *cl = ovnact_put_CT_LB(ctx->ovnacts);
     cl->ltable = ctx->pp->cur_ltable + 1;
     cl->dsts = dsts;
     cl->n_dsts = n_dsts;
+    cl->hash_fields = hash_fields;
 }
 
 static void
@@ -1034,10 +1057,10 @@ format_CT_LB(const struct ovnact_ct_lb *cl, struct ds *s)
 {
     ds_put_cstr(s, "ct_lb");
     if (cl->n_dsts) {
-        ds_put_char(s, '(');
+        ds_put_cstr(s, "(backends=");
         for (size_t i = 0; i < cl->n_dsts; i++) {
             if (i) {
-                ds_put_cstr(s, ", ");
+                ds_put_char(s, ',');
             }
 
             const struct ovnact_ct_lb_dst *dst = &cl->dsts[i];
@@ -1057,7 +1080,13 @@ format_CT_LB(const struct ovnact_ct_lb *cl, struct ds *s)
             }
         }
         ds_put_char(s, ')');
+
+        if (cl->hash_fields) {
+            ds_chomp(s, ')');
+            ds_put_format(s, "; hash_fields=\"%s\")", cl->hash_fields);
+        }
     }
+
     ds_put_char(s, ';');
 }
 
@@ -1104,7 +1133,11 @@ encode_CT_LB(const struct ovnact_ct_lb *cl,
                             : MFF_LOG_DNAT_ZONE - MFF_REG0;
 
     struct ds ds = DS_EMPTY_INITIALIZER;
-    ds_put_format(&ds, "type=select,selection_method=dp_hash");
+    ds_put_format(&ds, "type=select,selection_method=%s",
+                  cl->hash_fields ? "hash": "dp_hash");
+    if (cl->hash_fields) {
+        ds_put_format(&ds, ",fields(%s)", cl->hash_fields);
+    }
 
     BUILD_ASSERT(MFF_LOG_CT_ZONE >= MFF_REG0);
     BUILD_ASSERT(MFF_LOG_CT_ZONE < MFF_REG0 + FLOW_N_REGS);
@@ -1146,6 +1179,7 @@ static void
 ovnact_ct_lb_free(struct ovnact_ct_lb *ct_lb)
 {
     free(ct_lb->dsts);
+    free(ct_lb->hash_fields);
 }
 
 static void
@@ -1509,7 +1543,7 @@ encode_nested_actions(const struct ovnact_nest *on,
     size_t oc_offset = encode_start_controller_op(opcode, false,
                                                   NX_CTLR_NO_METER, ofpacts);
     ofpacts_put_openflow_actions(inner_ofpacts.data, inner_ofpacts.size,
-                                 ofpacts, OFP13_VERSION);
+                                 ofpacts, OFP15_VERSION);
     encode_finish_controller_op(oc_offset, ofpacts);
 
     /* Free memory. */
@@ -2312,7 +2346,7 @@ encode_PUT_DHCPV4_OPTS(const struct ovnact_put_opts *pdo,
     size_t oc_offset = encode_start_controller_op(ACTION_OPCODE_PUT_DHCP_OPTS,
                                                   true, NX_CTLR_NO_METER,
                                                   ofpacts);
-    nx_put_header(ofpacts, dst.field->id, OFP13_VERSION, false);
+    nx_put_header(ofpacts, dst.field->id, OFP15_VERSION, false);
     ovs_be32 ofs = htonl(dst.ofs);
     ofpbuf_put(ofpacts, &ofs, sizeof ofs);
 
@@ -2343,7 +2377,7 @@ encode_PUT_DHCPV6_OPTS(const struct ovnact_put_opts *pdo,
 
     size_t oc_offset = encode_start_controller_op(
         ACTION_OPCODE_PUT_DHCPV6_OPTS, true, NX_CTLR_NO_METER, ofpacts);
-    nx_put_header(ofpacts, dst.field->id, OFP13_VERSION, false);
+    nx_put_header(ofpacts, dst.field->id, OFP15_VERSION, false);
     ovs_be32 ofs = htonl(dst.ofs);
     ofpbuf_put(ofpacts, &ofs, sizeof ofs);
 
@@ -2453,7 +2487,7 @@ encode_DNS_LOOKUP(const struct ovnact_dns_lookup *dl,
     size_t oc_offset = encode_start_controller_op(ACTION_OPCODE_DNS_LOOKUP,
                                                   true, NX_CTLR_NO_METER,
                                                   ofpacts);
-    nx_put_header(ofpacts, dst.field->id, OFP13_VERSION, false);
+    nx_put_header(ofpacts, dst.field->id, OFP15_VERSION, false);
     ovs_be32 ofs = htonl(dst.ofs);
     ofpbuf_put(ofpacts, &ofs, sizeof ofs);
     encode_finish_controller_op(oc_offset, ofpacts);
@@ -2617,7 +2651,7 @@ encode_PUT_ND_RA_OPTS(const struct ovnact_put_opts *po,
 
     size_t oc_offset = encode_start_controller_op(
         ACTION_OPCODE_PUT_ND_RA_OPTS, true, NX_CTLR_NO_METER, ofpacts);
-    nx_put_header(ofpacts, dst.field->id, OFP13_VERSION, false);
+    nx_put_header(ofpacts, dst.field->id, OFP15_VERSION, false);
     ovs_be32 ofs = htonl(dst.ofs);
     ofpbuf_put(ofpacts, &ofs, sizeof ofs);
 
@@ -2848,12 +2882,13 @@ encode_SET_METER(const struct ovnact_set_meter *cl,
      * describes the meter itself. */
     char *name;
     if (cl->burst) {
-        name = xasprintf("__string: kbps burst stats bands=type=drop "
-                         "rate=%"PRId64" burst_size=%"PRId64"", cl->rate,
-                         cl->burst);
+        name = xasprintf("__string: uuid "UUID_FMT" kbps burst stats "
+                         "bands=type=drop rate=%"PRId64" burst_size=%"PRId64,
+                         UUID_ARGS(&ep->lflow_uuid), cl->rate, cl->burst);
     } else {
-        name = xasprintf("__string: kbps stats bands=type=drop "
-                         "rate=%"PRId64"", cl->rate);
+        name = xasprintf("__string: uuid "UUID_FMT" kbps stats "
+                         "bands=type=drop rate=%"PRId64,
+                         UUID_ARGS(&ep->lflow_uuid), cl->rate);
     }
 
     table_id = ovn_extend_table_assign_id(ep->meter_table, name,

@@ -374,6 +374,14 @@
         connections.
       </li>
       <li>
+        <code>reject</code> ACLs translate into logical
+        flows with the
+        <code>tcp_reset { output &lt;-&gt; inport;
+        next(pipeline=egress,table=5);}</code>
+        action for TCP connections and <code>icmp4/icmp6</code> action
+        for UDP connections.
+      </li>
+      <li>
         Other ACLs translate to <code>drop;</code> for new or untracked
         connections and <code>ct_commit(ct_label=1/1);</code> for known
         connections.  Setting <code>ct_label</code> marks a connection
@@ -551,14 +559,14 @@
     <h3>Ingress Table 11: Pre-Hairpin</h3>
     <ul>
       <li>
-        For all configured load balancer backends a priority-2 flow that
+        For all configured load balancer VIPs a priority-2 flow that
         matches on traffic that needs to be hairpinned, i.e., after load
         balancing the destination IP matches the source IP, which sets
         <code>reg0[6] = 1 </code> and executes <code>ct_snat(VIP)</code>
         to force replies to these packets to come back through OVN.
       </li>
       <li>
-        For all configured load balancer backends a priority-1 flow that
+        For all configured load balancer VIPs a priority-1 flow that
         matches on replies to hairpinned traffic, i.e., destination IP is VIP,
         source IP is the backend IP and source L4 port is backend port, which
         sets <code>reg0[6] = 1 </code> and executes <code>ct_snat;</code>.
@@ -1670,22 +1678,6 @@ next;
 
       <li>
         <p>
-          A priority-87 flow explicitly allows IPv6 multicast traffic that is
-          supposed to reach the router pipeline (e.g., neighbor solicitations
-          and traffic destined to the All-Routers multicast group).
-        </p>
-      </li>
-
-      <li>
-        <p>
-          A priority-86 flow allows IP multicast traffic if
-          <ref column="options" table="Logical_Router"/>:mcast_relay='true',
-          otherwise drops it.
-        </p>
-      </li>
-
-      <li>
-        <p>
           ICMP echo reply.  These flows reply to ICMP echo requests received
           for the router's IP address.  Let <var>A</var> be an IP address
           owned by a router port.  Then, for each <var>A</var> that is
@@ -1942,6 +1934,29 @@ nd.tll = <var>external_mac</var>;
       <li>
         Priority-85 flows which drops the ARP and IPv6 Neighbor Discovery
         packets.
+      </li>
+
+      <li>
+        <p>
+          A priority-84 flow explicitly allows IPv6 multicast traffic that is
+          supposed to reach the router pipeline (i.e., router solicitation
+          and router advertisement packets).
+        </p>
+      </li>
+
+      <li>
+        <p>
+          A priority-83 flow explicitly drops IPv6 multicast traffic that is
+          destined to reserved multicast groups.
+        </p>
+      </li>
+
+      <li>
+        <p>
+          A priority-82 flow allows IP multicast traffic if
+          <ref column="options" table="Logical_Router"/>:mcast_relay='true',
+          otherwise drops it.
+        </p>
       </li>
 
       <li>
@@ -2442,6 +2457,13 @@ output;
     <ul>
       <li>
         <p>
+          Priority-550 flow that drops IPv6 Router Solicitation/Advertisement
+          packets that were not processed in previous tables.
+        </p>
+      </li>
+
+      <li>
+        <p>
           Priority-500 flows that match IP multicast traffic destined to
           groups registered on any of the attached switches and sets
           <code>outport</code> to the associated multicast group that will
@@ -2457,7 +2479,8 @@ output;
           multicast group, which <code>ovn-northd</code> populates with the
           logical ports that have
           <ref column="options" table="Logical_Router_Port"/>
-          <code>:mcast_flood='true'</code>.
+          <code>:mcast_flood='true'</code>. If no router ports are configured
+          to flood multicast traffic the packets are dropped.
         </p>
       </li>
 
@@ -2885,18 +2908,6 @@ icmp4 {
     </p>
 
     <ul>
-      <li>
-        A priority-150 logical flow with match
-        <code>outport == <var>GW</var> &amp;&amp;
-        eth.dst == 00:00:00:00:00:00</code> has actions
-        <code>outport = <var>CR</var>; next;</code>, where
-        <var>GW</var> is the logical router distributed gateway
-        port and <var>CR</var> is the <code>chassisredirect</code>
-        port representing the instance of the logical router
-        distributed gateway port on the
-        <code>redirect-chassis</code>.
-      </li>
-
       <li>
         For each NAT rule in the OVN Northbound database that can
         be handled in a distributed manner, a priority-200 logical
