@@ -15,12 +15,14 @@
 #include <config.h>
 #include <unistd.h>
 
+#include "daemon.h"
 #include "ovn-util.h"
 #include "ovn-dirs.h"
 #include "openvswitch/vlog.h"
 #include "openvswitch/ofp-parse.h"
 #include "ovn-nb-idl.h"
 #include "ovn-sb-idl.h"
+#include <ctype.h>
 
 VLOG_DEFINE_THIS_MODULE(ovn_util);
 
@@ -377,7 +379,7 @@ default_ic_sb_db(void)
 }
 
 char *
-get_abs_unix_ctl_path(void)
+get_abs_unix_ctl_path(const char *path)
 {
 #ifdef _WIN32
     enum { WINDOWS = 1 };
@@ -386,10 +388,36 @@ get_abs_unix_ctl_path(void)
 #endif
 
     long int pid = getpid();
-    char *abs_path =
-        WINDOWS ? xasprintf("%s/%s.ctl", ovn_rundir(), program_name)
-                : xasprintf("%s/%s.%ld.ctl", ovn_rundir(), program_name, pid);
+    char *abs_path
+        = (path ? abs_file_name(ovn_rundir(), path)
+           : WINDOWS ? xasprintf("%s/%s.ctl", ovn_rundir(), program_name)
+           : xasprintf("%s/%s.%ld.ctl", ovn_rundir(), program_name, pid));
     return abs_path;
+}
+
+void
+ovn_set_pidfile(const char *name)
+{
+    char *pidfile_name = NULL;
+
+#ifndef _WIN32
+    pidfile_name = name ? abs_file_name(ovn_rundir(), name)
+                        : xasprintf("%s/%s.pid", ovn_rundir(), program_name);
+#else
+    if (name) {
+        if (strchr(name, ':')) {
+            pidfile_name = xstrdup(name);
+        } else {
+            pidfile_name = xasprintf("%s/%s", ovn_rundir(), name);
+        }
+    } else {
+        pidfile_name = xasprintf("%s/%s.pid", ovn_rundir(), program_name);
+    }
+#endif
+
+    /* Call openvswitch lib function. */
+    set_pidfile(pidfile_name);
+    free(pidfile_name);
 }
 
 /* l3gateway, chassisredirect, and patch
@@ -548,4 +576,18 @@ ip46_equals(const struct v46_ip *addr1, const struct v46_ip *addr2)
     return (addr1->family == addr2->family &&
             (addr1->family == AF_INET ? addr1->ipv4 == addr2->ipv4 :
              IN6_ARE_ADDR_EQUAL(&addr1->ipv6, &addr2->ipv6)));
+}
+
+char *
+str_tolower(const char *orig)
+{
+    char *copy = xmalloc(strlen(orig) + 1);
+    char *p = copy;
+
+    while (*orig) {
+        *p++ = tolower(*orig++);
+    }
+    *p = '\0';
+
+    return copy;
 }

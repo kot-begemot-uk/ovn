@@ -93,12 +93,7 @@ EXTRA_DIST = \
 	.travis/linux-prepare.sh \
 	.travis/osx-build.sh \
 	.travis/osx-prepare.sh \
-	appveyor.yml \
 	boot.sh \
-	poc/builders/Vagrantfile \
-	poc/playbook-centos-builder.yml \
-	poc/playbook-fedora-builder.yml \
-	poc/playbook-ubuntu-builder.yml \
 	$(MAN_FRAGMENTS) \
 	$(MAN_ROOTS) \
 	Vagrantfile \
@@ -257,7 +252,7 @@ config-h-check:
 	@cd $(srcdir); \
 	if test -e .git && (git --version) >/dev/null 2>&1 && \
 	  git --no-pager grep -L '#include <config\.h>' `git ls-files | grep '\.c$$' | \
-	    grep -vE '^ovs/datapath|^ovs/lib/sflow|^ovs/third-party|^ovs/datapath-windows|^python|^ovs/python'`; \
+	    grep -vE '^ovs/datapath|^ovs/lib/sflow|^ovs/datapath-windows|^python|^ovs/python'`; \
 	then \
 	  echo "See above for list of violations of the rule that"; \
 	  echo "every C source file must #include <config.h>."; \
@@ -271,7 +266,7 @@ printf-check:
 	@cd $(srcdir); \
 	if test -e .git && (git --version) >/dev/null 2>&1 && \
 	  git --no-pager grep -n -E -e '%[-+ #0-9.*]*([ztj]|hh)' --and --not -e 'ovs_scan' `git ls-files | grep '\.[ch]$$' | \
-	    grep -vE '^ovs/datapath|^ovs/lib/sflow|^ovs/third-party'`; \
+	    grep -vE '^ovs/datapath|^ovs/lib/sflow'`; \
 	then \
 	  echo "See above for list of violations of the rule that"; \
 	  echo "'z', 't', 'j', 'hh' printf() type modifiers are"; \
@@ -354,7 +349,7 @@ thread-safety-check:
 	if test -e .git && (git --version) >/dev/null 2>&1 && \
 	  grep -n -f build-aux/thread-safety-blacklist \
 	    `git ls-files | grep '\.[ch]$$' \
-	      | $(EGREP) -v '^ovs/datapath|^ovs/lib/sflow|^ovs/third-party'` /dev/null \
+	      | $(EGREP) -v '^ovs/datapath|^ovs/lib/sflow'` /dev/null \
 	      | $(EGREP) -v ':[ 	]*/?\*'; \
 	then \
 	  echo "See above for list of calls to functions that are"; \
@@ -494,14 +489,10 @@ include lib/automake.mk
 include utilities/automake.mk
 include tests/automake.mk
 include include/automake.mk
-include third-party/automake.mk
 include debian/automake.mk
 include lib/ovsdb_automake.mk
-include ipsec/automake.mk
 include rhel/automake.mk
-include xenserver/automake.mk
 include tutorial/automake.mk
-include selinux/automake.mk
 include controller/automake.mk
 include controller-vtep/automake.mk
 include northd/automake.mk

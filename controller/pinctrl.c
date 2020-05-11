@@ -578,6 +578,7 @@ enum {
 
 struct ipv6_prefixd_state {
     long long int next_announce;
+    long long int last_used;
     struct in6_addr ipv6_addr;
     struct eth_addr ea;
     struct eth_addr cmac;
@@ -653,6 +654,11 @@ pinctrl_parse_dhcpv6_advt(struct rconn *swconn, const struct flow *ip_flow,
         case DHCPV6_OPT_IA_PD: {
             struct dhcpv6_opt_ia_na *ia_na = (struct dhcpv6_opt_ia_na *)in_opt;
             int orig_len = len, hdr_len = 0, size = sizeof *in_opt + 12;
+            uint32_t t1 = ntohl(ia_na->t1), t2 = ntohl(ia_na->t2);
+
+            if (t1 > t2 && t2 > 0) {
+                goto out;
+            }
 
             aid = ntohl(ia_na->iaid);
             memcpy(&data[len], in_opt, size);
@@ -667,6 +673,15 @@ pinctrl_parse_dhcpv6_advt(struct rconn *swconn, const struct flow *ip_flow,
                 }
 
                 if (ntohs(in_opt->code) == DHCPV6_OPT_IA_PREFIX) {
+                    struct dhcpv6_opt_ia_prefix *ia_hdr =
+                        (struct dhcpv6_opt_ia_prefix *)in_opt;
+                    uint32_t plife_time = ntohl(ia_hdr->plife_time);
+                    uint32_t vlife_time = ntohl(ia_hdr->vlife_time);
+
+                    if (plife_time > vlife_time) {
+                        goto out;
+                    }
+
                     memcpy(&data[len], in_opt, flen);
                     hdr_len += flen;
                     len += flen;
@@ -831,16 +846,22 @@ pinctrl_parse_dhcpv6_reply(struct dp_packet *pkt_in,
                     struct dhcpv6_opt_ia_prefix *ia_hdr =
                         (struct dhcpv6_opt_ia_prefix *)(in_dhcpv6_data + size);
 
-                    prefix_len = ia_hdr->plen;
                     plife_time = ntohl(ia_hdr->plife_time);
                     vlife_time = ntohl(ia_hdr->vlife_time);
+                    if (plife_time > vlife_time) {
+                        break;
+                    }
+                    prefix_len = ia_hdr->plen;
                     memcpy(&ipv6, &ia_hdr->ipv6, sizeof (struct in6_addr));
+                    status = true;
                 }
                 if (ntohs(in_opt->code) == DHCPV6_OPT_STATUS_CODE) {
                    struct dhcpv6_opt_status *status_hdr;
 
                    status_hdr = (struct dhcpv6_opt_status *)in_opt;
-                   status = ntohs(status_hdr->status_code) == 0;
+                   if (ntohs(status_hdr->status_code)) {
+                       status = false;
+                   }
                 }
                 size += sizeof *in_opt + ntohs(in_opt->len);
                 in_opt = (struct dhcpv6_opt_header *)(in_dhcpv6_data + size);
@@ -1108,11 +1129,13 @@ fill_ipv6_prefix_state(struct ovsdb_idl_txn *ovnsb_idl_txn,
             sbrec_port_binding_set_options(pb, &options);
             smap_destroy(&options);
         }
+        pfd->last_used = time_msec();
     }
 
     return changed;
 }
 
+#define IPV6_PREFIXD_STALE_TIMEOUT  180000LL
 static void
 prepare_ipv6_prefixd(struct ovsdb_idl_txn *ovnsb_idl_txn,
                      struct ovsdb_idl_index *sbrec_port_binding_by_name,
@@ -1187,6 +1210,15 @@ prepare_ipv6_prefixd(struct ovsdb_idl_txn *ovnsb_idl_txn,
                                               ea, ip6_addr,
                                               peer->tunnel_key,
                                               peer->datapath->tunnel_key);
+        }
+    }
+
+    struct shash_node *iter, *next;
+    SHASH_FOR_EACH_SAFE (iter, next, &ipv6_prefixd) {
+        struct ipv6_prefixd_state *pfd = iter->data;
+        if (pfd->last_used + IPV6_PREFIXD_STALE_TIMEOUT < time_msec()) {
+            free(pfd);
+            shash_delete(&ipv6_prefixd, iter);
         }
     }
 
@@ -1433,7 +1465,7 @@ static void
 pinctrl_handle_icmp(struct rconn *swconn, const struct flow *ip_flow,
                     struct dp_packet *pkt_in,
                     const struct match *md, struct ofpbuf *userdata,
-                    bool include_orig_ip_datagram)
+                    bool set_icmp_code)
 {
     /* This action only works for IP packets, and the switch should only send
      * us IP packets this way, but check here just to be sure. */
@@ -1480,46 +1512,51 @@ pinctrl_handle_icmp(struct rconn *swconn, const struct flow *ip_flow,
         packet_set_ipv4(&packet, ip_flow->nw_src, ip_flow->nw_dst,
                         ip_flow->nw_tos, 255);
 
+        uint8_t icmp_code =  1;
+        if (set_icmp_code && in_ip->ip_proto == IPPROTO_UDP) {
+            icmp_code = 3;
+        }
+
         struct icmp_header *ih = dp_packet_put_zeros(&packet, sizeof *ih);
         dp_packet_set_l4(&packet, ih);
-        packet_set_icmp(&packet, ICMP4_DST_UNREACH, 1);
+        packet_set_icmp(&packet, ICMP4_DST_UNREACH, icmp_code);
 
-        if (include_orig_ip_datagram) {
-            /* RFC 1122: 3.2.2	MUST send at least the IP header and 8 bytes
-             * of header. MAY send more.
-             * RFC says return as much as we can without exceeding 576
-             * bytes.
-             * So, lets return as much as we can. */
+        /* RFC 1122: 3.2.2	MUST send at least the IP header and 8 bytes
+         * of header. MAY send more.
+         * RFC says return as much as we can without exceeding 576
+         * bytes.
+         * So, lets return as much as we can. */
 
-            /* Calculate available room to include the original IP + data. */
-            nh = dp_packet_l3(&packet);
-            uint16_t room = 576 - (sizeof *eh + ntohs(nh->ip_tot_len));
-            if (in_ip_len > room) {
-                in_ip_len = room;
-            }
-            dp_packet_put(&packet, in_ip, in_ip_len);
-
-            /* dp_packet_put may reallocate the buffer. Get the l3 and l4
-             * header pointers again. */
-            nh = dp_packet_l3(&packet);
-            ih = dp_packet_l4(&packet);
-            uint16_t ip_total_len = ntohs(nh->ip_tot_len) + in_ip_len;
-            nh->ip_tot_len = htons(ip_total_len);
-            ih->icmp_csum = 0;
-            ih->icmp_csum = csum(ih, sizeof *ih + in_ip_len);
-            nh->ip_csum = 0;
-            nh->ip_csum = csum(nh, sizeof *nh);
+        /* Calculate available room to include the original IP + data. */
+        nh = dp_packet_l3(&packet);
+        uint16_t room = 576 - (sizeof *eh + ntohs(nh->ip_tot_len));
+        if (in_ip_len > room) {
+            in_ip_len = room;
         }
+        dp_packet_put(&packet, in_ip, in_ip_len);
+
+        /* dp_packet_put may reallocate the buffer. Get the l3 and l4
+            * header pointers again. */
+        nh = dp_packet_l3(&packet);
+        ih = dp_packet_l4(&packet);
+        uint16_t ip_total_len = ntohs(nh->ip_tot_len) + in_ip_len;
+        nh->ip_tot_len = htons(ip_total_len);
+        ih->icmp_csum = 0;
+        ih->icmp_csum = csum(ih, sizeof *ih + in_ip_len);
+        nh->ip_csum = 0;
+        nh->ip_csum = csum(nh, sizeof *nh);
+
     } else {
         struct ip6_hdr *nh = dp_packet_put_zeros(&packet, sizeof *nh);
         struct icmp6_data_header *ih;
         uint32_t icmpv6_csum;
+        struct ip6_hdr *in_ip = dp_packet_l3(pkt_in);
 
         eh->eth_type = htons(ETH_TYPE_IPV6);
         dp_packet_set_l3(&packet, nh);
         nh->ip6_vfc = 0x60;
         nh->ip6_nxt = IPPROTO_ICMPV6;
-        nh->ip6_plen = htons(sizeof(*nh) + ICMP6_DATA_HEADER_LEN);
+        nh->ip6_plen = htons(ICMP6_DATA_HEADER_LEN);
         packet_set_ipv6(&packet, &ip_flow->ipv6_src, &ip_flow->ipv6_dst,
                         ip_flow->nw_tos, ip_flow->ipv6_label, 255);
 
@@ -1527,15 +1564,42 @@ pinctrl_handle_icmp(struct rconn *swconn, const struct flow *ip_flow,
         dp_packet_set_l4(&packet, ih);
         ih->icmp6_base.icmp6_type = ICMP6_DST_UNREACH;
         ih->icmp6_base.icmp6_code = 1;
+
+        if (set_icmp_code && in_ip->ip6_nxt == IPPROTO_UDP) {
+            ih->icmp6_base.icmp6_code = ICMP6_DST_UNREACH_NOPORT;
+        }
         ih->icmp6_base.icmp6_cksum = 0;
 
-        uint8_t *data = dp_packet_put_zeros(&packet, sizeof *nh);
-        memcpy(data, dp_packet_l3(pkt_in), sizeof(*nh));
+        nh = dp_packet_l3(&packet);
+
+        /* RFC 4443: 3.1.
+         *
+         * 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+         * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+         * |     Type      |     Code      |          Checksum             |
+         * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+         * |                             Unused                            |
+         * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+         * |                    As much of invoking packet                 |
+         * +                as possible without the ICMPv6 packet          +
+         * |                exceeding the minimum IPv6 MTU [IPv6]          |
+         * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+         */
+
+        uint16_t room = 1280 - (sizeof *eh + sizeof *nh +
+                                ICMP6_DATA_HEADER_LEN);
+        uint16_t in_ip_len = (uint16_t) sizeof *in_ip + ntohs(in_ip->ip6_plen);
+        if (in_ip_len > room) {
+            in_ip_len = room;
+        }
+
+        dp_packet_put(&packet, in_ip, in_ip_len);
+        nh->ip6_plen = htons(ICMP6_DATA_HEADER_LEN + in_ip_len);
 
         icmpv6_csum = packet_csum_pseudoheader6(dp_packet_l3(&packet));
         ih->icmp6_base.icmp6_cksum = csum_finish(
             csum_continue(icmpv6_csum, ih,
-                          sizeof(*nh) + ICMP6_DATA_HEADER_LEN));
+                          in_ip_len + ICMP6_DATA_HEADER_LEN));
     }
 
     if (ip_flow->vlans[0].tci & htons(VLAN_CFI)) {
@@ -2368,7 +2432,12 @@ pinctrl_handle_dns_lookup(
         struct dns_data *d = iter->data;
         for (size_t i = 0; i < d->n_dps; i++) {
             if (d->dps[i] == dp_key) {
-                answer_ips = smap_get(&d->records, ds_cstr(&query_name));
+                /* DNS records in SBDB are stored in lowercase. Convert to
+                 * lowercase to perform case insensitive lookup
+                 */
+                char *query_name_lower = str_tolower(ds_cstr(&query_name));
+                answer_ips = smap_get(&d->records, query_name_lower);
+                free(query_name_lower);
                 if (answer_ips) {
                     break;
                 }
@@ -2621,12 +2690,12 @@ process_packet_in(struct rconn *swconn, const struct ofp_header *msg)
 
     case ACTION_OPCODE_ICMP:
         pinctrl_handle_icmp(swconn, &headers, &packet, &pin.flow_metadata,
-                            &userdata, false);
+                            &userdata, true);
         break;
 
     case ACTION_OPCODE_ICMP4_ERROR:
         pinctrl_handle_icmp(swconn, &headers, &packet, &pin.flow_metadata,
-                            &userdata, true);
+                            &userdata, false);
         break;
 
     case ACTION_OPCODE_TCP_RESET:
@@ -2736,7 +2805,7 @@ pinctrl_handler(void *arg_)
     static long long int svc_monitors_next_run_time = LLONG_MAX;
     static long long int send_prefixd_time = LLONG_MAX;
 
-    swconn = rconn_create(5, 0, DSCP_DEFAULT, 1 << OFP13_VERSION);
+    swconn = rconn_create(5, 0, DSCP_DEFAULT, 1 << OFP15_VERSION);
 
     while (!latch_is_set(&pctrl->pinctrl_thread_exit)) {
         if (pctrl->br_int_name) {
@@ -5785,6 +5854,11 @@ sync_svc_monitors(struct ovsdb_idl_txn *ovnsb_idl_txn,
             }
 
             if (mac_found) {
+                break;
+            } else if (!laddrs.n_ipv4_addrs) {
+                /* IPv4 address(es) are not configured. Use the first mac. */
+                ea = laddrs.ea;
+                mac_found = true;
                 break;
             }
         }

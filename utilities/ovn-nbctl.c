@@ -324,7 +324,7 @@ enum {
     OPT_NO_SHUFFLE_REMOTES,
     OPT_BOOTSTRAP_CA_CERT,
     MAIN_LOOP_OPTION_ENUMS,
-    DAEMON_OPTION_ENUMS,
+    OVN_DAEMON_OPTION_ENUMS,
     VLOG_OPTION_ENUMS,
     TABLE_OPTION_ENUMS,
     SSL_OPTION_ENUMS,
@@ -428,7 +428,7 @@ get_all_options(void)
         {"version", no_argument, NULL, 'V'},
         {"unixctl", required_argument, NULL, 'u'},
         MAIN_LOOP_LONG_OPTIONS,
-        DAEMON_LONG_OPTIONS,
+        OVN_DAEMON_LONG_OPTIONS,
         VLOG_LONG_OPTIONS,
         STREAM_SSL_LONG_OPTIONS,
         {"bootstrap-ca-cert", required_argument, NULL, OPT_BOOTSTRAP_CA_CERT},
@@ -460,7 +460,7 @@ has_option(const struct ovs_cmdl_parsed_option *parsed_options, size_t n,
 static bool
 will_detach(const struct ovs_cmdl_parsed_option *parsed_options, size_t n)
 {
-    return has_option(parsed_options, n, OPT_DETACH);
+    return has_option(parsed_options, n, OVN_OPT_DETACH);
 }
 
 static char * OVS_WARN_UNUSED_RESULT
@@ -547,7 +547,7 @@ apply_options_direct(const struct ovs_cmdl_parsed_option *parsed_options,
             printf("DB Schema %s\n", nbrec_get_db_version());
             exit(EXIT_SUCCESS);
 
-        DAEMON_OPTION_HANDLERS
+        OVN_DAEMON_OPTION_HANDLERS
         VLOG_OPTION_HANDLERS
         TABLE_OPTION_HANDLERS(&table_style)
         STREAM_SSL_OPTION_HANDLERS
@@ -696,7 +696,7 @@ Route commands:\n\
 Policy commands:\n\
   lr-policy-add ROUTER PRIORITY MATCH ACTION [NEXTHOP]\n\
                             add a policy to router\n\
-  lr-policy-del ROUTER [PRIORITY [MATCH]]\n\
+  lr-policy-del ROUTER [{PRIORITY | UUID} [MATCH]]\n\
                             remove policies from ROUTER\n\
   lr-policy-list ROUTER     print policies for ROUTER\n\
 \n\
@@ -1034,6 +1034,10 @@ print_lr(const struct nbrec_logical_router *lr, struct ds *s)
                   UUID_ARGS(&nat->header_.uuid));
         ds_put_cstr(s, "        external ip: ");
         ds_put_format(s, "\"%s\"\n", nat->external_ip);
+        if (nat->external_port_range[0]) {
+          ds_put_cstr(s, "        external port(s): ");
+          ds_put_format(s, "\"%s\"\n", nat->external_port_range);
+        }
         ds_put_cstr(s, "        logical ip: ");
         ds_put_format(s, "\"%s\"\n", nat->logical_ip);
         ds_put_cstr(s, "        type: ");
@@ -3590,21 +3594,40 @@ nbctl_lr_policy_del(struct ctl_context *ctx)
         return;
     }
 
-    error = parse_priority(ctx->argv[2], &priority);
-    if (error) {
-        ctx->error = error;
-        return;
+    const struct uuid *lr_policy_uuid = NULL;
+    struct uuid uuid_from_cmd;
+    if (uuid_from_string(&uuid_from_cmd, ctx->argv[2])) {
+        lr_policy_uuid = &uuid_from_cmd;
+    } else {
+        error = parse_priority(ctx->argv[2], &priority);
+        if (error) {
+            ctx->error = error;
+            return;
+        }
+
     }
-    /* If match is not specified, delete all routing policies with the
-     * specified priority. */
+    /* If uuid was specified, delete routing policy with the
+     * specified uuid. */
     if (ctx->argc == 3) {
         struct nbrec_logical_router_policy **new_policies
             = xmemdup(lr->policies,
                       sizeof *new_policies * lr->n_policies);
         int n_policies = 0;
-        for (int i = 0; i < lr->n_policies; i++) {
-            if (priority != lr->policies[i]->priority) {
-                new_policies[n_policies++] = lr->policies[i];
+
+        if (lr_policy_uuid) {
+            for (size_t i = 0; i < lr->n_policies; i++) {
+                if (!uuid_equals(lr_policy_uuid,
+                                 &(lr->policies[i]->header_.uuid))) {
+                    new_policies[n_policies++] = lr->policies[i];
+                }
+            }
+    /* If match is not specified, delete all routing policies with the
+     * specified priority. */
+        } else {
+            for (int i = 0; i < lr->n_policies; i++) {
+                if (priority != lr->policies[i]->priority) {
+                    new_policies[n_policies++] = lr->policies[i];
+                }
             }
         }
         nbrec_logical_router_verify_policies(lr);
@@ -3990,7 +4013,7 @@ is_valid_port_range(const char *port_range)
         goto done;
     }
 
-    char *range_hi = strtok_r(NULL, "", &save_ptr);
+    char *range_hi = strtok_r(NULL, "-", &save_ptr);
     if (!range_hi) {
         goto done;
     }
@@ -3999,11 +4022,16 @@ is_valid_port_range(const char *port_range)
         goto done;
     }
 
+    /* Check that there is nothing after range_hi. */
+    if (strtok_r(NULL, "", &save_ptr)) {
+        goto done;
+    }
+
     if (range_lo_int >= range_hi_int) {
         goto done;
     }
 
-    if (range_lo_int <= 0 || range_hi_int > 65535) {
+    if (range_hi_int > 65535) {
         goto done;
     }
 
@@ -4320,20 +4348,24 @@ nbctl_lr_nat_list(struct ctl_context *ctx)
         const struct nbrec_nat *nat = lr->nat[i];
         char *key = xasprintf("%-17.13s%s", nat->type, nat->external_ip);
         if (nat->external_mac && nat->logical_port) {
-            smap_add_format(&lr_nats, key, "%-22.18s%-21.17s%s",
+            smap_add_format(&lr_nats, key, "%-17.13s%-22.18s%-21.17s%s",
+                            nat->external_port_range,
                             nat->logical_ip, nat->external_mac,
                             nat->logical_port);
         } else {
-            smap_add_format(&lr_nats, key, "%s", nat->logical_ip);
+            smap_add_format(&lr_nats, key, "%-17.13s%s",
+                            nat->external_port_range,
+                            nat->logical_ip);
         }
         free(key);
     }
 
     const struct smap_node **nodes = smap_sort(&lr_nats);
     if (nodes) {
-        ds_put_format(&ctx->output, "%-17.13s%-19.15s%-22.18s%-21.17s%s\n",
-                "TYPE", "EXTERNAL_IP", "LOGICAL_IP", "EXTERNAL_MAC",
-                "LOGICAL_PORT");
+        ds_put_format(&ctx->output,
+                "%-17.13s%-19.15s%-17.13s%-22.18s%-21.17s%s\n",
+                "TYPE", "EXTERNAL_IP", "EXTERNAL_PORT", "LOGICAL_IP",
+                "EXTERNAL_MAC", "LOGICAL_PORT");
         for (size_t i = 0; i < smap_count(&lr_nats); i++) {
             const struct smap_node *node = nodes[i];
             ds_put_format(&ctx->output, "%-36.32s%s\n",
@@ -6212,7 +6244,7 @@ static const struct ctl_command_syntax nbctl_commands[] = {
     /* Policy commands */
     { "lr-policy-add", 4, 5, "ROUTER PRIORITY MATCH ACTION [NEXTHOP]", NULL,
         nbctl_lr_policy_add, NULL, "", RW },
-    { "lr-policy-del", 1, 3, "ROUTER [PRIORITY [MATCH]]", NULL,
+    { "lr-policy-del", 1, 3, "ROUTER [{PRIORITY | UUID} [MATCH]]", NULL,
         nbctl_lr_policy_del, NULL, "", RW },
     { "lr-policy-list", 1, 1, "ROUTER", NULL, nbctl_lr_policy_list, NULL,
        "", RO },
@@ -6522,7 +6554,11 @@ server_loop(struct ovsdb_idl *idl, int argc, char *argv[])
 
     service_start(&argc, &argv);
     daemonize_start(false);
-    int error = unixctl_server_create(unixctl_path, &server);
+
+    char *abs_unixctl_path = get_abs_unix_ctl_path(unixctl_path);
+    int error = unixctl_server_create(abs_unixctl_path, &server);
+    free(abs_unixctl_path);
+
     if (error) {
         ctl_fatal("failed to create unixctl server (%s)",
                   ovs_retval_to_string(error));
@@ -6594,7 +6630,7 @@ nbctl_client(const char *socket_name,
         case OPT_NO_SHUFFLE_REMOTES:
         case OPT_BOOTSTRAP_CA_CERT:
         STREAM_SSL_CASES
-        DAEMON_OPTION_CASES
+        OVN_DAEMON_OPTION_CASES
             VLOG_INFO("using ovn-nbctl daemon, ignoring %s option",
                       po->o->name);
             break;
