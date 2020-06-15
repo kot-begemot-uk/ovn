@@ -47,6 +47,7 @@
 #include "unixctl.h"
 #include "util.h"
 #include "uuid.h"
+#include "fasthmap.h"
 #include "async-io.h"
 #include "openvswitch/vlog.h"
 
@@ -98,6 +99,10 @@ static char svc_monitor_mac[ETH_ADDR_STRLEN + 1];
 static int northd_probe_interval = DEFAULT_PROBE_INTERVAL_MSEC;
 
 #define MAX_OVN_TAGS 4096
+
+#define MIN_LFLOW_SIZE 128
+
+static last_lflow_size;
 
 /* Pipeline stages. */
 
@@ -3957,7 +3962,7 @@ ovn_lflow_add_at(struct hmap *lflow_map, struct ovn_datapath *od,
     ovn_lflow_init(lflow, od, stage, priority,
                    xstrdup(match), xstrdup(actions),
                    ovn_lflow_hint(stage_hint), where);
-    hmap_insert(lflow_map, &lflow->hmap_node, ovn_lflow_hash(lflow));
+    hmap_insert_fast(lflow_map, &lflow->hmap_node, ovn_lflow_hash(lflow));
 }
 
 /* Adds a row with the specified contents to the Logical_Flow table. */
@@ -10294,7 +10299,13 @@ build_lflows(struct northd_context *ctx, struct hmap *datapaths,
              struct shash *meter_groups,
              struct hmap *lbs)
 {
-    struct hmap lflows = HMAP_INITIALIZER(&lflows);
+    struct hmap lflows;
+
+    if (last_lflow_size < MIN_LFLOW_SIZE) {
+        last_lflow_size = MIN_LFLOW_SIZE;
+    }
+
+    fast_hmap_init(&lflows, last_lflow_size);
 
     build_lswitch_flows(datapaths, ports, port_groups, &lflows, mcgroups,
                         igmp_groups, meter_groups, lbs);
@@ -10323,6 +10334,9 @@ build_lflows(struct northd_context *ctx, struct hmap *datapaths,
             sbrec_logical_flow_delete(sbflow);
         }
     }
+
+    last_lflow_size = hmap_count(&lflows);
+
     struct ovn_lflow *lflow, *next_lflow;
     HMAP_FOR_EACH_SAFE (lflow, next_lflow, hmap_node, &lflows) {
         const char *pipeline = ovn_stage_get_pipeline_name(lflow->stage);
