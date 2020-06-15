@@ -6106,6 +6106,7 @@ build_lswitch_rport_arp_req_flows(struct ovn_port *op,
     sset_destroy(&all_ips_v4);
     sset_destroy(&all_ips_v6);
 }
+
 static void build_lswitch_per_datapath(
                 struct ovn_datapath *od,
                 struct hmap *port_groups, struct hmap *lflows,
@@ -6264,45 +6265,24 @@ static void build_lswitch_per_datapath(
 
         ovn_lflow_add(lflows, od, S_SWITCH_IN_L2_LKUP, 70, "eth.mcast",
                       "outport = \""MC_FLOOD"\"; output;");
-        ds_destroy(&match);
-        ds_destroy(&actions);
     }
+    ds_destroy(&match);
+    ds_destroy(&actions);
     free(svc_check_match);
 }
 
-
 static void
-build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
+build_lswitch_per_port(
+                    struct ovn_port *op,
+                    struct hmap *datapaths, struct hmap *ports,
                     struct hmap *port_groups, struct hmap *lflows,
                     struct hmap *mcgroups, struct hmap *igmp_groups,
                     struct shash *meter_groups,
                     struct hmap *lbs)
 {
-    /* This flow table structure is documented in ovn-northd(8), so please
-     * update ovn-northd.8.xml if you change anything. */
-
     struct ds match = DS_EMPTY_INITIALIZER;
     struct ds actions = DS_EMPTY_INITIALIZER;
-
-    /* Build pre-ACL and ACL tables for both ingress and egress.
-     * Ingress tables 3 through 10.  Egress tables 0 through 7. */
-    struct ovn_datapath *od;
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        build_lswitch_per_datapath(od, port_groups, lflows, meter_groups, lbs);
-    }
-
-
-    build_lswitch_input_port_sec(ports, datapaths, lflows);
-
-    /* Ingress table 13: ARP/ND responder, skip requests coming from localnet
-     * and vtep ports. (priority 100); see ovn-northd.8.xml for the
-     * rationale. */
-    struct ovn_port *op;
-    HMAP_FOR_EACH (op, key_node, ports) {
-        if (!op->nbsp) {
-            continue;
-        }
-
+    if (op->nbsp) {
         if ((!strcmp(op->nbsp->type, "localnet")) ||
             (!strcmp(op->nbsp->type, "vtep"))) {
             ds_clear(&match);
@@ -6311,15 +6291,8 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
                                     100, ds_cstr(&match), "next;",
                                     &op->nbsp->header_);
         }
-    }
-
-    /* Ingress table 13: ARP/ND responder, reply for known IPs.
-     * (priority 50). */
-    HMAP_FOR_EACH (op, key_node, ports) {
-        if (!op->nbsp) {
-            continue;
-        }
-
+        /* Ingress table 13: ARP/ND responder, reply for known IPs.
+         * (priority 50). */
         if (!strcmp(op->nbsp->type, "virtual")) {
             /* Handle
              *  - GARPs for virtual ip which belongs to a logical port
@@ -6335,7 +6308,7 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
                                                    "virtual-parents");
             if (!virtual_ip || !virtual_parents ||
                 !ip_parse(virtual_ip, &ip)) {
-                continue;
+                return;
             }
 
             char *tokstr = xstrdup(virtual_parents);
@@ -6378,11 +6351,11 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
              */
             if (!lsp_is_up(op->nbsp) && strcmp(op->nbsp->type, "router") &&
                 strcmp(op->nbsp->type, "localport")) {
-                continue;
+                return;
             }
 
             if (lsp_is_external(op->nbsp) || op->has_unknown) {
-                continue;
+                return;
             }
 
             for (size_t i = 0; i < op->n_lsp_addrs; i++) {
@@ -6474,7 +6447,47 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
             }
         }
     }
+    ds_destroy(&match);
+    ds_destroy(&actions);
+}
 
+
+static void
+build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
+                    struct hmap *port_groups, struct hmap *lflows,
+                    struct hmap *mcgroups, struct hmap *igmp_groups,
+                    struct shash *meter_groups,
+                    struct hmap *lbs)
+{
+    /* This flow table structure is documented in ovn-northd(8), so please
+     * update ovn-northd.8.xml if you change anything. */
+
+    struct ds match = DS_EMPTY_INITIALIZER;
+    struct ds actions = DS_EMPTY_INITIALIZER;
+
+    /* Build pre-ACL and ACL tables for both ingress and egress.
+     * Ingress tables 3 through 10.  Egress tables 0 through 7. */
+    struct ovn_datapath *od;
+    HMAP_FOR_EACH (od, key_node, datapaths) {
+        build_lswitch_per_datapath(od, port_groups, lflows, meter_groups, lbs);
+    }
+
+
+    build_lswitch_input_port_sec(ports, datapaths, lflows);
+
+    /* Ingress table 13: ARP/ND responder, skip requests coming from localnet
+     * and vtep ports. (priority 100); see ovn-northd.8.xml for the
+     * rationale. */
+    struct ovn_port *op;
+    HMAP_FOR_EACH (op, key_node, ports) {
+        build_lswitch_per_port(
+                    op,
+                    datapaths, ports,
+                    port_groups, lflows,
+                    mcgroups, igmp_groups,
+                    meter_groups,
+                    lbs);
+    }
 
     /* Ingress table 13: ARP/ND responder for service monitor source ip.
      * (priority 110)*/
