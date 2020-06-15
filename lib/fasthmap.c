@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include <config.h>
 #include <stdint.h>
 #include <string.h>
 #include "util.h"
@@ -26,9 +27,24 @@ VLOG_DEFINE_THIS_MODULE(fasthmap);
 
 /* Initializes 'hmap' as an empty hash table of size X. */
 void
-fast_hmap_init(struct hmap *hmap, int size)
+fast_hmap_init(struct hmap *hmap, ssize_t mask)
 {
-    size_t mask, i;
+    size_t i;
+
+    hmap->buckets = xmalloc(sizeof (struct hmap_node *) * (mask + 1));
+    hmap->one = NULL;
+    hmap->mask = mask;
+    hmap->n = 0;
+    for (i = 0; i <= hmap->mask; i++) {
+        hmap->buckets[i] = NULL;
+    }
+}
+
+/* Initializes 'hmap' as an empty hash table of size X. */
+void
+fast_hmap_size_for(struct hmap *hmap, int size)
+{
+    size_t mask;
     mask = size / 2;
     mask |= mask >> 1;
     mask |= mask >> 2;
@@ -43,13 +59,7 @@ fast_hmap_init(struct hmap *hmap, int size)
      * least 4 of them. */
     mask |= (mask & 1) << 1;
 
-    hmap->buckets = xmalloc(sizeof (struct hmap_node *) * (mask + 1));
-    hmap->one = NULL;
-    hmap->mask = mask;
-    hmap->n = 0;
-    for (i = 0; i <= hmap->mask; i++) {
-        hmap->buckets[i] = NULL;
-    }
+    fast_hmap_init(hmap, mask);
 }
 
 void hmap_merge(struct hmap *dest, struct hmap *inc)
@@ -71,4 +81,5 @@ void hmap_merge(struct hmap *dest, struct hmap *inc)
             *inc_bucket = NULL;
         }
     }
+    inc->n = 0;
 }

@@ -34,7 +34,8 @@ extern "C" {
          ASSIGN_CONTAINER(NODE, hmap_next_in_bucket(&(NODE)->MEMBER), MEMBER))
 
 
-void fast_hmap_init(struct hmap *hmap, int size);
+void fast_hmap_size_for(struct hmap *hmap, int size);
+void fast_hmap_init(struct hmap *hmap, ssize_t size);
 void hmap_merge(struct hmap *dest, struct hmap *inc);
 
 /* Returns the first node in 'hmap' in the bucket in which the given 'hash'

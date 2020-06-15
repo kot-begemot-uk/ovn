@@ -6683,8 +6683,24 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
     /* Build pre-ACL and ACL tables for both ingress and egress.
      * Ingress tables 3 through 10.  Egress tables 0 through 7. */
     struct ovn_datapath *od;
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        build_lswitch_per_datapath(od, port_groups, lflows, meter_groups, lbs);
+    ssize_t bnum;
+    
+    struct hmap lflow_segs[4];
+
+    for (int i=0; i<4; i++) {
+        fast_hmap_init(&lflow_segs[i], lflows->mask);
+    }
+    
+    for (bnum = 0; bnum <= datapaths->mask; bnum++) {
+        HMAP_FOR_EACH_IN_BNUM(od, key_node, bnum, datapaths) {
+            build_lswitch_per_datapath(od, port_groups, &lflow_segs[bnum % 4], meter_groups, lbs);
+        }
+    }
+
+    
+    for (int i=0; i<4; i++) {
+        hmap_merge(lflows, &lflow_segs[i]);
+        hmap_destroy(&lflow_segs[i]);
     }
 
 
@@ -6694,7 +6710,7 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
      * and vtep ports. (priority 100); see ovn-northd.8.xml for the
      * rationale. */
     struct ovn_port *op;
-    HMAP_FOR_EACH (op, key_node, ports) {
+    HMAP_FOR_EACH(op, key_node, ports) {
         build_lswitch_per_port(
                     op,
                     datapaths, ports,
@@ -10305,7 +10321,7 @@ build_lflows(struct northd_context *ctx, struct hmap *datapaths,
         last_lflow_size = MIN_LFLOW_SIZE;
     }
 
-    fast_hmap_init(&lflows, last_lflow_size);
+    fast_hmap_size_for(&lflows, last_lflow_size);
 
     build_lswitch_flows(datapaths, ports, port_groups, &lflows, mcgroups,
                         igmp_groups, meter_groups, lbs);
