@@ -6112,7 +6112,7 @@ static void build_lswitch_per_datapath(
                 struct shash *meter_groups,
                 struct hmap *lbs)
 {
-    // struct ds match = DS_EMPTY_INITIALIZER;
+    struct ds match = DS_EMPTY_INITIALIZER;
     // struct ds actions = DS_EMPTY_INITIALIZER;
     if (od->nbs) {
         /* Build pre-ACL and ACL tables for both ingress and egress.
@@ -6142,6 +6142,38 @@ static void build_lswitch_per_datapath(
 
         /* Port security flows have priority 50 (see below) and will continue
          * to the next table if packet source is acceptable. */
+        /* Ingress table 13: ARP/ND responder, by default goto next.
+         * (priority 0)*/
+
+        ovn_lflow_add(lflows, od, S_SWITCH_IN_ARP_ND_RSP, 0, "1", "next;");
+        /* Logical switch ingress table 17 and 18: DNS lookup and response
+         * priority 100 flows.
+         */
+        if (ls_has_dns_records(od->nbs)) {
+
+            struct ds action = DS_EMPTY_INITIALIZER;
+
+            ds_clear(&match);
+            ds_put_cstr(&match, "udp.dst == 53");
+            ds_put_format(&action,
+                          REGBIT_DNS_LOOKUP_RESULT" = dns_lookup(); next;");
+            ovn_lflow_add(lflows, od, S_SWITCH_IN_DNS_LOOKUP, 100,
+                          ds_cstr(&match), ds_cstr(&action));
+            ds_clear(&action);
+            ds_put_cstr(&match, " && "REGBIT_DNS_LOOKUP_RESULT);
+            ds_put_format(&action, "eth.dst <-> eth.src; ip4.src <-> ip4.dst; "
+                          "udp.dst = udp.src; udp.src = 53; outport = inport; "
+                          "flags.loopback = 1; output;");
+            ovn_lflow_add(lflows, od, S_SWITCH_IN_DNS_RESPONSE, 100,
+                          ds_cstr(&match), ds_cstr(&action));
+            ds_clear(&action);
+            ds_put_format(&action, "eth.dst <-> eth.src; ip6.src <-> ip6.dst; "
+                          "udp.dst = udp.src; udp.src = 53; outport = inport; "
+                          "flags.loopback = 1; output;");
+            ovn_lflow_add(lflows, od, S_SWITCH_IN_DNS_RESPONSE, 100,
+                          ds_cstr(&match), ds_cstr(&action));
+            ds_destroy(&action);
+        }
     }
 }
 
@@ -6350,15 +6382,6 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
         }
     }
 
-    /* Ingress table 13: ARP/ND responder, by default goto next.
-     * (priority 0)*/
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        if (!od->nbs) {
-            continue;
-        }
-
-        ovn_lflow_add(lflows, od, S_SWITCH_IN_ARP_ND_RSP, 0, "1", "next;");
-    }
 
     /* Ingress table 13: ARP/ND responder for service monitor source ip.
      * (priority 110)*/
@@ -6565,38 +6588,6 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
                 }
             }
         }
-    }
-
-    /* Logical switch ingress table 17 and 18: DNS lookup and response
-     * priority 100 flows.
-     */
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        if (!od->nbs || !ls_has_dns_records(od->nbs)) {
-           continue;
-        }
-
-        struct ds action = DS_EMPTY_INITIALIZER;
-
-        ds_clear(&match);
-        ds_put_cstr(&match, "udp.dst == 53");
-        ds_put_format(&action,
-                      REGBIT_DNS_LOOKUP_RESULT" = dns_lookup(); next;");
-        ovn_lflow_add(lflows, od, S_SWITCH_IN_DNS_LOOKUP, 100,
-                      ds_cstr(&match), ds_cstr(&action));
-        ds_clear(&action);
-        ds_put_cstr(&match, " && "REGBIT_DNS_LOOKUP_RESULT);
-        ds_put_format(&action, "eth.dst <-> eth.src; ip4.src <-> ip4.dst; "
-                      "udp.dst = udp.src; udp.src = 53; outport = inport; "
-                      "flags.loopback = 1; output;");
-        ovn_lflow_add(lflows, od, S_SWITCH_IN_DNS_RESPONSE, 100,
-                      ds_cstr(&match), ds_cstr(&action));
-        ds_clear(&action);
-        ds_put_format(&action, "eth.dst <-> eth.src; ip6.src <-> ip6.dst; "
-                      "udp.dst = udp.src; udp.src = 53; outport = inport; "
-                      "flags.loopback = 1; output;");
-        ovn_lflow_add(lflows, od, S_SWITCH_IN_DNS_RESPONSE, 100,
-                      ds_cstr(&match), ds_cstr(&action));
-        ds_destroy(&action);
     }
 
     /* Ingress table 14 and 15: DHCP options and response, by default goto
