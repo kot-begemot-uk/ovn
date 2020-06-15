@@ -6106,6 +6106,25 @@ build_lswitch_rport_arp_req_flows(struct ovn_port *op,
     sset_destroy(&all_ips_v4);
     sset_destroy(&all_ips_v6);
 }
+static void build_lswitch_per_datapath(
+                struct ovn_datapath *od,
+                struct hmap *port_groups, struct hmap *lflows,
+                struct shash *meter_groups,
+                struct hmap *lbs)
+{
+    // struct ds match = DS_EMPTY_INITIALIZER;
+    // struct ds actions = DS_EMPTY_INITIALIZER;
+    if (od->nbs) {
+        build_pre_acls(od, lflows);
+        build_pre_lb(od, lflows, meter_groups, lbs);
+        build_pre_stateful(od, lflows);
+        build_acls(od, lflows, port_groups);
+        build_qos(od, lflows);
+        build_lb(od, lflows);
+        build_stateful(od, lflows, lbs);
+    }
+}
+
 
 static void
 build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
@@ -6124,17 +6143,7 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
      * Ingress tables 3 through 10.  Egress tables 0 through 7. */
     struct ovn_datapath *od;
     HMAP_FOR_EACH (od, key_node, datapaths) {
-        if (!od->nbs) {
-            continue;
-        }
-
-        build_pre_acls(od, lflows);
-        build_pre_lb(od, lflows, meter_groups, lbs);
-        build_pre_stateful(od, lflows);
-        build_acls(od, lflows, port_groups);
-        build_qos(od, lflows);
-        build_lb(od, lflows);
-        build_stateful(od, lflows, lbs);
+        build_lswitch_per_datapath(od, port_groups, lflows, meter_groups, lbs);
     }
 
     /* Build logical flows for the forwarding groups */
