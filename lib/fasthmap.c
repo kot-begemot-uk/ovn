@@ -18,12 +18,97 @@
 #include <config.h>
 #include <stdint.h>
 #include <string.h>
+#include <semaphore.h>
+#include "fatal-signal.h"
 #include "util.h"
 #include "openvswitch/vlog.h"
 #include "openvswitch/hmap.h"
+#include "openvswitch/thread.h"
 #include "fasthmap.h"
+#include "ovs-atomic.h"
+#include "ovs-thread.h"
+#include "ovs-numa.h"
 
 VLOG_DEFINE_THIS_MODULE(fasthmap);
+
+
+static bool worker_pool_setup = false;
+static bool workers_must_exit = false;
+
+static struct ovs_list worker_pools = OVS_LIST_INITIALIZER(&worker_pools);
+
+static struct ovs_mutex init_mutex = OVS_MUTEX_INITIALIZER;
+
+static int pool_size;
+
+static void worker_pool_hook(void *aux OVS_UNUSED) {
+    int i;
+    static struct worker_pool *pool;
+    workers_must_exit = true; /* all workers must honour this flag */
+    LIST_FOR_EACH (pool, list_node, &worker_pools) {
+        for (i = 0; i < pool->size ; i++) {
+            sem_post(&pool->controls[i].fire);
+        }
+    }
+}
+
+static void setup_worker_pools(void) {
+    int cores, nodes;
+
+    nodes = ovs_numa_get_n_numas();
+    if (nodes == OVS_NUMA_UNSPEC || nodes <= 0) {
+        nodes = 1;
+    }
+    cores = ovs_numa_get_n_cores();
+    if (cores == OVS_CORE_UNSPEC || cores <= 0) {
+        pool_size = 4;
+    } else {
+        pool_size = cores / nodes;
+    }
+    fatal_signal_add_hook(worker_pool_hook, NULL, NULL, true);
+    worker_pool_setup = true;
+}
+
+bool seize_fire()
+{
+    return workers_must_exit;
+}
+
+struct worker_pool *add_worker_pool(void *(*start)(void *)){
+
+    struct worker_pool *new_pool = NULL;
+    struct worker_control *new_control;
+    int i;
+
+    ovs_mutex_lock(&init_mutex);
+
+    if (!worker_pool_setup) {
+         setup_worker_pools();
+    }
+
+    new_pool = xmalloc(sizeof(struct worker_pool));
+    new_pool->size = pool_size;
+    sem_init(&new_pool->done, 0, 0);
+
+    ovs_list_push_back(&worker_pools, &new_pool->list_node);
+
+    new_pool->controls =
+        xmalloc(sizeof(struct worker_control) * new_pool->size);
+    for (i = 0; i < new_pool->size; i++) {
+        new_control = &new_pool->controls[i];
+        sem_init(&new_control->fire, 0, 0);
+        new_control->done = &new_pool->done;
+        new_control->data = NULL;
+        ovs_mutex_init(&new_control->mutex);
+        new_control->finished = ATOMIC_VAR_INIT(false);
+    }
+    for (i = 0; i < pool_size; i++) {
+        ovs_thread_create("worker pool helper", start, &new_pool->controls[i]);
+    }
+    ovs_mutex_unlock(&init_mutex);
+    return new_pool;
+}
+
 
 /* Initializes 'hmap' as an empty hash table of size X. */
 void
@@ -83,3 +168,4 @@ void hmap_merge(struct hmap *dest, struct hmap *inc)
     }
     inc->n = 0;
 }
+

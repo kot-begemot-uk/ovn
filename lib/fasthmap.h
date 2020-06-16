@@ -24,8 +24,11 @@ extern "C" {
 
 #include <stdbool.h>
 #include <stdlib.h>
+#include <semaphore.h>
 #include "openvswitch/util.h"
 #include "openvswitch/hmap.h"
+#include "openvswitch/thread.h"
+#include "ovs-atomic.h"
 
 #define HMAP_FOR_EACH_IN_BNUM(NODE, MEMBER, BNUM, HMAP)               \
     for (INIT_CONTAINER(NODE, hmap_first_in_bucket_num(HMAP, BNUM), MEMBER); \
@@ -33,7 +36,26 @@ extern "C" {
          || ((NODE = NULL), false);                                     \
          ASSIGN_CONTAINER(NODE, hmap_next_in_bucket(&(NODE)->MEMBER), MEMBER))
 
+struct worker_control {
+    int id;
+    int size;
+    atomic_bool finished;
+    sem_t fire;
+    sem_t *done;
+    struct ovs_mutex mutex;
+    void *data;
+};
 
+struct worker_pool {
+    int size;
+    struct ovs_list list_node;
+    struct worker_control *controls;
+    sem_t done;
+};
+
+struct worker_pool *add_worker_pool(void *(*start)(void *));
+
+bool seize_fire(void);
 void fast_hmap_size_for(struct hmap *hmap, int size);
 void fast_hmap_init(struct hmap *hmap, ssize_t size);
 void hmap_merge(struct hmap *dest, struct hmap *inc);
