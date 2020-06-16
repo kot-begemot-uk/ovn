@@ -44,6 +44,7 @@ struct worker_control {
     sem_t *done;
     struct ovs_mutex mutex;
     void *data;
+    void *workload;
 };
 
 struct worker_pool {
@@ -59,6 +60,8 @@ bool seize_fire(void);
 void fast_hmap_size_for(struct hmap *hmap, int size);
 void fast_hmap_init(struct hmap *hmap, ssize_t size);
 void hmap_merge(struct hmap *dest, struct hmap *inc);
+void run_pool(struct worker_pool *pool, struct hmap *result, struct hmap *fragments);
+
 
 /* Returns the first node in 'hmap' in the bucket in which the given 'hash'
  * would land, or a null pointer if that bucket is empty. */

@@ -69,7 +69,7 @@ static void setup_worker_pools(void) {
     worker_pool_setup = true;
 }
 
-bool seize_fire()
+bool seize_fire(void)
 {
     return workers_must_exit;
 }
@@ -97,6 +97,7 @@ struct worker_pool *add_worker_pool(void *(*start)(void *)){
     for (i = 0; i < new_pool->size; i++) {
         new_control = &new_pool->controls[i];
         sem_init(&new_control->fire, 0, 0);
+        new_control->id = i;
         new_control->done = &new_pool->done;
         new_control->data = NULL;
         ovs_mutex_init(&new_control->mutex);
@@ -166,6 +167,40 @@ void hmap_merge(struct hmap *dest, struct hmap *inc)
             *inc_bucket = NULL;
         }
     }
+    dest->n += inc->n;
     inc->n = 0;
+}
+
+
+void run_pool(
+        struct worker_pool *pool,
+        struct hmap *result, 
+        struct hmap *fragments)
+{
+    int index, completed;
+
+    atomic_thread_fence(memory_order_release);
+
+    for (index = 0; index < pool->size; index++) {
+        sem_post(&pool->controls[index].fire);
+    }
+     
+    completed = 0;
+
+    do {
+        bool test;
+        sem_wait(&pool->done);
+        for (index = 0; index < pool->size; index++) {
+            test = true;
+            if (atomic_compare_exchange_weak(
+                    &pool->controls[index].finished,
+                    &test,
+                    false)) {
+                hmap_merge(result, &fragments[index]);
+                hmap_destroy(&fragments[index]);
+                completed++;
+            }
+        }
+    } while (completed < pool->size);
 }
 

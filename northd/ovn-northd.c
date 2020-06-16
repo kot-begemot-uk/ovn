@@ -102,7 +102,7 @@ static int northd_probe_interval = DEFAULT_PROBE_INTERVAL_MSEC;
 
 #define MIN_LFLOW_SIZE 128
 
-static last_lflow_size;
+static ssize_t last_lflow_size;
 
 /* Pipeline stages. */
 
@@ -574,6 +574,69 @@ struct macam_node {
     struct hmap_node hmap_node;
     struct eth_addr mac_addr; /* Allocated MAC address. */
 };
+
+struct lswitch_build_info {
+    struct hmap *datapaths;
+    struct hmap *ports;
+    struct hmap *port_groups;
+    struct hmap *lflows;
+    struct hmap *mcgroups;
+    struct hmap *igmp_groups;
+    struct shash *meter_groups;
+    struct hmap *lbs;
+    int index, size;
+};
+
+struct ovn_datapath_pool {
+    void (*od_helper_func)(struct ovn_datapath *od, void *context);
+    struct worker_pool *pool;
+    struct hmap *datapaths;
+};
+
+struct ovn_datapath_pool *lswitch_od_pipeline;
+
+struct ovn_port_pool {
+    void *(*op_helper_func)(struct ovn_port *op, void *context);
+    struct worker_pool *pool;
+    struct hmap *ports;
+};
+
+struct ovn_datapath_pool *lswitch_op_pipeline;
+
+static void *ovn_datapath_thread(void *arg) {
+ 
+    struct worker_control *control = (struct worker_control *) arg;
+    struct ovn_datapath_pool *workload;
+    struct lswitch_build_info *li;  
+    struct ovn_datapath *od;
+    int bnum;
+    
+    while (!seize_fire()) {
+        sem_wait(&control->fire);
+        workload = (struct ovn_datapath_pool *) control->workload;
+        li = (struct lswitch_build_info *) control->data;
+        if (workload->datapaths != NULL) {
+            for (bnum = control->id; 
+                    bnum <= li->datapaths->mask;
+                    bnum += workload->pool->size) 
+            {
+                HMAP_FOR_EACH_IN_BNUM(od, key_node, bnum, li->datapaths) {
+                    if (seize_fire()) {
+                        return NULL;
+                    }
+                    if (od->nbs) {
+                        (workload->od_helper_func)(od, control->data);
+                    }
+                }
+            }
+        }
+        atomic_store_relaxed(&control->finished, true);
+        atomic_thread_fence(memory_order_release);
+        sem_post(control->done);
+    }
+    return NULL;
+}
+
 
 static void
 cleanup_macam(struct hmap *macam_)
@@ -6114,163 +6177,161 @@ build_lswitch_rport_arp_req_flows(struct ovn_port *op,
 
 static void build_lswitch_per_datapath(
                 struct ovn_datapath *od,
-                struct hmap *port_groups, struct hmap *lflows,
-                struct shash *meter_groups,
-                struct hmap *lbs)
+                void *arg
+)
 {
+    struct lswitch_build_info *li = (struct lswitch_build_info *) arg;
     struct ds match = DS_EMPTY_INITIALIZER;
     struct ds actions = DS_EMPTY_INITIALIZER;
     char *svc_check_match = xasprintf("eth.dst == %s", svc_monitor_mac);
 
-    if (od->nbs) {
-        /* Build pre-ACL and ACL tables for both ingress and egress.
-         * Ingress tables 3 through 10.  Egress tables 0 through 7. */
-        build_pre_acls(od, lflows);
-        build_pre_lb(od, lflows, meter_groups, lbs);
-        build_pre_stateful(od, lflows);
-        build_acls(od, lflows, port_groups);
-        build_qos(od, lflows);
-        build_lb(od, lflows);
-        build_stateful(od, lflows, lbs);
+    /* Build pre-ACL and ACL tables for both ingress and egress.
+     * Ingress tables 3 through 10.  Egress tables 0 through 7. */
+    build_pre_acls(od, li->lflows);
+    build_pre_lb(od, li->lflows, li->meter_groups, li->lbs);
+    build_pre_stateful(od, li->lflows);
+    build_acls(od, li->lflows, li->port_groups);
+    build_qos(od, li->lflows);
+    build_lb(od, li->lflows);
+    build_stateful(od, li->lflows, li->lbs);
 
-        /* Build logical flows for the forwarding groups */
-        if (od->nbs->n_forwarding_groups) {
-            build_fwd_group_lflows(od, lflows);
+    /* Build logical flows for the forwarding groups */
+    if (od->nbs->n_forwarding_groups) {
+        build_fwd_group_lflows(od, li->lflows);
+    }
+    /* Logical switch ingress table 0: Admission control framework (priority
+     * 100). */
+
+    /* Logical VLANs not supported. */
+    ovn_lflow_add(li->lflows, od, S_SWITCH_IN_PORT_SEC_L2, 100, "vlan.present",
+                  "drop;");
+
+    /* Broadcast/multicast source address is invalid. */
+    ovn_lflow_add(li->lflows, od, S_SWITCH_IN_PORT_SEC_L2, 100, "eth.src[40]",
+                  "drop;");
+
+    /* Port security flows have priority 50 (see below) and will continue
+     * to the next table if packet source is acceptable. */
+    /* Ingress table 13: ARP/ND responder, by default goto next.
+     * (priority 0)*/
+
+    ovn_lflow_add(li->lflows, od, S_SWITCH_IN_ARP_ND_RSP, 0, "1", "next;");
+    /* Logical switch ingress table 17 and 18: DNS lookup and response
+     * priority 100 flows.
+     */
+    if (ls_has_dns_records(od->nbs)) {
+
+        struct ds action = DS_EMPTY_INITIALIZER;
+
+        ds_clear(&match);
+        ds_put_cstr(&match, "udp.dst == 53");
+        ds_put_format(&action,
+                      REGBIT_DNS_LOOKUP_RESULT" = dns_lookup(); next;");
+        ovn_lflow_add(li->lflows, od, S_SWITCH_IN_DNS_LOOKUP, 100,
+                      ds_cstr(&match), ds_cstr(&action));
+        ds_clear(&action);
+        ds_put_cstr(&match, " && "REGBIT_DNS_LOOKUP_RESULT);
+        ds_put_format(&action, "eth.dst <-> eth.src; ip4.src <-> ip4.dst; "
+                      "udp.dst = udp.src; udp.src = 53; outport = inport; "
+                      "flags.loopback = 1; output;");
+        ovn_lflow_add(li->lflows, od, S_SWITCH_IN_DNS_RESPONSE, 100,
+                      ds_cstr(&match), ds_cstr(&action));
+        ds_clear(&action);
+        ds_put_format(&action, "eth.dst <-> eth.src; ip6.src <-> ip6.dst; "
+                      "udp.dst = udp.src; udp.src = 53; outport = inport; "
+                      "flags.loopback = 1; output;");
+        ovn_lflow_add(li->lflows, od, S_SWITCH_IN_DNS_RESPONSE, 100,
+                      ds_cstr(&match), ds_cstr(&action));
+        ds_destroy(&action);
+    }
+    /* Ingress table 14 and 15: DHCP options and response, by default goto
+     * next. (priority 0).
+     * Ingress table 16 and 17: DNS lookup and response, by default goto next.
+     * (priority 0).
+     * Ingress table 18 - External port handling, by default goto next.
+     * (priority 0). */
+
+    ovn_lflow_add(li->lflows, od, S_SWITCH_IN_DHCP_OPTIONS, 0, "1", "next;");
+    ovn_lflow_add(li->lflows, od, S_SWITCH_IN_DHCP_RESPONSE, 0, "1", "next;");
+    ovn_lflow_add(li->lflows, od, S_SWITCH_IN_DNS_LOOKUP, 0, "1", "next;");
+    ovn_lflow_add(li->lflows, od, S_SWITCH_IN_DNS_RESPONSE, 0, "1", "next;");
+    ovn_lflow_add(li->lflows, od, S_SWITCH_IN_EXTERNAL_PORT, 0, "1", "next;");
+
+    /* Ingress table 19: Destination lookup, broadcast and multicast handling
+     * (priority 70 - 100). */
+
+    ovn_lflow_add(li->lflows, od, S_SWITCH_IN_L2_LKUP, 110, svc_check_match,
+                  "handle_svc_check(inport);");
+
+    struct mcast_switch_info *mcast_sw_info = &od->mcast_info.sw;
+
+    if (mcast_sw_info->enabled) {
+        ds_clear(&actions);
+        if (mcast_sw_info->flood_reports) {
+            ds_put_cstr(&actions,
+                        "clone { "
+                            "outport = \""MC_MROUTER_STATIC"\"; "
+                            "output; "
+                        "};");
         }
-        /* Logical switch ingress table 0: Admission control framework (priority
-         * 100). */
+        ds_put_cstr(&actions, "igmp;");
+        /* Punt IGMP traffic to controller. */
+        ovn_lflow_add(li->lflows, od, S_SWITCH_IN_L2_LKUP, 100,
+                      "ip4 && ip.proto == 2", ds_cstr(&actions));
 
-        /* Logical VLANs not supported. */
-        ovn_lflow_add(lflows, od, S_SWITCH_IN_PORT_SEC_L2, 100, "vlan.present",
-                      "drop;");
+        /* Punt MLD traffic to controller. */
+        ovn_lflow_add(li->lflows, od, S_SWITCH_IN_L2_LKUP, 100,
+                      "mldv1 || mldv2", ds_cstr(&actions));
 
-        /* Broadcast/multicast source address is invalid. */
-        ovn_lflow_add(lflows, od, S_SWITCH_IN_PORT_SEC_L2, 100, "eth.src[40]",
-                      "drop;");
-
-        /* Port security flows have priority 50 (see below) and will continue
-         * to the next table if packet source is acceptable. */
-        /* Ingress table 13: ARP/ND responder, by default goto next.
-         * (priority 0)*/
-
-        ovn_lflow_add(lflows, od, S_SWITCH_IN_ARP_ND_RSP, 0, "1", "next;");
-        /* Logical switch ingress table 17 and 18: DNS lookup and response
-         * priority 100 flows.
+        /* Flood all IP multicast traffic destined to 224.0.0.X to all
+         * ports - RFC 4541, section 2.1.2, item 2.
          */
-        if (ls_has_dns_records(od->nbs)) {
+        ovn_lflow_add(li->lflows, od, S_SWITCH_IN_L2_LKUP, 85,
+                      "ip4.mcast && ip4.dst == 224.0.0.0/24",
+                      "outport = \""MC_FLOOD"\"; output;");
 
-            struct ds action = DS_EMPTY_INITIALIZER;
+        /* Flood all IPv6 multicast traffic destined to reserved
+         * multicast IPs (RFC 4291, 2.7.1).
+         */
+        ovn_lflow_add(li->lflows, od, S_SWITCH_IN_L2_LKUP, 85,
+                      "ip6.mcast_flood",
+                      "outport = \""MC_FLOOD"\"; output;");
 
-            ds_clear(&match);
-            ds_put_cstr(&match, "udp.dst == 53");
-            ds_put_format(&action,
-                          REGBIT_DNS_LOOKUP_RESULT" = dns_lookup(); next;");
-            ovn_lflow_add(lflows, od, S_SWITCH_IN_DNS_LOOKUP, 100,
-                          ds_cstr(&match), ds_cstr(&action));
-            ds_clear(&action);
-            ds_put_cstr(&match, " && "REGBIT_DNS_LOOKUP_RESULT);
-            ds_put_format(&action, "eth.dst <-> eth.src; ip4.src <-> ip4.dst; "
-                          "udp.dst = udp.src; udp.src = 53; outport = inport; "
-                          "flags.loopback = 1; output;");
-            ovn_lflow_add(lflows, od, S_SWITCH_IN_DNS_RESPONSE, 100,
-                          ds_cstr(&match), ds_cstr(&action));
-            ds_clear(&action);
-            ds_put_format(&action, "eth.dst <-> eth.src; ip6.src <-> ip6.dst; "
-                          "udp.dst = udp.src; udp.src = 53; outport = inport; "
-                          "flags.loopback = 1; output;");
-            ovn_lflow_add(lflows, od, S_SWITCH_IN_DNS_RESPONSE, 100,
-                          ds_cstr(&match), ds_cstr(&action));
-            ds_destroy(&action);
-        }
-        /* Ingress table 14 and 15: DHCP options and response, by default goto
-         * next. (priority 0).
-         * Ingress table 16 and 17: DNS lookup and response, by default goto next.
-         * (priority 0).
-         * Ingress table 18 - External port handling, by default goto next.
-         * (priority 0). */
-
-        ovn_lflow_add(lflows, od, S_SWITCH_IN_DHCP_OPTIONS, 0, "1", "next;");
-        ovn_lflow_add(lflows, od, S_SWITCH_IN_DHCP_RESPONSE, 0, "1", "next;");
-        ovn_lflow_add(lflows, od, S_SWITCH_IN_DNS_LOOKUP, 0, "1", "next;");
-        ovn_lflow_add(lflows, od, S_SWITCH_IN_DNS_RESPONSE, 0, "1", "next;");
-        ovn_lflow_add(lflows, od, S_SWITCH_IN_EXTERNAL_PORT, 0, "1", "next;");
-
-        /* Ingress table 19: Destination lookup, broadcast and multicast handling
-         * (priority 70 - 100). */
-
-        ovn_lflow_add(lflows, od, S_SWITCH_IN_L2_LKUP, 110, svc_check_match,
-                      "handle_svc_check(inport);");
-
-        struct mcast_switch_info *mcast_sw_info = &od->mcast_info.sw;
-
-        if (mcast_sw_info->enabled) {
+        /* Forward uregistered IP multicast to routers with relay enabled
+         * and to any ports configured to flood IP multicast traffic.
+         * If configured to flood unregistered traffic this will be
+         * handled by the L2 multicast flow.
+         */
+        if (!mcast_sw_info->flood_unregistered) {
             ds_clear(&actions);
-            if (mcast_sw_info->flood_reports) {
+
+            if (mcast_sw_info->flood_relay) {
                 ds_put_cstr(&actions,
                             "clone { "
-                                "outport = \""MC_MROUTER_STATIC"\"; "
+                                "outport = \""MC_MROUTER_FLOOD"\"; "
                                 "output; "
-                            "};");
+                            "}; ");
             }
-            ds_put_cstr(&actions, "igmp;");
-            /* Punt IGMP traffic to controller. */
-            ovn_lflow_add(lflows, od, S_SWITCH_IN_L2_LKUP, 100,
-                          "ip4 && ip.proto == 2", ds_cstr(&actions));
 
-            /* Punt MLD traffic to controller. */
-            ovn_lflow_add(lflows, od, S_SWITCH_IN_L2_LKUP, 100,
-                          "mldv1 || mldv2", ds_cstr(&actions));
-
-            /* Flood all IP multicast traffic destined to 224.0.0.X to all
-             * ports - RFC 4541, section 2.1.2, item 2.
-             */
-            ovn_lflow_add(lflows, od, S_SWITCH_IN_L2_LKUP, 85,
-                          "ip4.mcast && ip4.dst == 224.0.0.0/24",
-                          "outport = \""MC_FLOOD"\"; output;");
-
-            /* Flood all IPv6 multicast traffic destined to reserved
-             * multicast IPs (RFC 4291, 2.7.1).
-             */
-            ovn_lflow_add(lflows, od, S_SWITCH_IN_L2_LKUP, 85,
-                          "ip6.mcast_flood",
-                          "outport = \""MC_FLOOD"\"; output;");
-
-            /* Forward uregistered IP multicast to routers with relay enabled
-             * and to any ports configured to flood IP multicast traffic.
-             * If configured to flood unregistered traffic this will be
-             * handled by the L2 multicast flow.
-             */
-            if (!mcast_sw_info->flood_unregistered) {
-                ds_clear(&actions);
-
-                if (mcast_sw_info->flood_relay) {
-                    ds_put_cstr(&actions,
-                                "clone { "
-                                    "outport = \""MC_MROUTER_FLOOD"\"; "
-                                    "output; "
-                                "}; ");
-                }
-
-                if (mcast_sw_info->flood_static) {
-                    ds_put_cstr(&actions, "outport =\""MC_STATIC"\"; output;");
-                }
-
-                /* Explicitly drop the traffic if relay or static flooding
-                 * is not configured.
-                 */
-                if (!mcast_sw_info->flood_relay &&
-                        !mcast_sw_info->flood_static) {
-                    ds_put_cstr(&actions, "drop;");
-                }
-
-                ovn_lflow_add(lflows, od, S_SWITCH_IN_L2_LKUP, 80,
-                              "ip4.mcast || ip6.mcast", ds_cstr(&actions));
+            if (mcast_sw_info->flood_static) {
+                ds_put_cstr(&actions, "outport =\""MC_STATIC"\"; output;");
             }
+
+            /* Explicitly drop the traffic if relay or static flooding
+             * is not configured.
+             */
+            if (!mcast_sw_info->flood_relay &&
+                    !mcast_sw_info->flood_static) {
+                ds_put_cstr(&actions, "drop;");
+            }
+
+            ovn_lflow_add(li->lflows, od, S_SWITCH_IN_L2_LKUP, 80,
+                          "ip4.mcast || ip6.mcast", ds_cstr(&actions));
         }
-
-        ovn_lflow_add(lflows, od, S_SWITCH_IN_L2_LKUP, 70, "eth.mcast",
-                      "outport = \""MC_FLOOD"\"; output;");
     }
+
+    ovn_lflow_add(li->lflows, od, S_SWITCH_IN_L2_LKUP, 70, "eth.mcast",
+                  "outport = \""MC_FLOOD"\"; output;");
     ds_destroy(&match);
     ds_destroy(&actions);
     free(svc_check_match);
@@ -6679,30 +6740,53 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
 
     struct ds match = DS_EMPTY_INITIALIZER;
     struct ds actions = DS_EMPTY_INITIALIZER;
+    int index;
+    struct lswitch_build_info *li;
+    struct hmap *lflow_segs;
+    struct worker_control *controls;
 
     /* Build pre-ACL and ACL tables for both ingress and egress.
      * Ingress tables 3 through 10.  Egress tables 0 through 7. */
-    struct ovn_datapath *od;
-    ssize_t bnum;
-    
-    struct hmap lflow_segs[4];
 
-    for (int i=0; i<4; i++) {
-        fast_hmap_init(&lflow_segs[i], lflows->mask);
-    }
-    
-    for (bnum = 0; bnum <= datapaths->mask; bnum++) {
-        HMAP_FOR_EACH_IN_BNUM(od, key_node, bnum, datapaths) {
-            build_lswitch_per_datapath(od, port_groups, &lflow_segs[bnum % 4], meter_groups, lbs);
+
+    if (lswitch_od_pipeline == NULL) {
+        lswitch_od_pipeline = xmalloc(sizeof (struct ovn_datapath_pool));
+        lswitch_od_pipeline[0].pool = add_worker_pool(ovn_datapath_thread);
+        lswitch_od_pipeline[0].od_helper_func = build_lswitch_per_datapath;
+        for (index=0; index < lswitch_od_pipeline[0].pool->size; index++) {
+            lswitch_od_pipeline[0].pool->controls[index].workload = &lswitch_od_pipeline[0];
         }
     }
 
-    
-    for (int i=0; i<4; i++) {
-        hmap_merge(lflows, &lflow_segs[i]);
-        hmap_destroy(&lflow_segs[i]);
+    li = xmalloc(sizeof(struct lswitch_build_info) * lswitch_od_pipeline[0].pool->size);
+    lflow_segs = xmalloc(sizeof(struct hmap) * lswitch_od_pipeline[0].pool->size);
+
+    controls = lswitch_od_pipeline[0].pool->controls;
+    for (index=0; index < lswitch_od_pipeline[0].pool->size; index++) {
+
+        li[index].index = index;
+        li[index].datapaths = datapaths;
+        li[index].ports = ports;
+        li[index].port_groups = port_groups;
+        li[index].mcgroups = mcgroups;
+        li[index].igmp_groups = igmp_groups;
+        li[index].meter_groups = meter_groups;
+        li[index].lbs = lbs;
+
+        fast_hmap_init(&lflow_segs[index], lflows->mask);
+        li[index].lflows = &lflow_segs[index];
+
+        controls[index].data = &li[index];
     }
 
+    atomic_thread_fence(memory_order_release);
+
+
+    run_pool(lswitch_od_pipeline[0].pool, lflows, lflow_segs);
+
+
+    free(li);
+    free(lflow_segs);
 
     build_lswitch_input_port_sec(ports, datapaths, lflows);
 
@@ -6966,6 +7050,8 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
             }
         }
     }
+
+    struct ovn_datapath *od;
 
     /* Ingress table 19: Destination lookup for unknown MACs (priority 0). */
     HMAP_FOR_EACH (od, key_node, datapaths) {
