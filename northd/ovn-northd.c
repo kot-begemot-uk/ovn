@@ -8140,6 +8140,76 @@ build_lrouter_logical_ingress_table_0_od(struct ovn_datapath *od,
 }
 
 static void
+build_lrouter_logical_ingress_table_1_od(struct ovn_datapath *od,
+                void *arg
+)
+{
+    struct lswitch_build_info *li = (struct lswitch_build_info *) arg;
+
+    /* Logical router ingress table 1: LOOKUP_NEIGHBOR and
+     * table 2: LEARN_NEIGHBOR. */
+    if (!od->nbr) {
+        return;
+    }
+
+    /* Learn MAC bindings from ARP/IPv6 ND.
+     *
+     * For ARP packets, table LOOKUP_NEIGHBOR does a lookup for the
+     * (arp.spa, arp.sha) in the mac binding table using the 'lookup_arp'
+     * action and stores the result in REGBIT_LOOKUP_NEIGHBOR_RESULT bit.
+     *
+     * For IPv6 ND NA packets, table LOOKUP_NEIGHBOR does a lookup
+     * for the (nd.target, nd.tll) in the mac binding table using the
+     * 'lookup_nd' action and stores the result in
+     * REGBIT_LOOKUP_NEIGHBOR_RESULT bit.
+     *
+     * For IPv6 ND NS packets, table LOOKUP_NEIGHBOR does a lookup
+     * for the (ip6.src, nd.sll) in the mac binding table using the
+     * 'lookup_nd' action and stores the result in
+     * REGBIT_LOOKUP_NEIGHBOR_RESULT bit.
+     *
+     * Table LEARN_NEIGHBOR learns the mac-binding using the action
+     * - 'put_arp/put_nd' only if REGBIT_LOOKUP_NEIGHBOR_RESULT bit
+     * is not set.
+     *
+     * */
+
+    /* Flows for LOOKUP_NEIGHBOR. */
+    ovn_lflow_add(li->lflows, od, S_ROUTER_IN_LOOKUP_NEIGHBOR, 100,
+                  "arp.op == 2",
+                  REGBIT_LOOKUP_NEIGHBOR_RESULT" = "
+                  "lookup_arp(inport, arp.spa, arp.sha); next;");
+
+    ovn_lflow_add(li->lflows, od, S_ROUTER_IN_LOOKUP_NEIGHBOR, 100, "nd_na",
+                  REGBIT_LOOKUP_NEIGHBOR_RESULT" = "
+                  "lookup_nd(inport, nd.target, nd.tll); next;");
+
+    ovn_lflow_add(li->lflows, od, S_ROUTER_IN_LOOKUP_NEIGHBOR, 100, "nd_ns",
+                  REGBIT_LOOKUP_NEIGHBOR_RESULT" = "
+                  "lookup_nd(inport, ip6.src, nd.sll); next;");
+
+    /* For other packet types, we can skip neighbor learning.
+     * So set REGBIT_SKIP_LOOKUP_NEIGHBOR to 1. */
+    ovn_lflow_add(li->lflows, od, S_ROUTER_IN_LOOKUP_NEIGHBOR, 0, "1",
+                  REGBIT_SKIP_LOOKUP_NEIGHBOR" = 1; next;");
+
+    /* Flows for LEARN_NEIGHBOR. */
+    /* Skip Neighbor learning if not required. */
+    ovn_lflow_add(li->lflows, od, S_ROUTER_IN_LEARN_NEIGHBOR, 100,
+                  REGBIT_SKIP_LOOKUP_NEIGHBOR" == 1 || "
+                  REGBIT_LOOKUP_NEIGHBOR_RESULT" == 1", "next;");
+
+    ovn_lflow_add(li->lflows, od, S_ROUTER_IN_LEARN_NEIGHBOR, 90,
+                  "arp", "put_arp(inport, arp.spa, arp.sha); next;");
+
+    ovn_lflow_add(li->lflows, od, S_ROUTER_IN_LEARN_NEIGHBOR, 90,
+                  "nd_na", "put_nd(inport, nd.target, nd.tll); next;");
+
+    ovn_lflow_add(li->lflows, od, S_ROUTER_IN_LEARN_NEIGHBOR, 90,
+                  "nd_ns", "put_nd(inport, ip6.src, nd.sll); next;");
+}
+
+static void
 build_lrouter_logical_ingress_table_0_op(struct ovn_port *op,
                 void *arg
 )
@@ -8186,10 +8256,47 @@ build_lrouter_logical_ingress_table_0_op(struct ovn_port *op,
 }
 
 static void
+build_lrouter_logical_ingress_table_1_op(struct ovn_port *op,
+                void *arg
+)
+{
+    struct lswitch_build_info *li = (struct lswitch_build_info *) arg;
+    struct ds match = DS_EMPTY_INITIALIZER;
+    struct ds actions = DS_EMPTY_INITIALIZER;
+    if (!op->nbrp) {
+        return;
+    }
+
+    /* Check if we need to learn mac-binding from ARP requests. */
+    for (int i = 0; i < op->lrp_networks.n_ipv4_addrs; i++) {
+        ds_clear(&match);
+        ds_put_format(&match,
+                      "inport == %s && arp.spa == %s/%u && arp.op == 1",
+                      op->json_key,
+                      op->lrp_networks.ipv4_addrs[i].network_s,
+                      op->lrp_networks.ipv4_addrs[i].plen);
+        if (op->od->l3dgw_port && op == op->od->l3dgw_port
+            && op->od->l3redirect_port) {
+            ds_put_format(&match, " && is_chassis_resident(%s)",
+                          op->od->l3redirect_port->json_key);
+        }
+        ovn_lflow_add_with_hint(li->lflows, op->od,
+                                S_ROUTER_IN_LOOKUP_NEIGHBOR, 100,
+                                ds_cstr(&match),
+                                REGBIT_LOOKUP_NEIGHBOR_RESULT" = "
+                                "lookup_arp(inport, arp.spa, arp.sha); "
+                                "next;", &op->nbrp->header_);
+    }
+    ds_destroy(&match);
+    ds_destroy(&actions);
+}
+
+static void
 build_lrouter_stage_2_od(struct ovn_datapath *od,
                 void *arg
 ) {
     build_lrouter_logical_ingress_table_0_od(od, arg);
+    build_lrouter_logical_ingress_table_1_od(od, arg);
 }
 
 static void
@@ -8197,6 +8304,7 @@ build_lrouter_stage_2_op(struct ovn_port *op,
                 void *arg
 ) {
     build_lrouter_logical_ingress_table_0_op(op, arg);
+    build_lrouter_logical_ingress_table_1_op(op, arg);
 }
 
 static void
@@ -8235,99 +8343,6 @@ build_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
 
     run_build_stage(2, li, lflows, lflow_segs);
 
-
-    /* Logical router ingress table 0: match (priority 50). */
-
-    /* Logical router ingress table 1: LOOKUP_NEIGHBOR and
-     * table 2: LEARN_NEIGHBOR. */
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        if (!od->nbr) {
-            continue;
-        }
-
-        /* Learn MAC bindings from ARP/IPv6 ND.
-         *
-         * For ARP packets, table LOOKUP_NEIGHBOR does a lookup for the
-         * (arp.spa, arp.sha) in the mac binding table using the 'lookup_arp'
-         * action and stores the result in REGBIT_LOOKUP_NEIGHBOR_RESULT bit.
-         *
-         * For IPv6 ND NA packets, table LOOKUP_NEIGHBOR does a lookup
-         * for the (nd.target, nd.tll) in the mac binding table using the
-         * 'lookup_nd' action and stores the result in
-         * REGBIT_LOOKUP_NEIGHBOR_RESULT bit.
-         *
-         * For IPv6 ND NS packets, table LOOKUP_NEIGHBOR does a lookup
-         * for the (ip6.src, nd.sll) in the mac binding table using the
-         * 'lookup_nd' action and stores the result in
-         * REGBIT_LOOKUP_NEIGHBOR_RESULT bit.
-         *
-         * Table LEARN_NEIGHBOR learns the mac-binding using the action
-         * - 'put_arp/put_nd' only if REGBIT_LOOKUP_NEIGHBOR_RESULT bit
-         * is not set.
-         *
-         * */
-
-        /* Flows for LOOKUP_NEIGHBOR. */
-        ovn_lflow_add(lflows, od, S_ROUTER_IN_LOOKUP_NEIGHBOR, 100,
-                      "arp.op == 2",
-                      REGBIT_LOOKUP_NEIGHBOR_RESULT" = "
-                      "lookup_arp(inport, arp.spa, arp.sha); next;");
-
-        ovn_lflow_add(lflows, od, S_ROUTER_IN_LOOKUP_NEIGHBOR, 100, "nd_na",
-                      REGBIT_LOOKUP_NEIGHBOR_RESULT" = "
-                      "lookup_nd(inport, nd.target, nd.tll); next;");
-
-        ovn_lflow_add(lflows, od, S_ROUTER_IN_LOOKUP_NEIGHBOR, 100, "nd_ns",
-                      REGBIT_LOOKUP_NEIGHBOR_RESULT" = "
-                      "lookup_nd(inport, ip6.src, nd.sll); next;");
-
-        /* For other packet types, we can skip neighbor learning.
-         * So set REGBIT_SKIP_LOOKUP_NEIGHBOR to 1. */
-        ovn_lflow_add(lflows, od, S_ROUTER_IN_LOOKUP_NEIGHBOR, 0, "1",
-                      REGBIT_SKIP_LOOKUP_NEIGHBOR" = 1; next;");
-
-        /* Flows for LEARN_NEIGHBOR. */
-        /* Skip Neighbor learning if not required. */
-        ovn_lflow_add(lflows, od, S_ROUTER_IN_LEARN_NEIGHBOR, 100,
-                      REGBIT_SKIP_LOOKUP_NEIGHBOR" == 1 || "
-                      REGBIT_LOOKUP_NEIGHBOR_RESULT" == 1", "next;");
-
-        ovn_lflow_add(lflows, od, S_ROUTER_IN_LEARN_NEIGHBOR, 90,
-                      "arp", "put_arp(inport, arp.spa, arp.sha); next;");
-
-        ovn_lflow_add(lflows, od, S_ROUTER_IN_LEARN_NEIGHBOR, 90,
-                      "nd_na", "put_nd(inport, nd.target, nd.tll); next;");
-
-        ovn_lflow_add(lflows, od, S_ROUTER_IN_LEARN_NEIGHBOR, 90,
-                      "nd_ns", "put_nd(inport, ip6.src, nd.sll); next;");
-    }
-
-    HMAP_FOR_EACH (op, key_node, ports) {
-        if (!op->nbrp) {
-            continue;
-        }
-
-        /* Check if we need to learn mac-binding from ARP requests. */
-        for (int i = 0; i < op->lrp_networks.n_ipv4_addrs; i++) {
-            ds_clear(&match);
-            ds_put_format(&match,
-                          "inport == %s && arp.spa == %s/%u && arp.op == 1",
-                          op->json_key,
-                          op->lrp_networks.ipv4_addrs[i].network_s,
-                          op->lrp_networks.ipv4_addrs[i].plen);
-            if (op->od->l3dgw_port && op == op->od->l3dgw_port
-                && op->od->l3redirect_port) {
-                ds_put_format(&match, " && is_chassis_resident(%s)",
-                              op->od->l3redirect_port->json_key);
-            }
-            ovn_lflow_add_with_hint(lflows, op->od,
-                                    S_ROUTER_IN_LOOKUP_NEIGHBOR, 100,
-                                    ds_cstr(&match),
-                                    REGBIT_LOOKUP_NEIGHBOR_RESULT" = "
-                                    "lookup_arp(inport, arp.spa, arp.sha); "
-                                    "next;", &op->nbrp->header_);
-        }
-    }
 
     /* Logical router ingress table 3: IP Input. */
     HMAP_FOR_EACH (od, key_node, datapaths) {
