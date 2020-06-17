@@ -9693,6 +9693,270 @@ build_lrouter_NAT_defrag_and_lb(struct ovn_datapath *od,
 }
 
 static void
+build_lrouter_ipv6_RA_response_op(struct ovn_port *op,
+                void *arg
+)
+{
+    struct lswitch_build_info *li = (struct lswitch_build_info *) arg;
+    struct ds match = DS_EMPTY_INITIALIZER;
+    struct ds actions = DS_EMPTY_INITIALIZER;
+    /* Logical router ingress table ND_RA_OPTIONS & ND_RA_RESPONSE: IPv6 Router
+     * Adv (RA) options and response. */
+    if (!op->nbrp || op->nbrp->peer || !op->peer) {
+        return;
+    }
+
+    if (!op->lrp_networks.n_ipv6_addrs) {
+        return;
+    }
+
+    struct smap options;
+    smap_clone(&options, &op->sb->options);
+
+    /* enable IPv6 prefix delegation */
+    bool prefix_delegation = smap_get_bool(&op->nbrp->options,
+                                           "prefix_delegation", false);
+    if (!lrport_is_enabled(op->nbrp)) {
+        prefix_delegation = false;
+    }
+    smap_add(&options, "ipv6_prefix_delegation",
+             prefix_delegation ? "true" : "false");
+    sbrec_port_binding_set_options(op->sb, &options);
+
+    bool ipv6_prefix = smap_get_bool(&op->nbrp->options,
+                                     "prefix", false);
+    if (!lrport_is_enabled(op->nbrp)) {
+        ipv6_prefix = false;
+    }
+    smap_add(&options, "ipv6_prefix",
+             ipv6_prefix ? "true" : "false");
+    sbrec_port_binding_set_options(op->sb, &options);
+
+    smap_destroy(&options);
+
+    const char *address_mode = smap_get(
+        &op->nbrp->ipv6_ra_configs, "address_mode");
+
+    if (!address_mode) {
+        return;
+    }
+    if (strcmp(address_mode, "slaac") &&
+        strcmp(address_mode, "dhcpv6_stateful") &&
+        strcmp(address_mode, "dhcpv6_stateless")) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
+        VLOG_WARN_RL(&rl, "Invalid address mode [%s] defined",
+                     address_mode);
+        return;
+    }
+
+    if (smap_get_bool(&op->nbrp->ipv6_ra_configs, "send_periodic",
+                      false)) {
+        copy_ra_to_sb(op, address_mode);
+    }
+
+    ds_clear(&match);
+    ds_put_format(&match, "inport == %s && ip6.dst == ff02::2 && nd_rs",
+                          op->json_key);
+    ds_clear(&actions);
+
+    const char *mtu_s = smap_get(
+        &op->nbrp->ipv6_ra_configs, "mtu");
+
+    /* As per RFC 2460, 1280 is minimum IPv6 MTU. */
+    uint32_t mtu = (mtu_s && atoi(mtu_s) >= 1280) ? atoi(mtu_s) : 0;
+
+    ds_put_format(&actions, REGBIT_ND_RA_OPTS_RESULT" = put_nd_ra_opts("
+                  "addr_mode = \"%s\", slla = %s",
+                  address_mode, op->lrp_networks.ea_s);
+    if (mtu > 0) {
+        ds_put_format(&actions, ", mtu = %u", mtu);
+    }
+
+    bool add_rs_response_flow = false;
+
+    for (size_t i = 0; i < op->lrp_networks.n_ipv6_addrs; i++) {
+        if (in6_is_lla(&op->lrp_networks.ipv6_addrs[i].network)) {
+            continue;
+        }
+
+        ds_put_format(&actions, ", prefix = %s/%u",
+                      op->lrp_networks.ipv6_addrs[i].network_s,
+                      op->lrp_networks.ipv6_addrs[i].plen);
+
+        add_rs_response_flow = true;
+    }
+
+    if (add_rs_response_flow) {
+        ds_put_cstr(&actions, "); next;");
+        ovn_lflow_add_with_hint(li->lflows, op->od, S_ROUTER_IN_ND_RA_OPTIONS,
+                                50, ds_cstr(&match), ds_cstr(&actions),
+                                &op->nbrp->header_);
+        ds_clear(&actions);
+        ds_clear(&match);
+        ds_put_format(&match, "inport == %s && ip6.dst == ff02::2 && "
+                      "nd_ra && "REGBIT_ND_RA_OPTS_RESULT, op->json_key);
+
+        char ip6_str[INET6_ADDRSTRLEN + 1];
+        struct in6_addr lla;
+        in6_generate_lla(op->lrp_networks.ea, &lla);
+        memset(ip6_str, 0, sizeof(ip6_str));
+        ipv6_string_mapped(ip6_str, &lla);
+        ds_put_format(&actions, "eth.dst = eth.src; eth.src = %s; "
+                      "ip6.dst = ip6.src; ip6.src = %s; "
+                      "outport = inport; flags.loopback = 1; "
+                      "output;",
+                      op->lrp_networks.ea_s, ip6_str);
+        ovn_lflow_add_with_hint(li->lflows, op->od,
+                                S_ROUTER_IN_ND_RA_RESPONSE, 50,
+                                ds_cstr(&match), ds_cstr(&actions),
+                                &op->nbrp->header_);
+    }
+
+    ds_destroy(&match);
+    ds_destroy(&actions);
+}
+
+
+static void
+build_lrouter_ipv6_RA_response_od(struct ovn_datapath *od,
+                void *arg
+)
+{
+    struct lswitch_build_info *li = (struct lswitch_build_info *) arg;
+    /* Logical router ingress table ND_RA_OPTIONS & ND_RA_RESPONSE: RS
+     * responder, by default goto next. (priority 0)*/
+    if (!od->nbr) {
+        return;
+    }
+
+    ovn_lflow_add(li->lflows, od, S_ROUTER_IN_ND_RA_OPTIONS, 0, "1", "next;");
+    ovn_lflow_add(li->lflows, od, S_ROUTER_IN_ND_RA_RESPONSE, 0, "1", "next;");
+}
+
+static void
+build_lrouter_ip_routing_distributed_router(struct ovn_datapath *od,
+                void *arg
+)
+{
+    struct lswitch_build_info *li = (struct lswitch_build_info *) arg;
+    struct ds match = DS_EMPTY_INITIALIZER;
+    struct ds actions = DS_EMPTY_INITIALIZER;
+    /* Logical router ingress table IP_ROUTING - IP routing for distributed
+     * logical router
+     */
+    if (od->nbr && od->l3dgw_port) {
+        add_distributed_routes(li->lflows, od);
+    }
+    ds_destroy(&match);
+    ds_destroy(&actions);
+}
+
+
+static void
+build_lrouter_ip_router_ingress(struct ovn_port *op,
+                void *arg
+)
+{
+    struct lswitch_build_info *li = (struct lswitch_build_info *) arg;
+    struct ds match = DS_EMPTY_INITIALIZER;
+    struct ds actions = DS_EMPTY_INITIALIZER;
+    /* Logical router ingress table IP_ROUTING & IP_ROUTING_ECMP: IP Routing.
+     *
+     * A packet that arrives at this table is an IP packet that should be
+     * routed to the address in 'ip[46].dst'.
+     *
+     * For regular routes without ECMP, table IP_ROUTING sets outport to the
+     * correct output port, eth.src to the output port's MAC address, and
+     * '[xx]reg0' to the next-hop IP address (leaving 'ip[46].dst', the
+     * packet’s final destination, unchanged), and advances to the next table.
+     *
+     * For ECMP routes, i.e. multiple routes with same policy and prefix, table
+     * IP_ROUTING remembers ECMP group id and selects a member id, and advances
+     * to table IP_ROUTING_ECMP, which sets outport, eth.src and '[xx]reg0' for
+     * the selected ECMP member.
+     * */
+    if (!op->nbrp) {
+        return;
+    }
+
+    for (int i = 0; i < op->lrp_networks.n_ipv4_addrs; i++) {
+        add_route(li->lflows, op, op->lrp_networks.ipv4_addrs[i].addr_s,
+                  op->lrp_networks.ipv4_addrs[i].network_s,
+                  op->lrp_networks.ipv4_addrs[i].plen, NULL, false,
+                  &op->nbrp->header_);
+    }
+
+    for (int i = 0; i < op->lrp_networks.n_ipv6_addrs; i++) {
+        add_route(li->lflows, op, op->lrp_networks.ipv6_addrs[i].addr_s,
+                  op->lrp_networks.ipv6_addrs[i].network_s,
+                  op->lrp_networks.ipv6_addrs[i].plen, NULL, false,
+                  &op->nbrp->header_);
+    }
+
+    ds_destroy(&match);
+    ds_destroy(&actions);
+}
+
+static void
+build_lrouter_static_routes(struct ovn_datapath *od,
+                void *arg
+)
+{
+    struct lswitch_build_info *li = (struct lswitch_build_info *) arg;
+    struct ds match = DS_EMPTY_INITIALIZER;
+    struct ds actions = DS_EMPTY_INITIALIZER;
+
+    /* Convert the static routes to flows. */
+    if (!od->nbr) {
+        return;
+    }
+    ovn_lflow_add(li->lflows, od, S_ROUTER_IN_IP_ROUTING_ECMP, 150,
+                  REG_ECMP_GROUP_ID" == 0", "next;");
+
+    struct hmap ecmp_groups = HMAP_INITIALIZER(&ecmp_groups);
+    struct hmap unique_routes = HMAP_INITIALIZER(&unique_routes);
+    struct ovs_list parsed_routes = OVS_LIST_INITIALIZER(&parsed_routes);
+    struct ecmp_groups_node *group;
+    for (int i = 0; i < od->nbr->n_static_routes; i++) {
+        struct parsed_route *route =
+            parsed_routes_add(&parsed_routes, od->nbr->static_routes[i]);
+        if (!route) {
+            continue;
+        }
+        group = ecmp_groups_find(&ecmp_groups, route);
+        if (group) {
+            ecmp_groups_add_route(group, route);
+        } else {
+            const struct parsed_route *existed_route =
+                unique_routes_remove(&unique_routes, route);
+            if (existed_route) {
+                group = ecmp_groups_add(&ecmp_groups, existed_route);
+                if (group) {
+                    ecmp_groups_add_route(group, route);
+                }
+            } else {
+                unique_routes_add(&unique_routes, route);
+            }
+        }
+    }
+    HMAP_FOR_EACH (group, hmap_node, &ecmp_groups) {
+        /* add a flow in IP_ROUTING, and one flow for each member in
+         * IP_ROUTING_ECMP. */
+        build_ecmp_route_flow(li->lflows, od, li->ports, group);
+    }
+    const struct unique_routes_node *ur;
+    HMAP_FOR_EACH (ur, hmap_node, &unique_routes) {
+        build_static_route_flow(li->lflows, od, li->ports, ur->route);
+    }
+    ecmp_groups_destroy(&ecmp_groups);
+    unique_routes_destroy(&unique_routes);
+    parsed_routes_destroy(&parsed_routes);
+
+    ds_destroy(&match);
+    ds_destroy(&actions);
+}
+
+static void
 build_lrouter_stage_2_od(struct ovn_datapath *od,
                 void *arg
 ) {
@@ -9700,6 +9964,9 @@ build_lrouter_stage_2_od(struct ovn_datapath *od,
     build_lrouter_logical_ingress_table_1_od(od, arg);
     build_lrouter_logical_ingress_table_3_od(od, arg);
     build_lrouter_NAT_defrag_and_lb(od, arg);
+    build_lrouter_ipv6_RA_response_od(od, arg);
+    build_lrouter_ip_routing_distributed_router(od, arg);
+    build_lrouter_static_routes(od, arg);
 }
 
 static void
@@ -9711,6 +9978,8 @@ build_lrouter_stage_2_op(struct ovn_port *op,
     build_lrouter_logical_ingress_table_3_op(op, arg);
     build_lrouter_dhcp6_reply(op, arg);
     build_lrouter_ip_input(op, arg);
+    build_lrouter_ipv6_RA_response_op(op, arg);
+    build_lrouter_ip_router_ingress(op, arg);
 }
 
 static void
@@ -9748,224 +10017,6 @@ build_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
     }
 
     run_build_stage(2, li, lflows, lflow_segs);
-
-
-    /* Logical router ingress table ND_RA_OPTIONS & ND_RA_RESPONSE: IPv6 Router
-     * Adv (RA) options and response. */
-    HMAP_FOR_EACH (op, key_node, ports) {
-        if (!op->nbrp || op->nbrp->peer || !op->peer) {
-            continue;
-        }
-
-        if (!op->lrp_networks.n_ipv6_addrs) {
-            continue;
-        }
-
-        struct smap options;
-        smap_clone(&options, &op->sb->options);
-
-        /* enable IPv6 prefix delegation */
-        bool prefix_delegation = smap_get_bool(&op->nbrp->options,
-                                               "prefix_delegation", false);
-        if (!lrport_is_enabled(op->nbrp)) {
-            prefix_delegation = false;
-        }
-        smap_add(&options, "ipv6_prefix_delegation",
-                 prefix_delegation ? "true" : "false");
-        sbrec_port_binding_set_options(op->sb, &options);
-
-        bool ipv6_prefix = smap_get_bool(&op->nbrp->options,
-                                         "prefix", false);
-        if (!lrport_is_enabled(op->nbrp)) {
-            ipv6_prefix = false;
-        }
-        smap_add(&options, "ipv6_prefix",
-                 ipv6_prefix ? "true" : "false");
-        sbrec_port_binding_set_options(op->sb, &options);
-
-        smap_destroy(&options);
-
-        const char *address_mode = smap_get(
-            &op->nbrp->ipv6_ra_configs, "address_mode");
-
-        if (!address_mode) {
-            continue;
-        }
-        if (strcmp(address_mode, "slaac") &&
-            strcmp(address_mode, "dhcpv6_stateful") &&
-            strcmp(address_mode, "dhcpv6_stateless")) {
-            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
-            VLOG_WARN_RL(&rl, "Invalid address mode [%s] defined",
-                         address_mode);
-            continue;
-        }
-
-        if (smap_get_bool(&op->nbrp->ipv6_ra_configs, "send_periodic",
-                          false)) {
-            copy_ra_to_sb(op, address_mode);
-        }
-
-        ds_clear(&match);
-        ds_put_format(&match, "inport == %s && ip6.dst == ff02::2 && nd_rs",
-                              op->json_key);
-        ds_clear(&actions);
-
-        const char *mtu_s = smap_get(
-            &op->nbrp->ipv6_ra_configs, "mtu");
-
-        /* As per RFC 2460, 1280 is minimum IPv6 MTU. */
-        uint32_t mtu = (mtu_s && atoi(mtu_s) >= 1280) ? atoi(mtu_s) : 0;
-
-        ds_put_format(&actions, REGBIT_ND_RA_OPTS_RESULT" = put_nd_ra_opts("
-                      "addr_mode = \"%s\", slla = %s",
-                      address_mode, op->lrp_networks.ea_s);
-        if (mtu > 0) {
-            ds_put_format(&actions, ", mtu = %u", mtu);
-        }
-
-        bool add_rs_response_flow = false;
-
-        for (size_t i = 0; i < op->lrp_networks.n_ipv6_addrs; i++) {
-            if (in6_is_lla(&op->lrp_networks.ipv6_addrs[i].network)) {
-                continue;
-            }
-
-            ds_put_format(&actions, ", prefix = %s/%u",
-                          op->lrp_networks.ipv6_addrs[i].network_s,
-                          op->lrp_networks.ipv6_addrs[i].plen);
-
-            add_rs_response_flow = true;
-        }
-
-        if (add_rs_response_flow) {
-            ds_put_cstr(&actions, "); next;");
-            ovn_lflow_add_with_hint(lflows, op->od, S_ROUTER_IN_ND_RA_OPTIONS,
-                                    50, ds_cstr(&match), ds_cstr(&actions),
-                                    &op->nbrp->header_);
-            ds_clear(&actions);
-            ds_clear(&match);
-            ds_put_format(&match, "inport == %s && ip6.dst == ff02::2 && "
-                          "nd_ra && "REGBIT_ND_RA_OPTS_RESULT, op->json_key);
-
-            char ip6_str[INET6_ADDRSTRLEN + 1];
-            struct in6_addr lla;
-            in6_generate_lla(op->lrp_networks.ea, &lla);
-            memset(ip6_str, 0, sizeof(ip6_str));
-            ipv6_string_mapped(ip6_str, &lla);
-            ds_put_format(&actions, "eth.dst = eth.src; eth.src = %s; "
-                          "ip6.dst = ip6.src; ip6.src = %s; "
-                          "outport = inport; flags.loopback = 1; "
-                          "output;",
-                          op->lrp_networks.ea_s, ip6_str);
-            ovn_lflow_add_with_hint(lflows, op->od,
-                                    S_ROUTER_IN_ND_RA_RESPONSE, 50,
-                                    ds_cstr(&match), ds_cstr(&actions),
-                                    &op->nbrp->header_);
-        }
-    }
-
-    /* Logical router ingress table ND_RA_OPTIONS & ND_RA_RESPONSE: RS
-     * responder, by default goto next. (priority 0)*/
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        if (!od->nbr) {
-            continue;
-        }
-
-        ovn_lflow_add(lflows, od, S_ROUTER_IN_ND_RA_OPTIONS, 0, "1", "next;");
-        ovn_lflow_add(lflows, od, S_ROUTER_IN_ND_RA_RESPONSE, 0, "1", "next;");
-    }
-
-    /* Logical router ingress table IP_ROUTING - IP routing for distributed
-     * logical router
-     */
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        if (od->nbr && od->l3dgw_port) {
-            add_distributed_routes(lflows, od);
-        }
-    }
-
-    /* Logical router ingress table IP_ROUTING & IP_ROUTING_ECMP: IP Routing.
-     *
-     * A packet that arrives at this table is an IP packet that should be
-     * routed to the address in 'ip[46].dst'.
-     *
-     * For regular routes without ECMP, table IP_ROUTING sets outport to the
-     * correct output port, eth.src to the output port's MAC address, and
-     * '[xx]reg0' to the next-hop IP address (leaving 'ip[46].dst', the
-     * packet’s final destination, unchanged), and advances to the next table.
-     *
-     * For ECMP routes, i.e. multiple routes with same policy and prefix, table
-     * IP_ROUTING remembers ECMP group id and selects a member id, and advances
-     * to table IP_ROUTING_ECMP, which sets outport, eth.src and '[xx]reg0' for
-     * the selected ECMP member.
-     * */
-    HMAP_FOR_EACH (op, key_node, ports) {
-        if (!op->nbrp) {
-            continue;
-        }
-
-        for (int i = 0; i < op->lrp_networks.n_ipv4_addrs; i++) {
-            add_route(lflows, op, op->lrp_networks.ipv4_addrs[i].addr_s,
-                      op->lrp_networks.ipv4_addrs[i].network_s,
-                      op->lrp_networks.ipv4_addrs[i].plen, NULL, false,
-                      &op->nbrp->header_);
-        }
-
-        for (int i = 0; i < op->lrp_networks.n_ipv6_addrs; i++) {
-            add_route(lflows, op, op->lrp_networks.ipv6_addrs[i].addr_s,
-                      op->lrp_networks.ipv6_addrs[i].network_s,
-                      op->lrp_networks.ipv6_addrs[i].plen, NULL, false,
-                      &op->nbrp->header_);
-        }
-    }
-
-    /* Convert the static routes to flows. */
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        if (!od->nbr) {
-            continue;
-        }
-        ovn_lflow_add(lflows, od, S_ROUTER_IN_IP_ROUTING_ECMP, 150,
-                      REG_ECMP_GROUP_ID" == 0", "next;");
-
-        struct hmap ecmp_groups = HMAP_INITIALIZER(&ecmp_groups);
-        struct hmap unique_routes = HMAP_INITIALIZER(&unique_routes);
-        struct ovs_list parsed_routes = OVS_LIST_INITIALIZER(&parsed_routes);
-        struct ecmp_groups_node *group;
-        for (int i = 0; i < od->nbr->n_static_routes; i++) {
-            struct parsed_route *route =
-                parsed_routes_add(&parsed_routes, od->nbr->static_routes[i]);
-            if (!route) {
-                continue;
-            }
-            group = ecmp_groups_find(&ecmp_groups, route);
-            if (group) {
-                ecmp_groups_add_route(group, route);
-            } else {
-                const struct parsed_route *existed_route =
-                    unique_routes_remove(&unique_routes, route);
-                if (existed_route) {
-                    group = ecmp_groups_add(&ecmp_groups, existed_route);
-                    if (group) {
-                        ecmp_groups_add_route(group, route);
-                    }
-                } else {
-                    unique_routes_add(&unique_routes, route);
-                }
-            }
-        }
-        HMAP_FOR_EACH (group, hmap_node, &ecmp_groups) {
-            /* add a flow in IP_ROUTING, and one flow for each member in
-             * IP_ROUTING_ECMP. */
-            build_ecmp_route_flow(lflows, od, ports, group);
-        }
-        const struct unique_routes_node *ur;
-        HMAP_FOR_EACH (ur, hmap_node, &unique_routes) {
-            build_static_route_flow(lflows, od, ports, ur->route);
-        }
-        ecmp_groups_destroy(&ecmp_groups);
-        unique_routes_destroy(&unique_routes);
-        parsed_routes_destroy(&parsed_routes);
-    }
 
     /* IP Multicast lookup. Here we set the output port, adjust TTL and
      * advance to next table (priority 500).
