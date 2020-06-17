@@ -575,8 +575,6 @@ struct macam_node {
     struct eth_addr mac_addr; /* Allocated MAC address. */
 };
 
-#define P_LSWITCH_OD_1 0
-#define P_LSWITCH_OD_2 1
 
 struct lswitch_build_info {
     struct hmap *datapaths;
@@ -595,18 +593,14 @@ struct ovn_datapath_pool {
     struct worker_pool *pool;
 };
 
-#define OD_POOL_SIZE 2
-struct ovn_datapath_pool *lswitch_od_pipeline;
+struct ovn_datapath_pool *parallel_od_pipeline;
 
 struct ovn_port_pool {
     void (*op_helper_func)(struct ovn_port *op, void *context);
     struct worker_pool *pool;
 };
-#define P_LSWITCH_OP_1 0
-#define P_LSWITCH_OP_2 1
 
-#define OP_POOL_SIZE 2
-struct ovn_port_pool *lswitch_op_pipeline;
+struct ovn_port_pool *parallel_op_pipeline;
 
 static void
 cleanup_macam(struct hmap *macam_)
@@ -4647,7 +4641,7 @@ build_lswitch_output_port_sec_op(struct ovn_port *op,
      * Priority 150 rules drop packets to disabled logical ports, so that
      * they don't even receive multicast or broadcast packets.
      */
-    if (lsp_is_external(op->nbsp)) {
+    if ((!op->nbsp) || (lsp_is_external(op->nbsp))) {
         return;
     }
 
@@ -4690,6 +4684,10 @@ build_lswitch_output_port_sec_od(struct ovn_datapath *od,
     struct lswitch_build_info *li = (struct lswitch_build_info *) arg;
     struct ds actions = DS_EMPTY_INITIALIZER;
     struct ds match = DS_EMPTY_INITIALIZER;
+
+    if (!od->nbs) {
+        return;
+    }
 
     if (od->has_unknown) {
         ovn_lflow_add(li->lflows, od, S_SWITCH_IN_L2_LKUP, 0, "1",
@@ -6143,6 +6141,10 @@ static void build_lswitch_per_datapath(
     struct ds actions = DS_EMPTY_INITIALIZER;
     char *svc_check_match = xasprintf("eth.dst == %s", svc_monitor_mac);
 
+    if (!od->nbs) {
+        return;
+    }
+
     /* Build pre-ACL and ACL tables for both ingress and egress.
      * Ingress tables 3 through 10.  Egress tables 0 through 7. */
     build_pre_acls(od, li->lflows);
@@ -6705,6 +6707,10 @@ build_lswitch_per_port_dest_unicast (
     struct lswitch_build_info *li = (struct lswitch_build_info *) arg;
     struct ds match = DS_EMPTY_INITIALIZER;
     struct ds actions = DS_EMPTY_INITIALIZER;
+
+    if (!op->nbsp) {
+        return;
+    }
     /* Ingress table 19: Destination lookup, unicast handling (priority 50), */
     if (lsp_is_external(op->nbsp)) {
         return;
@@ -6847,9 +6853,11 @@ build_lswitch_per_port (
                     struct ovn_port *op,
                     void *arg)
 {
-    build_lswitch_per_port_1(op, arg);
-    build_lswitch_per_port_2(op, arg);
-    build_lswitch_input_port_sec(op, arg);
+    if (op->nbsp) {
+        build_lswitch_per_port_1(op, arg);
+        build_lswitch_per_port_2(op, arg);
+        build_lswitch_input_port_sec(op, arg);
+    }
 }
 
 static void *ovn_datapath_thread(void *arg) {
@@ -6873,9 +6881,7 @@ static void *ovn_datapath_thread(void *arg) {
                     if (seize_fire()) {
                         return NULL;
                     }
-                    if (od->nbs) {
-                        (workload->od_helper_func)(od, control->data);
-                    }
+                    (workload->od_helper_func)(od, control->data);
                 }
             }
         }
@@ -6907,9 +6913,7 @@ static void *ovn_port_thread(void *arg) {
                     if (seize_fire()) {
                         return NULL;
                     }
-                    if (op->nbsp) {
-                        (workload->op_helper_func)(op, control->data);
-                    }
+                    (workload->op_helper_func)(op, control->data);
                 }
             }
         }
@@ -6920,52 +6924,114 @@ static void *ovn_port_thread(void *arg) {
     return NULL;
 }
 
+/* forward declarations of lrouter processing */
+
+static void build_lrouter_stage_2_od(struct ovn_datapath *od, void *arg);
+static void build_lrouter_stage_2_op(struct ovn_port *op, void *arg);
+
+#define PARALLEL_POOL_SIZE 3
 
 static void init_thread_pools(void)
 {
     int index;
-    if (lswitch_od_pipeline == NULL) {
+    if (parallel_od_pipeline == NULL) {
 
-        lswitch_od_pipeline = xmalloc(sizeof (struct ovn_datapath_pool) * OD_POOL_SIZE);
+        /* DATAPATHS */
+
+        parallel_od_pipeline = xmalloc(sizeof (struct ovn_datapath_pool) * PARALLEL_POOL_SIZE);
         
-        /* LSWITCH DATAPATH */
-        lswitch_od_pipeline[P_LSWITCH_OD_1].pool = add_worker_pool(ovn_datapath_thread);
-        lswitch_od_pipeline[P_LSWITCH_OD_1].od_helper_func = build_lswitch_per_datapath;
+        /* LSWITCH DATAPATH STAGE 1 */
+        parallel_od_pipeline[0].pool = add_worker_pool(ovn_datapath_thread);
+        parallel_od_pipeline[0].od_helper_func = build_lswitch_per_datapath;
 
-        for (index=0; index < lswitch_od_pipeline[P_LSWITCH_OD_1].pool->size; index++) {
-            lswitch_od_pipeline[P_LSWITCH_OD_1].pool->controls[index].workload = &lswitch_od_pipeline[P_LSWITCH_OD_1];
+        for (index=0; index < parallel_od_pipeline[0].pool->size; index++) {
+            parallel_od_pipeline[0].pool->controls[index].workload = &parallel_od_pipeline[0];
         }
 
-        /* LSWITCH DATAPATH PHASE 2 */
+        /* LSWITCH DATAPATH STAGE 2 */
 
-        lswitch_od_pipeline[P_LSWITCH_OD_2].pool = add_worker_pool(ovn_datapath_thread);
-        lswitch_od_pipeline[P_LSWITCH_OD_2].od_helper_func = build_lswitch_output_port_sec_od;
+        parallel_od_pipeline[1].pool = add_worker_pool(ovn_datapath_thread);
+        parallel_od_pipeline[1].od_helper_func = build_lswitch_output_port_sec_od;
 
-        for (index=0; index < lswitch_od_pipeline[P_LSWITCH_OD_2].pool->size; index++) {
-            lswitch_od_pipeline[P_LSWITCH_OD_2].pool->controls[index].workload = &lswitch_od_pipeline[P_LSWITCH_OD_2];
+        for (index=0; index < parallel_od_pipeline[1].pool->size; index++) {
+            parallel_od_pipeline[1].pool->controls[index].workload = &parallel_od_pipeline[1];
         }
+
+        /* LROUTER DATAPATH STAGE 1 (slot 2)*/
+
+        parallel_od_pipeline[2].pool = add_worker_pool(ovn_datapath_thread);
+        parallel_od_pipeline[2].od_helper_func = build_lrouter_stage_2_od;
+
+        for (index=0; index < parallel_od_pipeline[2].pool->size; index++) {
+            parallel_od_pipeline[2].pool->controls[index].workload = &parallel_od_pipeline[2];
+        }
+
+        /* PORTS */
+
+        parallel_op_pipeline = xmalloc(sizeof (struct ovn_datapath_pool) * PARALLEL_POOL_SIZE);
+
         /* LSWITCH PERPORT */
-        lswitch_op_pipeline = xmalloc(sizeof (struct ovn_datapath_pool) * OP_POOL_SIZE);
+        parallel_op_pipeline[0].pool = add_worker_pool(ovn_port_thread);
+        parallel_op_pipeline[0].op_helper_func = build_lswitch_per_port;
 
-        lswitch_op_pipeline[P_LSWITCH_OP_1].pool = add_worker_pool(ovn_port_thread);
-        lswitch_op_pipeline[P_LSWITCH_OP_1].op_helper_func = build_lswitch_per_port;
-
-        for (index=0; index < lswitch_op_pipeline[P_LSWITCH_OP_1].pool->size; index++) {
-            lswitch_op_pipeline[P_LSWITCH_OP_1].pool->controls[index].workload = &lswitch_op_pipeline[P_LSWITCH_OP_1];
+        for (index=0; index < parallel_op_pipeline[0].pool->size; index++) {
+            parallel_op_pipeline[0].pool->controls[index].workload = &parallel_op_pipeline[0];
         }
-        lswitch_op_pipeline[P_LSWITCH_OP_2].pool = add_worker_pool(ovn_port_thread);
 
         /* LSWITCH PERPORT PHASE 2*/
 
-        lswitch_op_pipeline[P_LSWITCH_OP_2].op_helper_func = build_lswitch_output_port_sec_op;
+        parallel_op_pipeline[1].pool = add_worker_pool(ovn_port_thread);
+        parallel_op_pipeline[1].op_helper_func = build_lswitch_output_port_sec_op;
 
-        for (index=0; index < lswitch_op_pipeline[P_LSWITCH_OP_2].pool->size; index++) {
-            lswitch_op_pipeline[P_LSWITCH_OP_2].pool->controls[index].workload = &lswitch_op_pipeline[P_LSWITCH_OP_2];
+        for (index=0; index < parallel_op_pipeline[1].pool->size; index++) {
+            parallel_op_pipeline[1].pool->controls[index].workload = &parallel_op_pipeline[1];
+        }
+
+        /* LROUTER PERPORT PHASE 1 (slot 2)*/
+
+        parallel_op_pipeline[2].pool = add_worker_pool(ovn_port_thread);
+        parallel_op_pipeline[2].op_helper_func = build_lrouter_stage_2_op;
+
+        for (index=0; index < parallel_op_pipeline[2].pool->size; index++) {
+            parallel_op_pipeline[2].pool->controls[index].workload = &parallel_op_pipeline[2];
         }
     }
 }
 
+static void run_build_stage(int stage, 
+            struct lswitch_build_info *li,
+            struct hmap *lflows,
+            struct hmap *lflow_segs)
+{
+    int index;
+    struct worker_control *controls;
 
+    if (parallel_od_pipeline[stage].pool) {
+        controls = parallel_od_pipeline[stage].pool->controls;
+
+        for (index=0; index < parallel_od_pipeline[stage].pool->size; index++) {
+            fast_hmap_init(&lflow_segs[index], lflows->mask);
+            li[index].lflows = &lflow_segs[index];
+
+            controls[index].data = &li[index];
+        }
+
+        run_pool(parallel_od_pipeline[stage].pool, lflows, lflow_segs);
+    }
+
+    if (parallel_od_pipeline[stage].pool) {
+        controls = parallel_op_pipeline[stage].pool->controls;
+        for (index=0; index < parallel_op_pipeline[stage].pool->size; index++) {
+
+            fast_hmap_init(&lflow_segs[index], lflows->mask);
+            li[index].lflows = &lflow_segs[index];
+            controls[index].data = &li[index];
+        }
+
+        run_pool(parallel_op_pipeline[stage].pool, lflows, lflow_segs);
+    }
+
+}
 
 static void
 build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
@@ -6982,18 +7048,18 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
     int index;
     struct lswitch_build_info *li;
     struct hmap *lflow_segs;
-    struct worker_control *controls;
 
     /* Build pre-ACL and ACL tables for both ingress and egress.
      * Ingress tables 3 through 10.  Egress tables 0 through 7. */
 
     init_thread_pools();
 
-    li = xmalloc(sizeof(struct lswitch_build_info) * lswitch_od_pipeline[P_LSWITCH_OD_1].pool->size);
-    lflow_segs = xmalloc(sizeof(struct hmap) * lswitch_od_pipeline[P_LSWITCH_OD_1].pool->size);
+    /* we assume all parallel pipelines are same width */
 
-    controls = lswitch_od_pipeline[P_LSWITCH_OD_1].pool->controls;
-    for (index=0; index < lswitch_od_pipeline[P_LSWITCH_OD_1].pool->size; index++) {
+    li = xmalloc(sizeof(struct lswitch_build_info) * parallel_od_pipeline[0].pool->size);
+    lflow_segs = xmalloc(sizeof(struct hmap) * parallel_od_pipeline[0].pool->size);
+
+    for (index=0; index < parallel_od_pipeline[0].pool->size; index++) {
 
         li[index].index = index;
         li[index].datapaths = datapaths;
@@ -7003,26 +7069,9 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
         li[index].igmp_groups = igmp_groups;
         li[index].meter_groups = meter_groups;
         li[index].lbs = lbs;
-
-        fast_hmap_init(&lflow_segs[index], lflows->mask);
-        li[index].lflows = &lflow_segs[index];
-
-        controls[index].data = &li[index];
     }
 
-
-    run_pool(lswitch_od_pipeline[P_LSWITCH_OD_1].pool, lflows, lflow_segs);
-
-    controls = lswitch_op_pipeline[P_LSWITCH_OP_1].pool->controls;
-    for (index=0; index < lswitch_op_pipeline[P_LSWITCH_OP_1].pool->size; index++) {
-
-        fast_hmap_init(&lflow_segs[index], lflows->mask);
-        li[index].lflows = &lflow_segs[index];
-        controls[index].data = &li[index];
-    }
-
-    run_pool(lswitch_op_pipeline[P_LSWITCH_OP_1].pool, lflows, lflow_segs);
-
+    run_build_stage(0, li, lflows, lflow_segs);
 
     /* Ingress table 13: ARP/ND responder for service monitor source ip.
      * (priority 110)*/
@@ -7140,34 +7189,10 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
     struct ovn_port *op;
 
     HMAP_FOR_EACH(op, key_node, li->ports) {
-        if (op->nbsp) {
-            build_lswitch_per_port_dest_unicast(op, &li[0]);
-        }
+        build_lswitch_per_port_dest_unicast(op, &li[0]);
     }
 
-    /* Per Datapath phase 2 */
-
-    controls = lswitch_od_pipeline[P_LSWITCH_OD_2].pool->controls;
-    for (index=0; index < lswitch_od_pipeline[P_LSWITCH_OD_2].pool->size; index++) {
-
-        fast_hmap_init(&lflow_segs[index], lflows->mask);
-        li[index].lflows = &lflow_segs[index];
-        controls[index].data = &li[index];
-    }
-
-    run_pool(lswitch_od_pipeline[P_LSWITCH_OD_2].pool, lflows, lflow_segs);
-
-    /* Per Port phase 2 */
-
-    controls = lswitch_op_pipeline[P_LSWITCH_OP_2].pool->controls;
-    for (index=0; index < lswitch_op_pipeline[P_LSWITCH_OP_2].pool->size; index++) {
-
-        fast_hmap_init(&lflow_segs[index], lflows->mask);
-        li[index].lflows = &lflow_segs[index];
-        controls[index].data = &li[index];
-    }
-
-    run_pool(lswitch_op_pipeline[P_LSWITCH_OP_2].pool, lflows, lflow_segs);
+    run_build_stage(1, li, lflows, lflow_segs);
 
     free(li);
     free(lflow_segs);
@@ -8096,6 +8121,83 @@ lrouter_nat_is_stateless(const struct nbrec_nat *nat)
 
     return false;
 }
+static void
+build_lrouter_logical_ingress_table_0_od(struct ovn_datapath *od,
+                void *arg
+)
+{
+    struct lswitch_build_info *li = (struct lswitch_build_info *) arg;
+
+    /* Logical router ingress table 0: Admission control framework. */
+    if (!od->nbr) {
+        return;
+    }
+
+    /* Logical VLANs not supported.
+     * Broadcast/multicast source address is invalid. */
+    ovn_lflow_add(li->lflows, od, S_ROUTER_IN_ADMISSION, 100,
+                  "vlan.present || eth.src[40]", "drop;");
+}
+
+static void
+build_lrouter_logical_ingress_table_0_op(struct ovn_port *op,
+                void *arg
+)
+{
+    struct lswitch_build_info *li = (struct lswitch_build_info *) arg;
+    struct ds match = DS_EMPTY_INITIALIZER;
+    struct ds actions = DS_EMPTY_INITIALIZER;
+    if (!op->nbrp) {
+        return;
+    }
+
+    if (!lrport_is_enabled(op->nbrp)) {
+        /* Drop packets from disabled logical ports (since logical flow
+         * tables are default-drop). */
+        return;
+    }
+
+    if (op->derived) {
+        /* No ingress packets should be received on a chassisredirect
+         * port. */
+        return;
+    }
+
+    ds_clear(&match);
+    ds_put_format(&match, "eth.mcast && inport == %s", op->json_key);
+    ovn_lflow_add_with_hint(li->lflows, op->od, S_ROUTER_IN_ADMISSION, 50,
+                            ds_cstr(&match), "next;", &op->nbrp->header_);
+
+    ds_clear(&match);
+    ds_put_format(&match, "eth.dst == %s && inport == %s",
+                  op->lrp_networks.ea_s, op->json_key);
+    if (op->od->l3dgw_port && op == op->od->l3dgw_port
+        && op->od->l3redirect_port) {
+        /* Traffic with eth.dst = l3dgw_port->lrp_networks.ea_s
+         * should only be received on the "redirect-chassis". */
+        ds_put_format(&match, " && is_chassis_resident(%s)",
+                      op->od->l3redirect_port->json_key);
+    }
+    ovn_lflow_add_with_hint(li->lflows, op->od, S_ROUTER_IN_ADMISSION, 50,
+                            ds_cstr(&match), "next;", &op->nbrp->header_);
+
+    ds_destroy(&match);
+    ds_destroy(&actions);
+}
+
+static void
+build_lrouter_stage_2_od(struct ovn_datapath *od,
+                void *arg
+) {
+    build_lrouter_logical_ingress_table_0_od(od, arg);
+}
+
+static void
+build_lrouter_stage_2_op(struct ovn_port *op,
+                void *arg
+) {
+    build_lrouter_logical_ingress_table_0_op(op, arg);
+}
 
 static void
 build_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
@@ -8108,56 +8210,33 @@ build_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
     struct ds match = DS_EMPTY_INITIALIZER;
     struct ds actions = DS_EMPTY_INITIALIZER;
 
-    /* Logical router ingress table 0: Admission control framework. */
+    int index;
+    struct lswitch_build_info *li;
+    struct hmap *lflow_segs;
+    struct ovn_port *op;
     struct ovn_datapath *od;
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        if (!od->nbr) {
-            continue;
-        }
 
-        /* Logical VLANs not supported.
-         * Broadcast/multicast source address is invalid. */
-        ovn_lflow_add(lflows, od, S_ROUTER_IN_ADMISSION, 100,
-                      "vlan.present || eth.src[40]", "drop;");
+    init_thread_pools();
+
+    li = xmalloc(sizeof(struct lswitch_build_info) * parallel_od_pipeline[0].pool->size);
+    lflow_segs = xmalloc(sizeof(struct hmap) * parallel_od_pipeline[0].pool->size);
+
+    for (index=0; index < parallel_od_pipeline[0].pool->size; index++) {
+
+        li[index].index = index;
+        li[index].datapaths = datapaths;
+        li[index].ports = ports;
+        li[index].port_groups = NULL;
+        li[index].mcgroups = NULL;
+        li[index].igmp_groups = NULL;
+        li[index].meter_groups = meter_groups;
+        li[index].lbs = lbs;
     }
+
+    run_build_stage(2, li, lflows, lflow_segs);
+
 
     /* Logical router ingress table 0: match (priority 50). */
-    struct ovn_port *op;
-    HMAP_FOR_EACH (op, key_node, ports) {
-        if (!op->nbrp) {
-            continue;
-        }
-
-        if (!lrport_is_enabled(op->nbrp)) {
-            /* Drop packets from disabled logical ports (since logical flow
-             * tables are default-drop). */
-            continue;
-        }
-
-        if (op->derived) {
-            /* No ingress packets should be received on a chassisredirect
-             * port. */
-            continue;
-        }
-
-        ds_clear(&match);
-        ds_put_format(&match, "eth.mcast && inport == %s", op->json_key);
-        ovn_lflow_add_with_hint(lflows, op->od, S_ROUTER_IN_ADMISSION, 50,
-                                ds_cstr(&match), "next;", &op->nbrp->header_);
-
-        ds_clear(&match);
-        ds_put_format(&match, "eth.dst == %s && inport == %s",
-                      op->lrp_networks.ea_s, op->json_key);
-        if (op->od->l3dgw_port && op == op->od->l3dgw_port
-            && op->od->l3redirect_port) {
-            /* Traffic with eth.dst = l3dgw_port->lrp_networks.ea_s
-             * should only be received on the "redirect-chassis". */
-            ds_put_format(&match, " && is_chassis_resident(%s)",
-                          op->od->l3redirect_port->json_key);
-        }
-        ovn_lflow_add_with_hint(lflows, op->od, S_ROUTER_IN_ADMISSION, 50,
-                                ds_cstr(&match), "next;", &op->nbrp->header_);
-    }
 
     /* Logical router ingress table 1: LOOKUP_NEIGHBOR and
      * table 2: LEARN_NEIGHBOR. */
@@ -10491,6 +10570,8 @@ build_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
         ovn_lflow_add(lflows, op->od, S_ROUTER_OUT_DELIVERY, 100,
                       ds_cstr(&match), "output;");
     }
+    free(li);
+    free(lflow_segs);
 
     ds_destroy(&match);
     ds_destroy(&actions);
