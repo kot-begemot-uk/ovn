@@ -9957,6 +9957,502 @@ build_lrouter_static_routes(struct ovn_datapath *od,
 }
 
 static void
+build_lrouter_ip_multicast_lookup(struct ovn_datapath *od,
+                void *arg
+)
+{
+    struct lswitch_build_info *li = (struct lswitch_build_info *) arg;
+    struct ds match = DS_EMPTY_INITIALIZER;
+    struct ds actions = DS_EMPTY_INITIALIZER;
+    /* IP Multicast lookup. Here we set the output port, adjust TTL and
+     * advance to next table (priority 500).
+     */
+    if (!od->nbr) {
+        return;
+    }
+
+    /* Drop IPv6 multicast traffic that shouldn't be forwarded,
+     * i.e., router solicitation and router advertisement.
+     */
+    ovn_lflow_add(li->lflows, od, S_ROUTER_IN_IP_ROUTING, 550,
+                  "nd_rs || nd_ra", "drop;");
+
+    if (!od->mcast_info.rtr.relay) {
+        return;
+    }
+
+    struct ovn_igmp_group *igmp_group;
+
+    LIST_FOR_EACH (igmp_group, list_node, &od->mcast_info.groups) {
+        ds_clear(&match);
+        ds_clear(&actions);
+        if (IN6_IS_ADDR_V4MAPPED(&igmp_group->address)) {
+            ds_put_format(&match, "ip4 && ip4.dst == %s ",
+                        igmp_group->mcgroup.name);
+        } else {
+            ds_put_format(&match, "ip6 && ip6.dst == %s ",
+                        igmp_group->mcgroup.name);
+        }
+        if (od->mcast_info.rtr.flood_static) {
+            ds_put_cstr(&actions,
+                        "clone { "
+                            "outport = \""MC_STATIC"\"; "
+                            "ip.ttl--; "
+                            "next; "
+                        "};");
+        }
+        ds_put_format(&actions, "outport = \"%s\"; ip.ttl--; next;",
+                      igmp_group->mcgroup.name);
+        ovn_lflow_add(li->lflows, od, S_ROUTER_IN_IP_ROUTING, 500,
+                      ds_cstr(&match), ds_cstr(&actions));
+    }
+
+    /* If needed, flood unregistered multicast on statically configured
+     * ports. Otherwise drop any multicast traffic.
+     */
+    if (od->mcast_info.rtr.flood_static) {
+        ds_clear(&actions);
+        ovn_lflow_add(li->lflows, od, S_ROUTER_IN_IP_ROUTING, 450,
+                      "ip4.mcast || ip6.mcast",
+                      "clone { "
+                            "outport = \""MC_STATIC"\"; "
+                            "ip.ttl--; "
+                            "next; "
+                      "};");
+    } else {
+        ovn_lflow_add(li->lflows, od, S_ROUTER_IN_IP_ROUTING, 450,
+                      "ip4.mcast || ip6.mcast", "drop;");
+    }
+
+    ds_destroy(&match);
+    ds_destroy(&actions);
+}
+
+static void
+build_lrouter_ingress_policy(struct ovn_datapath *od,
+                void *arg
+)
+{
+    struct lswitch_build_info *li = (struct lswitch_build_info *) arg;
+    struct ds match = DS_EMPTY_INITIALIZER;
+    struct ds actions = DS_EMPTY_INITIALIZER;
+    /* Logical router ingress table POLICY: Policy.
+     *
+     * A packet that arrives at this table is an IP packet that should be
+     * permitted/denied/rerouted to the address in the rule's nexthop.
+     * This table sets outport to the correct out_port,
+     * eth.src to the output port's MAC address,
+     * and '[xx]reg0' to the next-hop IP address (leaving
+     * 'ip[46].dst', the packet’s final destination, unchanged), and
+     * advances to the next table for ARP/ND resolution. */
+    if (!od->nbr) {
+        return;
+    }
+    /* This is a catch-all rule. It has the lowest priority (0)
+     * does a match-all("1") and pass-through (next) */
+    ovn_lflow_add(li->lflows, od, S_ROUTER_IN_POLICY, 0, "1", "next;");
+
+    /* Convert routing policies to flows. */
+    for (int i = 0; i < od->nbr->n_policies; i++) {
+        const struct nbrec_logical_router_policy *rule
+            = od->nbr->policies[i];
+        build_routing_policy_flow(li->lflows, od, li->ports, rule, &rule->header_);
+    }
+
+    ds_destroy(&match);
+    ds_destroy(&actions);
+}
+
+static void
+build_lrouter_unreachable(struct ovn_datapath *od,
+                void *arg
+)
+{
+    struct lswitch_build_info *li = (struct lswitch_build_info *) arg;
+    struct ds match = DS_EMPTY_INITIALIZER;
+    struct ds actions = DS_EMPTY_INITIALIZER;
+    /* XXX destination unreachable */
+
+    /* Local router ingress table ARP_RESOLVE: ARP Resolution.
+     *
+     * Multicast packets already have the outport set so just advance to next
+     * table (priority 500). */
+    if (!od->nbr) {
+        return;
+    }
+
+    ovn_lflow_add(li->lflows, od, S_ROUTER_IN_ARP_RESOLVE, 500,
+                  "ip4.mcast || ip6.mcast", "next;");
+
+    ds_destroy(&match);
+    ds_destroy(&actions);
+}
+
+
+static void
+build_lrouter_arp_resolve(struct ovn_port *op,
+                void *arg
+)
+{
+    struct lswitch_build_info *li = (struct lswitch_build_info *) arg;
+    struct ds match = DS_EMPTY_INITIALIZER;
+    struct ds actions = DS_EMPTY_INITIALIZER;
+
+    /* Local router ingress table ARP_RESOLVE: ARP Resolution.
+     *
+     * Any unicast packet that reaches this table is an IP packet whose
+     * next-hop IP address is in reg0. (ip4.dst is the final destination.)
+     * This table resolves the IP address in reg0 into an output port in
+     * outport and an Ethernet address in eth.dst.
+     */
+    if (op->nbsp && !lsp_is_enabled(op->nbsp)) {
+        return;
+    }
+
+    if (op->nbrp) {
+        /* This is a logical router port. If next-hop IP address in
+         * '[xx]reg0' matches IP address of this router port, then
+         * the packet is intended to eventually be sent to this
+         * logical port. Set the destination mac address using this
+         * port's mac address.
+         *
+         * The packet is still in peer's logical pipeline. So the match
+         * should be on peer's outport. */
+        if (op->peer && op->nbrp->peer) {
+            if (op->lrp_networks.n_ipv4_addrs) {
+                ds_clear(&match);
+                ds_put_format(&match, "outport == %s && reg0 == ",
+                              op->peer->json_key);
+                op_put_v4_networks(&match, op, false);
+
+                ds_clear(&actions);
+                ds_put_format(&actions, "eth.dst = %s; next;",
+                              op->lrp_networks.ea_s);
+                ovn_lflow_add_with_hint(li->lflows, op->peer->od,
+                                        S_ROUTER_IN_ARP_RESOLVE, 100,
+                                        ds_cstr(&match), ds_cstr(&actions),
+                                        &op->nbrp->header_);
+            }
+
+            if (op->lrp_networks.n_ipv6_addrs) {
+                ds_clear(&match);
+                ds_put_format(&match, "outport == %s && xxreg0 == ",
+                              op->peer->json_key);
+                op_put_v6_networks(&match, op);
+
+                ds_clear(&actions);
+                ds_put_format(&actions, "eth.dst = %s; next;",
+                              op->lrp_networks.ea_s);
+                ovn_lflow_add_with_hint(li->lflows, op->peer->od,
+                                        S_ROUTER_IN_ARP_RESOLVE, 100,
+                                        ds_cstr(&match), ds_cstr(&actions),
+                                        &op->nbrp->header_);
+            }
+        }
+
+        if (!op->derived && op->od->l3redirect_port) {
+            const char *redirect_type = smap_get(&op->nbrp->options,
+                                                 "redirect-type");
+            if (redirect_type && !strcasecmp(redirect_type, "bridged")) {
+                /* Packet is on a non gateway chassis and
+                 * has an unresolved ARP on a network behind gateway
+                 * chassis attached router port. Since, redirect type
+                 * is "bridged", instead of calling "get_arp"
+                 * on this node, we will redirect the packet to gateway
+                 * chassis, by setting destination mac router port mac.*/
+                ds_clear(&match);
+                ds_put_format(&match, "outport == %s && "
+                              "!is_chassis_resident(%s)", op->json_key,
+                              op->od->l3redirect_port->json_key);
+                ds_clear(&actions);
+                ds_put_format(&actions, "eth.dst = %s; next;",
+                              op->lrp_networks.ea_s);
+
+                ovn_lflow_add_with_hint(li->lflows, op->od,
+                                        S_ROUTER_IN_ARP_RESOLVE, 50,
+                                        ds_cstr(&match), ds_cstr(&actions),
+                                        &op->nbrp->header_);
+            }
+        }
+    } else if (op->od->n_router_ports && strcmp(op->nbsp->type, "router")
+               && strcmp(op->nbsp->type, "virtual")) {
+        /* This is a logical switch port that backs a VM or a container.
+         * Extract its addresses. For each of the address, go through all
+         * the router ports attached to the switch (to which this port
+         * connects) and if the address in question is reachable from the
+         * router port, add an ARP/ND entry in that router's pipeline. */
+
+        for (size_t i = 0; i < op->n_lsp_addrs; i++) {
+            const char *ea_s = op->lsp_addrs[i].ea_s;
+            for (size_t j = 0; j < op->lsp_addrs[i].n_ipv4_addrs; j++) {
+                const char *ip_s = op->lsp_addrs[i].ipv4_addrs[j].addr_s;
+                for (size_t k = 0; k < op->od->n_router_ports; k++) {
+                    /* Get the Logical_Router_Port that the
+                     * Logical_Switch_Port is connected to, as
+                     * 'peer'. */
+                    const char *peer_name = smap_get(
+                        &op->od->router_ports[k]->nbsp->options,
+                        "router-port");
+                    if (!peer_name) {
+                        continue;
+                    }
+
+                    struct ovn_port *peer = ovn_port_find(li->ports, peer_name);
+                    if (!peer || !peer->nbrp) {
+                        continue;
+                    }
+
+                    if (!find_lrp_member_ip(peer, ip_s)) {
+                        continue;
+                    }
+
+                    ds_clear(&match);
+                    ds_put_format(&match, "outport == %s && reg0 == %s",
+                                  peer->json_key, ip_s);
+
+                    ds_clear(&actions);
+                    ds_put_format(&actions, "eth.dst = %s; next;", ea_s);
+                    ovn_lflow_add_with_hint(li->lflows, peer->od,
+                                            S_ROUTER_IN_ARP_RESOLVE, 100,
+                                            ds_cstr(&match),
+                                            ds_cstr(&actions),
+                                            &op->nbsp->header_);
+                }
+            }
+
+            for (size_t j = 0; j < op->lsp_addrs[i].n_ipv6_addrs; j++) {
+                const char *ip_s = op->lsp_addrs[i].ipv6_addrs[j].addr_s;
+                for (size_t k = 0; k < op->od->n_router_ports; k++) {
+                    /* Get the Logical_Router_Port that the
+                     * Logical_Switch_Port is connected to, as
+                     * 'peer'. */
+                    const char *peer_name = smap_get(
+                        &op->od->router_ports[k]->nbsp->options,
+                        "router-port");
+                    if (!peer_name) {
+                        continue;
+                    }
+
+                    struct ovn_port *peer = ovn_port_find(li->ports, peer_name);
+                    if (!peer || !peer->nbrp) {
+                        continue;
+                    }
+
+                    if (!find_lrp_member_ip(peer, ip_s)) {
+                        continue;
+                    }
+
+                    ds_clear(&match);
+                    ds_put_format(&match, "outport == %s && xxreg0 == %s",
+                                  peer->json_key, ip_s);
+
+                    ds_clear(&actions);
+                    ds_put_format(&actions, "eth.dst = %s; next;", ea_s);
+                    ovn_lflow_add_with_hint(li->lflows, peer->od,
+                                            S_ROUTER_IN_ARP_RESOLVE, 100,
+                                            ds_cstr(&match),
+                                            ds_cstr(&actions),
+                                            &op->nbsp->header_);
+                }
+            }
+        }
+    } else if (op->od->n_router_ports && strcmp(op->nbsp->type, "router")
+               && !strcmp(op->nbsp->type, "virtual")) {
+        /* This is a virtual port. Add ARP replies for the virtual ip with
+         * the mac of the present active virtual parent.
+         * If the logical port doesn't have virtual parent set in
+         * Port_Binding table, then add the flow to set eth.dst to
+         * 00:00:00:00:00:00 and advance to next table so that ARP is
+         * resolved by router pipeline using the arp{} action.
+         * The MAC_Binding entry for the virtual ip might be invalid. */
+        ovs_be32 ip;
+
+        const char *vip = smap_get(&op->nbsp->options,
+                                   "virtual-ip");
+        const char *virtual_parents = smap_get(&op->nbsp->options,
+                                               "virtual-parents");
+        if (!vip || !virtual_parents ||
+            !ip_parse(vip, &ip) || !op->sb) {
+            return;
+        }
+
+        if (!op->sb->virtual_parent || !op->sb->virtual_parent[0] ||
+            !op->sb->chassis) {
+            /* The virtual port is not claimed yet. */
+            for (size_t i = 0; i < op->od->n_router_ports; i++) {
+                const char *peer_name = smap_get(
+                    &op->od->router_ports[i]->nbsp->options,
+                    "router-port");
+                if (!peer_name) {
+                    continue;
+                }
+
+                struct ovn_port *peer = ovn_port_find(li->ports, peer_name);
+                if (!peer || !peer->nbrp) {
+                    continue;
+                }
+
+                if (find_lrp_member_ip(peer, vip)) {
+                    ds_clear(&match);
+                    ds_put_format(&match, "outport == %s && reg0 == %s",
+                                    peer->json_key, vip);
+
+                    ds_clear(&actions);
+                    ds_put_format(&actions,
+                                  "eth.dst = 00:00:00:00:00:00; next;");
+                    ovn_lflow_add_with_hint(li->lflows, peer->od,
+                                            S_ROUTER_IN_ARP_RESOLVE, 100,
+                                            ds_cstr(&match),
+                                            ds_cstr(&actions),
+                                            &op->nbsp->header_);
+                    break;
+                }
+            }
+        } else {
+            struct ovn_port *vp =
+                ovn_port_find(li->ports, op->sb->virtual_parent);
+            if (!vp || !vp->nbsp) {
+                return;
+            }
+
+            for (size_t i = 0; i < vp->n_lsp_addrs; i++) {
+                bool found_vip_network = false;
+                const char *ea_s = vp->lsp_addrs[i].ea_s;
+                for (size_t j = 0; j < vp->od->n_router_ports; j++) {
+                    /* Get the Logical_Router_Port that the
+                    * Logical_Switch_Port is connected to, as
+                    * 'peer'. */
+                    const char *peer_name = smap_get(
+                        &vp->od->router_ports[j]->nbsp->options,
+                        "router-port");
+                    if (!peer_name) {
+                        continue;
+                    }
+
+                    struct ovn_port *peer =
+                        ovn_port_find(li->ports, peer_name);
+                    if (!peer || !peer->nbrp) {
+                        continue;
+                    }
+
+                    if (!find_lrp_member_ip(peer, vip)) {
+                        continue;
+                    }
+
+                    ds_clear(&match);
+                    ds_put_format(&match, "outport == %s && reg0 == %s",
+                                    peer->json_key, vip);
+
+                    ds_clear(&actions);
+                    ds_put_format(&actions, "eth.dst = %s; next;", ea_s);
+                    ovn_lflow_add_with_hint(li->lflows, peer->od,
+                                            S_ROUTER_IN_ARP_RESOLVE, 100,
+                                            ds_cstr(&match),
+                                            ds_cstr(&actions),
+                                            &op->nbsp->header_);
+                    found_vip_network = true;
+                    break;
+                }
+
+                if (found_vip_network) {
+                    break;
+                }
+            }
+        }
+    } else if (!strcmp(op->nbsp->type, "router")) {
+        /* This is a logical switch port that connects to a router. */
+
+        /* The peer of this switch port is the router port for which
+         * we need to add logical flows such that it can resolve
+         * ARP entries for all the other router ports connected to
+         * the switch in question. */
+
+        const char *peer_name = smap_get(&op->nbsp->options,
+                                         "router-port");
+        if (!peer_name) {
+            return;
+        }
+
+        struct ovn_port *peer = ovn_port_find(li->ports, peer_name);
+        if (!peer || !peer->nbrp) {
+            return;
+        }
+
+        for (size_t i = 0; i < op->od->n_router_ports; i++) {
+            const char *router_port_name = smap_get(
+                                &op->od->router_ports[i]->nbsp->options,
+                                "router-port");
+            struct ovn_port *router_port = ovn_port_find(li->ports,
+                                                         router_port_name);
+            if (!router_port || !router_port->nbrp) {
+                continue;
+            }
+
+            /* Skip the router port under consideration. */
+            if (router_port == peer) {
+               continue;
+            }
+
+            if (router_port->lrp_networks.n_ipv4_addrs) {
+                ds_clear(&match);
+                ds_put_format(&match, "outport == %s && reg0 == ",
+                              peer->json_key);
+                op_put_v4_networks(&match, router_port, false);
+
+                ds_clear(&actions);
+                ds_put_format(&actions, "eth.dst = %s; next;",
+                                          router_port->lrp_networks.ea_s);
+                ovn_lflow_add_with_hint(li->lflows, peer->od,
+                                        S_ROUTER_IN_ARP_RESOLVE, 100,
+                                        ds_cstr(&match), ds_cstr(&actions),
+                                        &op->nbsp->header_);
+            }
+
+            if (router_port->lrp_networks.n_ipv6_addrs) {
+                ds_clear(&match);
+                ds_put_format(&match, "outport == %s && xxreg0 == ",
+                              peer->json_key);
+                op_put_v6_networks(&match, router_port);
+
+                ds_clear(&actions);
+                ds_put_format(&actions, "eth.dst = %s; next;",
+                              router_port->lrp_networks.ea_s);
+                ovn_lflow_add_with_hint(li->lflows, peer->od,
+                                        S_ROUTER_IN_ARP_RESOLVE, 100,
+                                        ds_cstr(&match), ds_cstr(&actions),
+                                        &op->nbsp->header_);
+            }
+        }
+    }
+
+    ds_destroy(&match);
+    ds_destroy(&actions);
+}
+
+static void
+build_lrouter_arp_resolve_od(struct ovn_datapath *od,
+                void *arg
+)
+{
+    struct lswitch_build_info *li = (struct lswitch_build_info *) arg;
+    struct ds match = DS_EMPTY_INITIALIZER;
+    struct ds actions = DS_EMPTY_INITIALIZER;
+    if (!od->nbr) {
+        return;
+    }
+
+    ovn_lflow_add(li->lflows, od, S_ROUTER_IN_ARP_RESOLVE, 0, "ip4",
+                  "get_arp(outport, reg0); next;");
+
+    ovn_lflow_add(li->lflows, od, S_ROUTER_IN_ARP_RESOLVE, 0, "ip6",
+                  "get_nd(outport, xxreg0); next;");
+
+
+    ds_destroy(&match);
+    ds_destroy(&actions);
+}
+
+static void
 build_lrouter_stage_2_od(struct ovn_datapath *od,
                 void *arg
 ) {
@@ -9967,6 +10463,10 @@ build_lrouter_stage_2_od(struct ovn_datapath *od,
     build_lrouter_ipv6_RA_response_od(od, arg);
     build_lrouter_ip_routing_distributed_router(od, arg);
     build_lrouter_static_routes(od, arg);
+    build_lrouter_ip_multicast_lookup(od, arg);
+    build_lrouter_ingress_policy(od, arg);
+    build_lrouter_unreachable(od, arg);
+    build_lrouter_arp_resolve_od(od, arg);
 }
 
 static void
@@ -9980,6 +10480,7 @@ build_lrouter_stage_2_op(struct ovn_port *op,
     build_lrouter_ip_input(op, arg);
     build_lrouter_ipv6_RA_response_op(op, arg);
     build_lrouter_ip_router_ingress(op, arg);
+    build_lrouter_arp_resolve(op, arg);
 }
 
 static void
@@ -10018,449 +10519,6 @@ build_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
 
     run_build_stage(2, li, lflows, lflow_segs);
 
-    /* IP Multicast lookup. Here we set the output port, adjust TTL and
-     * advance to next table (priority 500).
-     */
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        if (!od->nbr) {
-            continue;
-        }
-
-        /* Drop IPv6 multicast traffic that shouldn't be forwarded,
-         * i.e., router solicitation and router advertisement.
-         */
-        ovn_lflow_add(lflows, od, S_ROUTER_IN_IP_ROUTING, 550,
-                      "nd_rs || nd_ra", "drop;");
-
-        if (!od->mcast_info.rtr.relay) {
-            continue;
-        }
-
-        struct ovn_igmp_group *igmp_group;
-
-        LIST_FOR_EACH (igmp_group, list_node, &od->mcast_info.groups) {
-            ds_clear(&match);
-            ds_clear(&actions);
-            if (IN6_IS_ADDR_V4MAPPED(&igmp_group->address)) {
-                ds_put_format(&match, "ip4 && ip4.dst == %s ",
-                            igmp_group->mcgroup.name);
-            } else {
-                ds_put_format(&match, "ip6 && ip6.dst == %s ",
-                            igmp_group->mcgroup.name);
-            }
-            if (od->mcast_info.rtr.flood_static) {
-                ds_put_cstr(&actions,
-                            "clone { "
-                                "outport = \""MC_STATIC"\"; "
-                                "ip.ttl--; "
-                                "next; "
-                            "};");
-            }
-            ds_put_format(&actions, "outport = \"%s\"; ip.ttl--; next;",
-                          igmp_group->mcgroup.name);
-            ovn_lflow_add(lflows, od, S_ROUTER_IN_IP_ROUTING, 500,
-                          ds_cstr(&match), ds_cstr(&actions));
-        }
-
-        /* If needed, flood unregistered multicast on statically configured
-         * ports. Otherwise drop any multicast traffic.
-         */
-        if (od->mcast_info.rtr.flood_static) {
-            ds_clear(&actions);
-            ovn_lflow_add(lflows, od, S_ROUTER_IN_IP_ROUTING, 450,
-                          "ip4.mcast || ip6.mcast",
-                          "clone { "
-                                "outport = \""MC_STATIC"\"; "
-                                "ip.ttl--; "
-                                "next; "
-                          "};");
-        } else {
-            ovn_lflow_add(lflows, od, S_ROUTER_IN_IP_ROUTING, 450,
-                          "ip4.mcast || ip6.mcast", "drop;");
-        }
-    }
-
-    /* Logical router ingress table POLICY: Policy.
-     *
-     * A packet that arrives at this table is an IP packet that should be
-     * permitted/denied/rerouted to the address in the rule's nexthop.
-     * This table sets outport to the correct out_port,
-     * eth.src to the output port's MAC address,
-     * and '[xx]reg0' to the next-hop IP address (leaving
-     * 'ip[46].dst', the packet’s final destination, unchanged), and
-     * advances to the next table for ARP/ND resolution. */
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        if (!od->nbr) {
-            continue;
-        }
-        /* This is a catch-all rule. It has the lowest priority (0)
-         * does a match-all("1") and pass-through (next) */
-        ovn_lflow_add(lflows, od, S_ROUTER_IN_POLICY, 0, "1", "next;");
-
-        /* Convert routing policies to flows. */
-        for (int i = 0; i < od->nbr->n_policies; i++) {
-            const struct nbrec_logical_router_policy *rule
-                = od->nbr->policies[i];
-            build_routing_policy_flow(lflows, od, ports, rule, &rule->header_);
-        }
-    }
-
-
-    /* XXX destination unreachable */
-
-    /* Local router ingress table ARP_RESOLVE: ARP Resolution.
-     *
-     * Multicast packets already have the outport set so just advance to next
-     * table (priority 500). */
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        if (!od->nbr) {
-            continue;
-        }
-
-        ovn_lflow_add(lflows, od, S_ROUTER_IN_ARP_RESOLVE, 500,
-                      "ip4.mcast || ip6.mcast", "next;");
-    }
-
-    /* Local router ingress table ARP_RESOLVE: ARP Resolution.
-     *
-     * Any unicast packet that reaches this table is an IP packet whose
-     * next-hop IP address is in reg0. (ip4.dst is the final destination.)
-     * This table resolves the IP address in reg0 into an output port in
-     * outport and an Ethernet address in eth.dst.
-     */
-    HMAP_FOR_EACH (op, key_node, ports) {
-        if (op->nbsp && !lsp_is_enabled(op->nbsp)) {
-            continue;
-        }
-
-        if (op->nbrp) {
-            /* This is a logical router port. If next-hop IP address in
-             * '[xx]reg0' matches IP address of this router port, then
-             * the packet is intended to eventually be sent to this
-             * logical port. Set the destination mac address using this
-             * port's mac address.
-             *
-             * The packet is still in peer's logical pipeline. So the match
-             * should be on peer's outport. */
-            if (op->peer && op->nbrp->peer) {
-                if (op->lrp_networks.n_ipv4_addrs) {
-                    ds_clear(&match);
-                    ds_put_format(&match, "outport == %s && reg0 == ",
-                                  op->peer->json_key);
-                    op_put_v4_networks(&match, op, false);
-
-                    ds_clear(&actions);
-                    ds_put_format(&actions, "eth.dst = %s; next;",
-                                  op->lrp_networks.ea_s);
-                    ovn_lflow_add_with_hint(lflows, op->peer->od,
-                                            S_ROUTER_IN_ARP_RESOLVE, 100,
-                                            ds_cstr(&match), ds_cstr(&actions),
-                                            &op->nbrp->header_);
-                }
-
-                if (op->lrp_networks.n_ipv6_addrs) {
-                    ds_clear(&match);
-                    ds_put_format(&match, "outport == %s && xxreg0 == ",
-                                  op->peer->json_key);
-                    op_put_v6_networks(&match, op);
-
-                    ds_clear(&actions);
-                    ds_put_format(&actions, "eth.dst = %s; next;",
-                                  op->lrp_networks.ea_s);
-                    ovn_lflow_add_with_hint(lflows, op->peer->od,
-                                            S_ROUTER_IN_ARP_RESOLVE, 100,
-                                            ds_cstr(&match), ds_cstr(&actions),
-                                            &op->nbrp->header_);
-                }
-            }
-
-            if (!op->derived && op->od->l3redirect_port) {
-                const char *redirect_type = smap_get(&op->nbrp->options,
-                                                     "redirect-type");
-                if (redirect_type && !strcasecmp(redirect_type, "bridged")) {
-                    /* Packet is on a non gateway chassis and
-                     * has an unresolved ARP on a network behind gateway
-                     * chassis attached router port. Since, redirect type
-                     * is "bridged", instead of calling "get_arp"
-                     * on this node, we will redirect the packet to gateway
-                     * chassis, by setting destination mac router port mac.*/
-                    ds_clear(&match);
-                    ds_put_format(&match, "outport == %s && "
-                                  "!is_chassis_resident(%s)", op->json_key,
-                                  op->od->l3redirect_port->json_key);
-                    ds_clear(&actions);
-                    ds_put_format(&actions, "eth.dst = %s; next;",
-                                  op->lrp_networks.ea_s);
-
-                    ovn_lflow_add_with_hint(lflows, op->od,
-                                            S_ROUTER_IN_ARP_RESOLVE, 50,
-                                            ds_cstr(&match), ds_cstr(&actions),
-                                            &op->nbrp->header_);
-                }
-            }
-        } else if (op->od->n_router_ports && strcmp(op->nbsp->type, "router")
-                   && strcmp(op->nbsp->type, "virtual")) {
-            /* This is a logical switch port that backs a VM or a container.
-             * Extract its addresses. For each of the address, go through all
-             * the router ports attached to the switch (to which this port
-             * connects) and if the address in question is reachable from the
-             * router port, add an ARP/ND entry in that router's pipeline. */
-
-            for (size_t i = 0; i < op->n_lsp_addrs; i++) {
-                const char *ea_s = op->lsp_addrs[i].ea_s;
-                for (size_t j = 0; j < op->lsp_addrs[i].n_ipv4_addrs; j++) {
-                    const char *ip_s = op->lsp_addrs[i].ipv4_addrs[j].addr_s;
-                    for (size_t k = 0; k < op->od->n_router_ports; k++) {
-                        /* Get the Logical_Router_Port that the
-                         * Logical_Switch_Port is connected to, as
-                         * 'peer'. */
-                        const char *peer_name = smap_get(
-                            &op->od->router_ports[k]->nbsp->options,
-                            "router-port");
-                        if (!peer_name) {
-                            continue;
-                        }
-
-                        struct ovn_port *peer = ovn_port_find(ports, peer_name);
-                        if (!peer || !peer->nbrp) {
-                            continue;
-                        }
-
-                        if (!find_lrp_member_ip(peer, ip_s)) {
-                            continue;
-                        }
-
-                        ds_clear(&match);
-                        ds_put_format(&match, "outport == %s && reg0 == %s",
-                                      peer->json_key, ip_s);
-
-                        ds_clear(&actions);
-                        ds_put_format(&actions, "eth.dst = %s; next;", ea_s);
-                        ovn_lflow_add_with_hint(lflows, peer->od,
-                                                S_ROUTER_IN_ARP_RESOLVE, 100,
-                                                ds_cstr(&match),
-                                                ds_cstr(&actions),
-                                                &op->nbsp->header_);
-                    }
-                }
-
-                for (size_t j = 0; j < op->lsp_addrs[i].n_ipv6_addrs; j++) {
-                    const char *ip_s = op->lsp_addrs[i].ipv6_addrs[j].addr_s;
-                    for (size_t k = 0; k < op->od->n_router_ports; k++) {
-                        /* Get the Logical_Router_Port that the
-                         * Logical_Switch_Port is connected to, as
-                         * 'peer'. */
-                        const char *peer_name = smap_get(
-                            &op->od->router_ports[k]->nbsp->options,
-                            "router-port");
-                        if (!peer_name) {
-                            continue;
-                        }
-
-                        struct ovn_port *peer = ovn_port_find(ports, peer_name);
-                        if (!peer || !peer->nbrp) {
-                            continue;
-                        }
-
-                        if (!find_lrp_member_ip(peer, ip_s)) {
-                            continue;
-                        }
-
-                        ds_clear(&match);
-                        ds_put_format(&match, "outport == %s && xxreg0 == %s",
-                                      peer->json_key, ip_s);
-
-                        ds_clear(&actions);
-                        ds_put_format(&actions, "eth.dst = %s; next;", ea_s);
-                        ovn_lflow_add_with_hint(lflows, peer->od,
-                                                S_ROUTER_IN_ARP_RESOLVE, 100,
-                                                ds_cstr(&match),
-                                                ds_cstr(&actions),
-                                                &op->nbsp->header_);
-                    }
-                }
-            }
-        } else if (op->od->n_router_ports && strcmp(op->nbsp->type, "router")
-                   && !strcmp(op->nbsp->type, "virtual")) {
-            /* This is a virtual port. Add ARP replies for the virtual ip with
-             * the mac of the present active virtual parent.
-             * If the logical port doesn't have virtual parent set in
-             * Port_Binding table, then add the flow to set eth.dst to
-             * 00:00:00:00:00:00 and advance to next table so that ARP is
-             * resolved by router pipeline using the arp{} action.
-             * The MAC_Binding entry for the virtual ip might be invalid. */
-            ovs_be32 ip;
-
-            const char *vip = smap_get(&op->nbsp->options,
-                                       "virtual-ip");
-            const char *virtual_parents = smap_get(&op->nbsp->options,
-                                                   "virtual-parents");
-            if (!vip || !virtual_parents ||
-                !ip_parse(vip, &ip) || !op->sb) {
-                continue;
-            }
-
-            if (!op->sb->virtual_parent || !op->sb->virtual_parent[0] ||
-                !op->sb->chassis) {
-                /* The virtual port is not claimed yet. */
-                for (size_t i = 0; i < op->od->n_router_ports; i++) {
-                    const char *peer_name = smap_get(
-                        &op->od->router_ports[i]->nbsp->options,
-                        "router-port");
-                    if (!peer_name) {
-                        continue;
-                    }
-
-                    struct ovn_port *peer = ovn_port_find(ports, peer_name);
-                    if (!peer || !peer->nbrp) {
-                        continue;
-                    }
-
-                    if (find_lrp_member_ip(peer, vip)) {
-                        ds_clear(&match);
-                        ds_put_format(&match, "outport == %s && reg0 == %s",
-                                        peer->json_key, vip);
-
-                        ds_clear(&actions);
-                        ds_put_format(&actions,
-                                      "eth.dst = 00:00:00:00:00:00; next;");
-                        ovn_lflow_add_with_hint(lflows, peer->od,
-                                                S_ROUTER_IN_ARP_RESOLVE, 100,
-                                                ds_cstr(&match),
-                                                ds_cstr(&actions),
-                                                &op->nbsp->header_);
-                        break;
-                    }
-                }
-            } else {
-                struct ovn_port *vp =
-                    ovn_port_find(ports, op->sb->virtual_parent);
-                if (!vp || !vp->nbsp) {
-                    continue;
-                }
-
-                for (size_t i = 0; i < vp->n_lsp_addrs; i++) {
-                    bool found_vip_network = false;
-                    const char *ea_s = vp->lsp_addrs[i].ea_s;
-                    for (size_t j = 0; j < vp->od->n_router_ports; j++) {
-                        /* Get the Logical_Router_Port that the
-                        * Logical_Switch_Port is connected to, as
-                        * 'peer'. */
-                        const char *peer_name = smap_get(
-                            &vp->od->router_ports[j]->nbsp->options,
-                            "router-port");
-                        if (!peer_name) {
-                            continue;
-                        }
-
-                        struct ovn_port *peer =
-                            ovn_port_find(ports, peer_name);
-                        if (!peer || !peer->nbrp) {
-                            continue;
-                        }
-
-                        if (!find_lrp_member_ip(peer, vip)) {
-                            continue;
-                        }
-
-                        ds_clear(&match);
-                        ds_put_format(&match, "outport == %s && reg0 == %s",
-                                        peer->json_key, vip);
-
-                        ds_clear(&actions);
-                        ds_put_format(&actions, "eth.dst = %s; next;", ea_s);
-                        ovn_lflow_add_with_hint(lflows, peer->od,
-                                                S_ROUTER_IN_ARP_RESOLVE, 100,
-                                                ds_cstr(&match),
-                                                ds_cstr(&actions),
-                                                &op->nbsp->header_);
-                        found_vip_network = true;
-                        break;
-                    }
-
-                    if (found_vip_network) {
-                        break;
-                    }
-                }
-            }
-        } else if (!strcmp(op->nbsp->type, "router")) {
-            /* This is a logical switch port that connects to a router. */
-
-            /* The peer of this switch port is the router port for which
-             * we need to add logical flows such that it can resolve
-             * ARP entries for all the other router ports connected to
-             * the switch in question. */
-
-            const char *peer_name = smap_get(&op->nbsp->options,
-                                             "router-port");
-            if (!peer_name) {
-                continue;
-            }
-
-            struct ovn_port *peer = ovn_port_find(ports, peer_name);
-            if (!peer || !peer->nbrp) {
-                continue;
-            }
-
-            for (size_t i = 0; i < op->od->n_router_ports; i++) {
-                const char *router_port_name = smap_get(
-                                    &op->od->router_ports[i]->nbsp->options,
-                                    "router-port");
-                struct ovn_port *router_port = ovn_port_find(ports,
-                                                             router_port_name);
-                if (!router_port || !router_port->nbrp) {
-                    continue;
-                }
-
-                /* Skip the router port under consideration. */
-                if (router_port == peer) {
-                   continue;
-                }
-
-                if (router_port->lrp_networks.n_ipv4_addrs) {
-                    ds_clear(&match);
-                    ds_put_format(&match, "outport == %s && reg0 == ",
-                                  peer->json_key);
-                    op_put_v4_networks(&match, router_port, false);
-
-                    ds_clear(&actions);
-                    ds_put_format(&actions, "eth.dst = %s; next;",
-                                              router_port->lrp_networks.ea_s);
-                    ovn_lflow_add_with_hint(lflows, peer->od,
-                                            S_ROUTER_IN_ARP_RESOLVE, 100,
-                                            ds_cstr(&match), ds_cstr(&actions),
-                                            &op->nbsp->header_);
-                }
-
-                if (router_port->lrp_networks.n_ipv6_addrs) {
-                    ds_clear(&match);
-                    ds_put_format(&match, "outport == %s && xxreg0 == ",
-                                  peer->json_key);
-                    op_put_v6_networks(&match, router_port);
-
-                    ds_clear(&actions);
-                    ds_put_format(&actions, "eth.dst = %s; next;",
-                                  router_port->lrp_networks.ea_s);
-                    ovn_lflow_add_with_hint(lflows, peer->od,
-                                            S_ROUTER_IN_ARP_RESOLVE, 100,
-                                            ds_cstr(&match), ds_cstr(&actions),
-                                            &op->nbsp->header_);
-                }
-            }
-        }
-    }
-
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        if (!od->nbr) {
-            continue;
-        }
-
-        ovn_lflow_add(lflows, od, S_ROUTER_IN_ARP_RESOLVE, 0, "ip4",
-                      "get_arp(outport, reg0); next;");
-
-        ovn_lflow_add(lflows, od, S_ROUTER_IN_ARP_RESOLVE, 0, "ip6",
-                      "get_nd(outport, xxreg0); next;");
-    }
 
     /* Local router ingress table CHK_PKT_LEN: Check packet length.
      *
