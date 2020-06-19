@@ -10821,6 +10821,8 @@ build_lflows(struct northd_context *ctx, struct hmap *datapaths,
                         igmp_groups, meter_groups, lbs);
     build_lrouter_flows(datapaths, ports, &lflows, meter_groups, lbs);
 
+    last_lflow_size = hmap_count(&lflows);
+
     /* Push changes to the Logical_Flow table to database. */
     const struct sbrec_logical_flow *sbflow, *next_sbflow;
     SBREC_LOGICAL_FLOW_FOR_EACH_SAFE (sbflow, next_sbflow, ctx->ovnsb_idl) {
@@ -10844,8 +10846,6 @@ build_lflows(struct northd_context *ctx, struct hmap *datapaths,
             sbrec_logical_flow_delete(sbflow);
         }
     }
-
-    last_lflow_size = hmap_count(&lflows);
 
     struct ovn_lflow *lflow, *next_lflow;
     HMAP_FOR_EACH_SAFE (lflow, next_lflow, hmap_node, &lflows) {
