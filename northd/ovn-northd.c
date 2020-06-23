@@ -6877,7 +6877,7 @@ static void *ovn_datapath_thread(void *arg) {
                     bnum <= li->datapaths->mask;
                     bnum += workload->pool->size) 
             {
-                HMAP_FOR_EACH_IN_BNUM(od, key_node, bnum, li->datapaths) {
+                HMAP_FOR_EACH_IN_PARALLEL(od, key_node, bnum, li->datapaths) {
                     if (seize_fire()) {
                         return NULL;
                     }
@@ -6909,7 +6909,7 @@ static void *ovn_port_thread(void *arg) {
                     bnum <= li->ports->mask;
                     bnum += workload->pool->size) 
             {
-                HMAP_FOR_EACH_IN_BNUM(op, key_node, bnum, li->ports) {
+                HMAP_FOR_EACH_IN_PARALLEL(op, key_node, bnum, li->ports) {
                     if (seize_fire()) {
                         return NULL;
                     }
@@ -7016,7 +7016,7 @@ static void run_build_stage(int stage,
             controls[index].data = &li[index];
         }
 
-        run_pool(parallel_od_pipeline[stage].pool, lflows, lflow_segs);
+        run_pool_hash(parallel_od_pipeline[stage].pool, lflows, lflow_segs);
     }
 
     if (parallel_od_pipeline[stage].pool) {
@@ -7028,7 +7028,7 @@ static void run_build_stage(int stage,
             controls[index].data = &li[index];
         }
 
-        run_pool(parallel_op_pipeline[stage].pool, lflows, lflow_segs);
+        run_pool_hash(parallel_op_pipeline[stage].pool, lflows, lflow_segs);
     }
 
 }

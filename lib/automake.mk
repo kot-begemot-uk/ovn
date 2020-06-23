@@ -13,8 +13,6 @@ lib_libovn_la_SOURCES = \
 	lib/expr.c \
 	lib/extend-table.h \
 	lib/extend-table.c \
-	lib/fasthmap.c \
-	lib/fasthmap.h \
 	lib/ip-mcast-index.c \
 	lib/ip-mcast-index.h \
 	lib/mcast-group-index.c \
