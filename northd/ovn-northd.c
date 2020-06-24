@@ -48,6 +48,7 @@
 #include "util.h"
 #include "uuid.h"
 #include "fasthmap.h"
+#include "async-io.h"
 #include "openvswitch/vlog.h"
 
 VLOG_DEFINE_THIS_MODULE(ovn_northd);
@@ -12782,6 +12783,7 @@ main(int argc, char *argv[])
                              &reset_ovnnb_idl_min_index);
 
     daemonize_complete();
+    async_io_enable();
 
     /* We want to detect (almost) all changes to the ovn-nb db. */
     struct ovsdb_idl_loop ovnnb_idl_loop = OVSDB_IDL_LOOP_INITIALIZER(
