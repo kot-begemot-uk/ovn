@@ -10385,178 +10385,33 @@ build_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
                     struct hmap *lflows, struct shash *meter_groups,
                     struct hmap *lbs)
 {
-    /* This flow table structure is documented in ovn-northd(8), so please
-     * update ovn-northd.8.xml if you change anything. */
-
-    /* Logical router ingress table 0: Admission control framework. */
     struct ovn_datapath *od;
     HMAP_FOR_EACH (od, key_node, datapaths) {
         build_lrouter_flow_table_0_od(od, lflows);
-    }
-
-    /* Logical router ingress table 0: match (priority 50). */
-    struct ovn_port *op;
-    HMAP_FOR_EACH (op, key_node, ports) {
-        build_lrouter_flow_table_0_op(op, lflows);
-    }
-
-    /* Logical router ingress table 1: LOOKUP_NEIGHBOR and
-     * table 2: LEARN_NEIGHBOR. */
-    HMAP_FOR_EACH (od, key_node, datapaths) {
         build_lrouter_flow_table_1_and_2_od(od, lflows);
-    }
-
-    HMAP_FOR_EACH (op, key_node, ports) {
-        build_lrouter_flow_table_1_and_2_op(op, lflows);
-    }
-
-    /* Logical router ingress table 3: IP Input. */
-    HMAP_FOR_EACH (od, key_node, datapaths) {
         build_lrouter_flow_table_3_od(od, lflows);
-    }
-
-    /* Logical router ingress table 3: IP Input for IPv4. */
-    HMAP_FOR_EACH (op, key_node, ports) {
-        build_lrouter_flow_table_3_op(op, lflows);
-    }
-
-    /* DHCPv6 reply handling */
-    HMAP_FOR_EACH (op, key_node, ports) {
-        build_lrouter_flow_DHCP_v6_op(op, lflows);
-    }
-
-    /* Logical router ingress table 1: IP Input for IPv6. */
-    HMAP_FOR_EACH (op, key_node, ports) {
-        build_lrouter_flow_inpit_for_v6_op(op, lflows);
-    }
-
-    /* NAT, Defrag and load balancing. */
-    HMAP_FOR_EACH (od, key_node, datapaths) {
         build_lrouter_flow_nat_defrag_lb_od(od, lflows, meter_groups, lbs);
-    }
-
-    /* Logical router ingress table ND_RA_OPTIONS & ND_RA_RESPONSE: IPv6 Router
-     * Adv (RA) options and response. */
-    HMAP_FOR_EACH (op, key_node, ports) {
-        build_lrouter_flow_ingress_ND_RA_op(op, lflows);
-    }
-
-    /* Logical router ingress table ND_RA_OPTIONS & ND_RA_RESPONSE: RS
-     * responder, by default goto next. (priority 0)*/
-    HMAP_FOR_EACH (od, key_node, datapaths) {
         build_lrouter_flow_ingress_ND_RA_od(od, lflows);
-    }
-
-    /* Logical router ingress table IP_ROUTING & IP_ROUTING_ECMP: IP Routing.
-     *
-     * A packet that arrives at this table is an IP packet that should be
-     * routed to the address in 'ip[46].dst'.
-     *
-     * For regular routes without ECMP, table IP_ROUTING sets outport to the
-     * correct output port, eth.src to the output port's MAC address, and
-     * '[xx]reg0' to the next-hop IP address (leaving 'ip[46].dst', the
-     * packet’s final destination, unchanged), and advances to the next table.
-     *
-     * For ECMP routes, i.e. multiple routes with same policy and prefix, table
-     * IP_ROUTING remembers ECMP group id and selects a member id, and advances
-     * to table IP_ROUTING_ECMP, which sets outport, eth.src and '[xx]reg0' for
-     * the selected ECMP member.
-     * */
-    HMAP_FOR_EACH (op, key_node, ports) {
-        build_lrouter_flow_ingress_ip_routing_ecmp(op, lflows);
-    }
-
-    /* Convert the static routes to flows. */
-    HMAP_FOR_EACH (od, key_node, datapaths) {
         build_lrouter_flow_datapath_to_static_route(od, lflows, ports);
-    }
-
-    /* IP Multicast lookup. Here we set the output port, adjust TTL and
-     * advance to next table (priority 500).
-     */
-    HMAP_FOR_EACH (od, key_node, datapaths) {
         build_lrouter_flow_multicast_lookup(od, lflows);
-    }
-
-    /* Logical router ingress table POLICY: Policy.
-     *
-     * A packet that arrives at this table is an IP packet that should be
-     * permitted/denied/rerouted to the address in the rule's nexthop.
-     * This table sets outport to the correct out_port,
-     * eth.src to the output port's MAC address,
-     * and '[xx]reg0' to the next-hop IP address (leaving
-     * 'ip[46].dst', the packet’s final destination, unchanged), and
-     * advances to the next table for ARP/ND resolution. */
-    HMAP_FOR_EACH (od, key_node, datapaths) {
         build_lrouter_flow_ingress_policy(od, lflows, ports);
-    }
-
-
-    /* XXX destination unreachable */
-
-    /* Local router ingress table ARP_RESOLVE: ARP Resolution.
-     *
-     * Multicast packets already have the outport set so just advance to next
-     * table (priority 500). */
-    HMAP_FOR_EACH (od, key_node, datapaths) {
         build_lrouter_flow_dest_unreachable(od, lflows);
-    }
-
-    /* Local router ingress table ARP_RESOLVE: ARP Resolution.
-     *
-     * Any unicast packet that reaches this table is an IP packet whose
-     * next-hop IP address is in reg0. (ip4.dst is the final destination.)
-     * This table resolves the IP address in reg0 into an output port in
-     * outport and an Ethernet address in eth.dst.
-     */
-    HMAP_FOR_EACH (op, key_node, ports) {
-        build_lrouter_arp_resolve_op(op, lflows, ports);
-    }
-
-    HMAP_FOR_EACH (od, key_node, datapaths) {
         build_lrouter_arp_resolve_od(od, lflows);
-    }
-
-    /* Local router ingress table CHK_PKT_LEN: Check packet length.
-     *
-     * Any IPv4 packet with outport set to the distributed gateway
-     * router port, check the packet length and store the result in the
-     * 'REGBIT_PKT_LARGER' register bit.
-     *
-     * Local router ingress table LARGER_PKTS: Handle larger packets.
-     *
-     * Any IPv4 packet with outport set to the distributed gateway
-     * router port and the 'REGBIT_PKT_LARGER' register bit is set,
-     * generate ICMPv4 packet with type 3 (Destination Unreachable) and
-     * code 4 (Fragmentation needed).
-     * */
-    HMAP_FOR_EACH (od, key_node, datapaths) {
         build_lrouter_check_pck_len_od(od, lflows, ports);
-    }
-
-    /* Logical router ingress table GW_REDIRECT: Gateway redirect.
-     *
-     * For traffic with outport equal to the l3dgw_port
-     * on a distributed router, this table redirects a subset
-     * of the traffic to the l3redirect_port which represents
-     * the central instance of the l3dgw_port.
-     */
-    HMAP_FOR_EACH (od, key_node, datapaths) {
         build_lrouter_gw_redirect_od(od, lflows);
-    }
-
-    HMAP_FOR_EACH (od, key_node, datapaths) {
         build_lrouter_arp_request_od(od, lflows);
     }
 
-    /* Logical router egress table DELIVERY: Delivery (priority 100-110).
-     *
-     * Priority 100 rules deliver packets to enabled logical ports.
-     * Priority 110 rules match multicast packets and update the source
-     * mac before delivering to enabled logical ports. IP multicast traffic
-     * bypasses S_ROUTER_IN_IP_ROUTING route lookups.
-     */
+    struct ovn_port *op;
     HMAP_FOR_EACH (op, key_node, ports) {
+        build_lrouter_flow_table_0_op(op, lflows);
+        build_lrouter_flow_table_1_and_2_op(op, lflows);
+        build_lrouter_flow_table_3_op(op, lflows);
+        build_lrouter_flow_DHCP_v6_op(op, lflows);
+        build_lrouter_flow_inpit_for_v6_op(op, lflows);
+        build_lrouter_flow_ingress_ND_RA_op(op, lflows);
+        build_lrouter_flow_ingress_ip_routing_ecmp(op, lflows);
+        build_lrouter_arp_resolve_op(op, lflows, ports);
         build_lrouter_egress_delivery(op, lflows);
     }
 
