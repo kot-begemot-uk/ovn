@@ -36,6 +36,14 @@ struct gen_opts_map {
 
 #define DHCP_BROADCAST_FLAG 0x8000
 
+/* These are not defined in ovs/lib/dhcp.h and hence defined here with
+ * OVN_DHCP_OPT_CODE_<opt_name>.
+ */
+#define OVN_DHCP_OPT_CODE_NETMASK      1
+#define OVN_DHCP_OPT_CODE_LEASE_TIME   51
+#define OVN_DHCP_OPT_CODE_T1           58
+#define OVN_DHCP_OPT_CODE_T2           59
+
 #define DHCP_OPTION(NAME, CODE, TYPE) \
     {.name = NAME, .code = CODE, .type = TYPE}
 
@@ -57,7 +65,7 @@ struct gen_opts_map {
 #define DHCP_OPT_NIS_SERVER  DHCP_OPTION("nis_server", 41, "ipv4")
 #define DHCP_OPT_NTP_SERVER  DHCP_OPTION("ntp_server", 42, "ipv4")
 #define DHCP_OPT_SERVER_ID   DHCP_OPTION("server_id", 54, "ipv4")
-#define DHCP_OPT_TFTP_SERVER DHCP_OPTION("tftp_server", 66, "ipv4")
+#define DHCP_OPT_TFTP_SERVER DHCP_OPTION("tftp_server", 66, "host_id")
 
 #define DHCP_OPT_CLASSLESS_STATIC_ROUTE \
     DHCP_OPTION("classless_static_route", 121, "static_routes")
@@ -167,6 +175,10 @@ struct dhcp_opt6_header {
     ovs_be16 opt_code;
     ovs_be16 size;
 };
+
+/* These are not defined in ovs/lib/dhcp.h, hence defining here. */
+#define OVN_DHCP_MSG_RELEASE        7
+#define OVN_DHCP_MSG_INFORM         8
 
 /* Supported DHCPv6 Message Types */
 #define DHCPV6_MSG_TYPE_SOLICIT     1
@@ -309,6 +321,9 @@ nd_ra_opts_destroy(struct hmap *nd_ra_opts)
 
 
 #define ND_RA_FLAG_ADDR_MODE    0
+/* all small numbers seems to be all already taken but nothing guarantees this
+ * code will not be assigned by IANA to another option */
+#define ND_RA_FLAG_PRF          255
 
 
 /* Default values of various IPv6 Neighbor Discovery protocol options and
@@ -330,11 +345,13 @@ nd_ra_opts_destroy(struct hmap *nd_ra_opts)
 #define IPV6_ND_RA_OPT_PRF_NORMAL                   0x00
 #define IPV6_ND_RA_OPT_PRF_HIGH                     0x08
 #define IPV6_ND_RA_OPT_PRF_LOW                      0x18
+#define IPV6_ND_RA_OPT_PRF_RESET_MASK               0xe7
 
 static inline void
 nd_ra_opts_init(struct hmap *nd_ra_opts)
 {
     nd_ra_opt_add(nd_ra_opts, "addr_mode", ND_RA_FLAG_ADDR_MODE, "str");
+    nd_ra_opt_add(nd_ra_opts, "router_preference", ND_RA_FLAG_PRF, "str");
     nd_ra_opt_add(nd_ra_opts, "slla", ND_OPT_SOURCE_LINKADDR, "mac");
     nd_ra_opt_add(nd_ra_opts, "prefix", ND_OPT_PREFIX_INFORMATION, "ipv6");
     nd_ra_opt_add(nd_ra_opts, "mtu", ND_OPT_MTU, "uint32");

@@ -47,8 +47,6 @@ OVN To-do List
   Han Zhou: "To support VMs that hosts workloads with their own macs, e.g.
   containers, if not using OVN native container support."
 
-* Finish up ARP/ND support: re-checking bindings, expiring bindings.
-
 * Hitless upgrade, especially for data plane.
 
 * Use OpenFlow "bundles" for transactional data plane updates.
@@ -85,7 +83,7 @@ OVN To-do List
 
     The table of MAC bindings must not be allowed to grow unreasonably large.
 
-  * MTU handling (fragmentation on output)
+* MTU handling (fragmentation on output)
 
 * ovsdb-server
 
@@ -99,17 +97,6 @@ OVN To-do List
     adequately, we can multithread ovsdb-server.  Initially one might
     only break protocol handling into separate threads, leaving the
     actual database work serialized through a lock.
-
-  * Reducing startup time.
-
-    As-is, if ovsdb-server restarts, every client will fetch a fresh copy of
-    the part of the database that it cares about.  With hundreds of clients,
-    this could cause heavy CPU load on ovsdb-server and use excessive network
-    bandwidth.  It would be better to allow incremental updates even across
-    connection loss.  One way might be to use "Difference Digests" as described
-    in Epstein et al., "What's the Difference? Efficient Set Reconciliation
-    Without Prior Context".  (I'm not yet aware of previous non-academic use of
-    this technique.)
 
 * Support multiple tunnel encapsulations in Chassis.
 
@@ -149,3 +136,7 @@ OVN To-do List
 * OVN Interconnection
 
   * Packaging for RHEL, Debian, etc.
+
+* ovn-controller: Stop copying the local OVS configuration into the
+  Chassis external_ids column (same for the "is-remote" configuration from
+  ovn-ic) a few releases after the 20.06 version (21.06 maybe ?).

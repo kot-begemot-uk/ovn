@@ -31,6 +31,7 @@ struct uuid;
 struct eth_addr;
 struct sbrec_port_binding;
 struct sbrec_datapath_binding;
+struct unixctl_conn;
 
 struct ipv4_netaddr {
     ovs_be32 addr;            /* 192.168.10.123 */
@@ -97,6 +98,8 @@ uint32_t ovn_logical_flow_hash(const struct uuid *logical_datapath,
                                uint16_t priority,
                                const char *match, const char *actions);
 bool datapath_is_switch(const struct sbrec_datapath_binding *);
+void ovn_conn_show(struct unixctl_conn *conn, int argc OVS_UNUSED,
+                   const char *argv[] OVS_UNUSED, void *idl_);
 
 #define OVN_MAX_DP_KEY ((1u << 24) - 1)
 #define OVN_MAX_DP_GLOBAL_NUM ((1u << 16) - 1)
@@ -110,6 +113,14 @@ void ovn_add_tnlid(struct hmap *set, uint32_t tnlid);
 bool ovn_tnlid_in_use(const struct hmap *set, uint32_t tnlid);
 uint32_t ovn_allocate_tnlid(struct hmap *set, const char *name, uint32_t min,
                             uint32_t max, uint32_t *hint);
+
+static inline void
+get_unique_lport_key(uint64_t dp_tunnel_key, uint64_t lport_tunnel_key,
+                     char *buf, size_t buf_size)
+{
+    snprintf(buf, buf_size, "%"PRId64"_%"PRId64, dp_tunnel_key,
+             lport_tunnel_key);
+}
 
 char *ovn_chassis_redirect_name(const char *port_name);
 void ovn_set_pidfile(const char *name);

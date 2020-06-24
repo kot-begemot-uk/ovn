@@ -160,12 +160,19 @@
 
       <dt><code>qos-del</code> <var>switch</var> [<var>direction</var> [<var>priority</var> <var>match</var>]]</dt>
       <dd>
-        Deletes QoS rules from <var>switch</var>.  If only
-        <var>switch</var> is supplied, all the QoS rules from the logical
-        switch are deleted.  If <var>direction</var> is also specified,
-        then all the flows in that direction will be deleted from the
-        logical switch.  If all the fields are supplied, then a single
-        flow that matches the given fields will be deleted.
+        <p>
+          Deletes QoS rules from <var>switch</var>.  If only
+          <var>switch</var> is supplied, all the QoS rules from the logical
+          switch are deleted.  If <var>direction</var> is also specified,
+          then all the flows in that direction will be deleted from the
+          logical switch.  If all the fields are supplied, then a single
+          flow that matches the given fields will be deleted.
+        </p>
+
+        <p>
+          If <var>switch</var> and <var>uuid</var> are supplied, then the
+          QoS rule with sepcified uuid is deleted.
+        </p>
       </dd>
 
       <dt><code>qos-list</code> <var>switch</var></dt>
@@ -714,7 +721,8 @@
 
     <dl>
       <dt><code>lr-policy-add</code> <var>router</var> <var>priority</var>
-          <var>match</var> <var>action</var> [<var>nexthop</var>]</dt>
+          <var>match</var> <var>action</var> [<var>nexthop</var>]
+          [<var>options key=value]</var>] </dt>
       <dd>
         <p>
           Add Policy to <var>router</var> which provides a way to configure
@@ -725,6 +733,8 @@
           only when <var>action</var> is <var>reroute</var>. A policy is
           uniquely identified by <var>priority</var> and <var>match</var>.
           Multiple policies can have the same <var>priority</var>.
+          <var>options</var> sets the router policy options as key-value pair.
+          The supported option is : <code>pkt_mark</code>.
         </p>
 
           <p>
@@ -736,6 +746,12 @@
           <code>lr-policy-add lr1 100 ip4.src == 192.168.100.0/24 drop</code>.
           </p>
 
+          <p>
+          <code>
+            lr-policy-add lr1 100 ip4.src == 192.168.100.0/24 allow
+            pkt_mark=100
+          </code>.
+          </p>
       </dd>
 
       <dt><code>lr-policy-del</code> <var>router</var> [<var>{priority | uuid}

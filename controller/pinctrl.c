@@ -1130,6 +1130,7 @@ fill_ipv6_prefix_state(struct ovsdb_idl_txn *ovnsb_idl_txn,
             smap_destroy(&options);
         }
         pfd->last_used = time_msec();
+        destroy_lport_addresses(&c_addrs);
     }
 
     return changed;
@@ -1183,7 +1184,7 @@ prepare_ipv6_prefixd(struct ovsdb_idl_txn *ovnsb_idl_txn,
             }
 
             struct in6_addr ip6_addr;
-            struct eth_addr ea;
+            struct eth_addr ea = eth_addr_zero;
             for (j = 0; j < pb->n_mac; j++) {
                 struct lport_addresses laddrs;
 
@@ -1194,8 +1195,10 @@ prepare_ipv6_prefixd(struct ovsdb_idl_txn *ovnsb_idl_txn,
                 ea = laddrs.ea;
                 if (laddrs.n_ipv6_addrs > 0) {
                     ip6_addr = laddrs.ipv6_addrs[0].addr;
+                    destroy_lport_addresses(&laddrs);
                     break;
                 }
+                destroy_lport_addresses(&laddrs);
             }
 
             if (eth_addr_is_zero(ea)) {
@@ -1378,8 +1381,7 @@ pinctrl_find_buffered_packets(const struct in6_addr *ip, uint32_t hash)
 
 /* Called with in the pinctrl_handler thread context. */
 static int
-pinctrl_handle_buffered_packets(const struct flow *ip_flow,
-                                struct dp_packet *pkt_in,
+pinctrl_handle_buffered_packets(struct dp_packet *pkt_in,
                                 const struct match *md, bool is_arp)
     OVS_REQUIRES(pinctrl_mutex)
 {
@@ -1388,9 +1390,10 @@ pinctrl_handle_buffered_packets(const struct flow *ip_flow,
     struct in6_addr addr;
 
     if (is_arp) {
-        addr = in6_addr_mapped_ipv4(ip_flow->nw_dst);
+        addr = in6_addr_mapped_ipv4(htonl(md->flow.regs[0]));
     } else {
-        addr = ip_flow->ipv6_dst;
+        ovs_be128 ip6 = hton128(flow_get_xxreg(&md->flow, 0));
+        memcpy(&addr, &ip6, sizeof addr);
     }
 
     uint32_t hash = hash_bytes(&addr, sizeof addr, 0);
@@ -1431,7 +1434,7 @@ pinctrl_handle_arp(struct rconn *swconn, const struct flow *ip_flow,
     }
 
     ovs_mutex_lock(&pinctrl_mutex);
-    pinctrl_handle_buffered_packets(ip_flow, pkt_in, md, true);
+    pinctrl_handle_buffered_packets(pkt_in, md, true);
     ovs_mutex_unlock(&pinctrl_mutex);
 
     /* Compose an ARP packet. */
@@ -1570,8 +1573,6 @@ pinctrl_handle_icmp(struct rconn *swconn, const struct flow *ip_flow,
         }
         ih->icmp6_base.icmp6_cksum = 0;
 
-        nh = dp_packet_l3(&packet);
-
         /* RFC 4443: 3.1.
          *
          * 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
@@ -1594,9 +1595,11 @@ pinctrl_handle_icmp(struct rconn *swconn, const struct flow *ip_flow,
         }
 
         dp_packet_put(&packet, in_ip, in_ip_len);
+        nh = dp_packet_l3(&packet);
         nh->ip6_plen = htons(ICMP6_DATA_HEADER_LEN + in_ip_len);
 
         icmpv6_csum = packet_csum_pseudoheader6(dp_packet_l3(&packet));
+        ih = dp_packet_l4(&packet);
         ih->icmp6_base.icmp6_cksum = csum_finish(
             csum_continue(icmpv6_csum, ih,
                           in_ip_len + ICMP6_DATA_HEADER_LEN));
@@ -1679,11 +1682,13 @@ static void
 pinctrl_handle_put_dhcp_opts(
     struct rconn *swconn,
     struct dp_packet *pkt_in, struct ofputil_packet_in *pin,
-    struct ofpbuf *userdata, struct ofpbuf *continuation)
+    struct flow *in_flow, struct ofpbuf *userdata,
+    struct ofpbuf *continuation)
 {
     enum ofp_version version = rconn_get_version(swconn);
     enum ofputil_protocol proto = ofputil_protocol_from_ofp_version(version);
     struct dp_packet *pkt_out_ptr = NULL;
+    struct ofpbuf *dhcp_inform_reply_buf = NULL;
     uint32_t success = 0;
 
     /* Parse result field. */
@@ -1807,22 +1812,15 @@ pinctrl_handle_put_dhcp_opts(
         VLOG_WARN_RL(&rl, "Missing DHCP message type");
         goto exit;
     }
-    if (*in_dhcp_msg_type != DHCP_MSG_DISCOVER &&
-        *in_dhcp_msg_type != DHCP_MSG_REQUEST) {
-        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
-        VLOG_WARN_RL(&rl, "Invalid DHCP message type: %d", *in_dhcp_msg_type);
-        goto exit;
-    }
 
-    uint8_t msg_type;
-    if (*in_dhcp_msg_type == DHCP_MSG_DISCOVER) {
+    struct ofpbuf *reply_dhcp_opts_ptr = userdata;
+    uint8_t msg_type = 0;
+
+    switch (*in_dhcp_msg_type) {
+    case DHCP_MSG_DISCOVER:
         msg_type = DHCP_MSG_OFFER;
-    } else {
-        /* This is a DHCPREQUEST. If the client has requested an IP that
-         * does not match the offered IP address, reply with a NAK. The
-         * requested IP address may be supplied either via Requested IP Address
-         * (opt 50) or via ciaddr, depending on the client's state.
-         */
+        break;
+    case DHCP_MSG_REQUEST: {
         msg_type = DHCP_MSG_ACK;
         if (request_ip != *offer_ip) {
             static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
@@ -1831,12 +1829,81 @@ pinctrl_handle_put_dhcp_opts(
                          IP_ARGS(*offer_ip));
             msg_type = DHCP_MSG_NAK;
         }
+        break;
+    }
+    case OVN_DHCP_MSG_RELEASE: {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(20, 40);
+        const struct eth_header *l2 = dp_packet_eth(pkt_in);
+        VLOG_INFO_RL(&rl, "DHCPRELEASE "ETH_ADDR_FMT " "IP_FMT"",
+                     ETH_ADDR_ARGS(l2->eth_src),
+                     IP_ARGS(in_dhcp_data->ciaddr));
+        break;
+    }
+    case OVN_DHCP_MSG_INFORM: {
+        /* RFC 2131 section 3.4.
+         * Remove all the offer ip related dhcp options and
+         * all the time related dhcp options.
+         * Loop through the dhcp option defined in the userdata buffer
+         * and copy all the options into dhcp_inform_reply_buf skipping
+         * the not required ones.
+         * */
+        msg_type = DHCP_MSG_ACK;
+        in_dhcp_ptr = userdata->data;
+        end = (const char *)userdata->data + userdata->size;
+
+        /* The buf size cannot be greater > userdata->size. */
+        dhcp_inform_reply_buf = ofpbuf_new(userdata->size);
+
+        reply_dhcp_opts_ptr = dhcp_inform_reply_buf;
+        while (in_dhcp_ptr < end) {
+            const struct dhcp_opt_header *in_dhcp_opt =
+                (const struct dhcp_opt_header *)in_dhcp_ptr;
+
+            switch (in_dhcp_opt->code) {
+            case OVN_DHCP_OPT_CODE_NETMASK:
+            case OVN_DHCP_OPT_CODE_LEASE_TIME:
+            case OVN_DHCP_OPT_CODE_T1:
+            case OVN_DHCP_OPT_CODE_T2:
+                break;
+            default:
+                /* Copy the dhcp option to reply_dhcp_opts_ptr. */
+                ofpbuf_put(reply_dhcp_opts_ptr, in_dhcp_opt,
+                           in_dhcp_opt->len + sizeof *in_dhcp_opt);
+                break;
+            }
+
+            in_dhcp_ptr += sizeof *in_dhcp_opt;
+            if (in_dhcp_ptr > end) {
+                break;
+            }
+            in_dhcp_ptr += in_dhcp_opt->len;
+            if (in_dhcp_ptr > end) {
+                break;
+            }
+        }
+
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(20, 40);
+        VLOG_INFO_RL(&rl, "DHCPINFORM from "ETH_ADDR_FMT " "IP_FMT"",
+                     ETH_ADDR_ARGS(in_flow->dl_src),
+                     IP_ARGS(in_flow->nw_src));
+
+        break;
+    }
+    default: {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
+        VLOG_WARN_RL(&rl, "Invalid DHCP message type: %d", *in_dhcp_msg_type);
+        goto exit;
+    }
+    }
+
+    if (!msg_type) {
+        goto exit;
     }
 
     /* Frame the DHCP reply packet
-     * Total DHCP options length will be options stored in the userdata +
-     * 16 bytes. Note that the DHCP options stored in userdata are not included
-     * in DHCPNAK messages.
+     * Total DHCP options length will be options stored in the
+     * reply_dhcp_opts_ptr + 16 bytes. Note that the DHCP options stored in
+     * reply_dhcp_opts_ptr are not included in DHCPNAK messages.
      *
      * --------------------------------------------------------------
      *| 4 Bytes (dhcp cookie) | 3 Bytes (option type) | DHCP options |
@@ -1846,7 +1913,7 @@ pinctrl_handle_put_dhcp_opts(
      */
     uint16_t new_l4_size = UDP_HEADER_LEN + DHCP_HEADER_LEN + 16;
     if (msg_type != DHCP_MSG_NAK) {
-        new_l4_size += userdata->size;
+        new_l4_size += reply_dhcp_opts_ptr->size;
     }
     size_t new_packet_size = pkt_in->l4_ofs + new_l4_size;
 
@@ -1871,12 +1938,18 @@ pinctrl_handle_put_dhcp_opts(
     struct dhcp_header *dhcp_data = dp_packet_put(
         &pkt_out, dp_packet_pull(pkt_in, DHCP_HEADER_LEN), DHCP_HEADER_LEN);
     dhcp_data->op = DHCP_OP_REPLY;
-    dhcp_data->yiaddr = (msg_type == DHCP_MSG_NAK) ? 0 : *offer_ip;
+
+    if (*in_dhcp_msg_type != OVN_DHCP_MSG_INFORM) {
+        dhcp_data->yiaddr = (msg_type == DHCP_MSG_NAK) ? 0 : *offer_ip;
+    } else {
+        dhcp_data->yiaddr = 0;
+    }
+
     dp_packet_put(&pkt_out, &magic_cookie, sizeof(ovs_be32));
 
     uint16_t out_dhcp_opts_size = 12;
     if (msg_type != DHCP_MSG_NAK) {
-      out_dhcp_opts_size += userdata->size;
+      out_dhcp_opts_size += reply_dhcp_opts_ptr->size;
     }
     uint8_t *out_dhcp_opts = dp_packet_put_zeros(&pkt_out,
                                                  out_dhcp_opts_size);
@@ -1887,8 +1960,9 @@ pinctrl_handle_put_dhcp_opts(
     out_dhcp_opts += 3;
 
     if (msg_type != DHCP_MSG_NAK) {
-      memcpy(out_dhcp_opts, userdata->data, userdata->size);
-      out_dhcp_opts += userdata->size;
+        memcpy(out_dhcp_opts, reply_dhcp_opts_ptr->data,
+               reply_dhcp_opts_ptr->size);
+        out_dhcp_opts += reply_dhcp_opts_ptr->size;
     }
 
     /* Padding */
@@ -1935,6 +2009,10 @@ exit:
     queue_msg(swconn, ofputil_encode_resume(pin, continuation, proto));
     if (pkt_out_ptr) {
         dp_packet_uninit(pkt_out_ptr);
+    }
+
+    if (dhcp_inform_reply_buf) {
+        ofpbuf_delete(dhcp_inform_reply_buf);
     }
 }
 
@@ -2641,8 +2719,8 @@ process_packet_in(struct rconn *swconn, const struct ofp_header *msg)
         break;
 
     case ACTION_OPCODE_PUT_DHCP_OPTS:
-        pinctrl_handle_put_dhcp_opts(swconn, &packet, &pin, &userdata,
-                                     &continuation);
+        pinctrl_handle_put_dhcp_opts(swconn, &packet, &pin, &headers,
+                                     &userdata, &continuation);
         break;
 
     case ACTION_OPCODE_ND_NA:
@@ -5278,7 +5356,7 @@ pinctrl_handle_nd_ns(struct rconn *swconn, const struct flow *ip_flow,
     }
 
     ovs_mutex_lock(&pinctrl_mutex);
-    pinctrl_handle_buffered_packets(ip_flow, pkt_in, md, false);
+    pinctrl_handle_buffered_packets(pkt_in, md, false);
     ovs_mutex_unlock(&pinctrl_mutex);
 
     uint64_t packet_stub[128 / 8];
@@ -5839,8 +5917,9 @@ sync_svc_monitors(struct ovsdb_idl_txn *ovnsb_idl_txn,
 
         struct eth_addr ea;
         bool mac_found = false;
-        for (size_t i = 0; i < pb->n_mac; i++) {
+        for (size_t i = 0; i < pb->n_mac && !mac_found; i++) {
             struct lport_addresses laddrs;
+
             if (!extract_lsp_addresses(pb->mac[i], &laddrs)) {
                 continue;
             }
@@ -5853,14 +5932,13 @@ sync_svc_monitors(struct ovsdb_idl_txn *ovnsb_idl_txn,
                 }
             }
 
-            if (mac_found) {
-                break;
-            } else if (!laddrs.n_ipv4_addrs) {
+            if (!mac_found && !laddrs.n_ipv4_addrs) {
                 /* IPv4 address(es) are not configured. Use the first mac. */
                 ea = laddrs.ea;
                 mac_found = true;
-                break;
             }
+
+            destroy_lport_addresses(&laddrs);
         }
 
         if (!mac_found) {

@@ -262,14 +262,14 @@
       from the <ref table="SB_Global"/> table into this column.
     </column>
 
-    <column name="external_ids" key="ovn-bridge-mappings">
+    <column name="other_config" key="ovn-bridge-mappings">
       <code>ovn-controller</code> populates this key with the set of bridge
       mappings it has been configured to use.  Other applications should treat
       this key as read-only.  See <code>ovn-controller</code>(8) for more
       information.
     </column>
 
-    <column name="external_ids" key="datapath-type">
+    <column name="other_config" key="datapath-type">
       <code>ovn-controller</code> populates this key with the datapath type
       configured in the <ref table="Bridge" column="datapath_type"/> column of
       the Open_vSwitch database's <ref table="Bridge" db="Open_vSwitch"/>
@@ -277,7 +277,7 @@
       <code>ovn-controller</code>(8) for more information.
     </column>
 
-    <column name="external_ids" key="iface-types">
+    <column name="other_config" key="iface-types">
       <code>ovn-controller</code> populates this key with the interface types
       configured in the <ref table="Open_vSwitch" column="iface_types"/> column
       of the Open_vSwitch database's <ref table="Open_vSwitch"
@@ -285,7 +285,7 @@
       read-only. See <code>ovn-controller</code>(8) for more information.
     </column>
 
-    <column name="external_ids" key="ovn-cms-options">
+    <column name="other_config" key="ovn-cms-options">
       <code>ovn-controller</code> populates this key with the set of options
       configured in the <ref table="Open_vSwitch"
       column="external_ids:ovn-cms-options"/> column of the Open_vSwitch
@@ -293,7 +293,7 @@
       See <code>ovn-controller</code>(8) for more information.
     </column>
 
-    <column name="external_ids" key="is-interconn">
+    <column name="other_config" key="is-interconn">
       <code>ovn-controller</code> populates this key with the setting
       configured in the <ref table="Open_vSwitch"
       column="external_ids:ovn-is-interconn"/> column of the Open_vSwitch
@@ -302,7 +302,7 @@
       See <code>ovn-controller</code>(8) for more information.
     </column>
 
-    <column name="external_ids" key="is-remote">
+    <column name="other_config" key="is-remote">
       <code>ovn-ic</code> set this key to true for remote interconnection
       gateway chassises learned from the interconnection southbound database.
       See <code>ovn-ic</code>(8) for more information.
@@ -316,7 +316,7 @@
       See <code>ovn-controller</code>(8) for more information.
     </column>
 
-    <column name="external_ids" key="ovn-chassis-mac-mappings">
+    <column name="other_config" key="ovn-chassis-mac-mappings">
       <code>ovn-controller</code> populates this key with the set of options
       configured in the <ref table="Open_vSwitch"
       column="external_ids:ovn-chassis-mac-mappings"/> column of the
@@ -975,6 +975,7 @@
         <li><code>xxreg0</code> <code>xxreg1</code></li>
         <li><code>inport</code> <code>outport</code></li>
         <li><code>flags.loopback</code></li>
+        <li><code>pkt.mark</code></li>
         <li><code>eth.src</code> <code>eth.dst</code> <code>eth.type</code></li>
         <li><code>vlan.tci</code> <code>vlan.vid</code> <code>vlan.pcp</code> <code>vlan.present</code></li>
         <li><code>ip.proto</code> <code>ip.dscp</code> <code>ip.ecn</code> <code>ip.ttl</code> <code>ip.frag</code></li>
@@ -2626,10 +2627,15 @@ tcp.flags = RST;
 
           <dt><code>localnet</code></dt>
           <dd>
-            A connection to a locally accessible network from each
-            <code>ovn-controller</code> instance.  A logical switch can only
-            have a single <code>localnet</code> port attached.  This is used
-            to model direct connectivity to an existing network.
+            A connection to a locally accessible network from
+            <code>ovn-controller</code> instances that have a corresponding
+            bridge mapping.  A logical switch can have multiple
+            <code>localnet</code> ports attached.  This type is used to model
+            direct connectivity to existing networks.  In this case, each
+            chassis should have a mapping for one of the physical networks
+            only.  Note: nothing said above implies that a chassis cannot be
+            plugged to multiple physical networks as long as they belong to
+            different switches.
           </dd>
 
           <dt><code>localport</code></dt>
@@ -2777,7 +2783,13 @@ tcp.flags = RST;
           switch must have a bridge mapping configured to reach that
           <code>localnet</code>.  Traffic that arrives on a
           <code>localnet</code> port is never forwarded over a tunnel to
-          another chassis.
+          another chassis.  If there are multiple <code>localnet</code>
+          ports in a logical switch, each chassis should only have a single
+          bridge mapping for one of the physical networks.  Note: In case of
+          multiple <code>localnet</code> ports, to provide interconnectivity
+          between all VIFs located on different chassis with different fabric
+          connectivity, the fabric should implement some form of routing
+          between the segments.
         </p>
       </column>
 
@@ -3208,6 +3220,19 @@ tcp.flags = RST;
             Example. "name=host_name", "code=12", "type=str".
           </p>
         </dd>
+
+        <dt><code>value: host_id</code></dt>
+        <dd>
+          <p>
+            This indicates that the value of the DHCP option is a host_id.
+            It can either be a host_name or an IP address.
+          </p>
+
+          <p>
+            Example. "name=tftp_server", "code=66", "type=host_id".
+          </p>
+        </dd>
+
       </dl>
     </column>
   </table>

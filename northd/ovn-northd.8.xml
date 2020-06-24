@@ -96,6 +96,34 @@
         acquired OVSDB lock on SB DB, "standby" if it has not or "paused" if
         this instance is paused.
       </dd>
+
+      <dt><code>sb-cluster-state-reset</code></dt>
+      <dd>
+      <p>
+        Reset southbound database cluster status when databases are destroyed
+        and rebuilt.
+      </p>
+      <p>
+        If all databases in a clustered southbound database are removed from
+        disk, then the stored index of all databases will be reset to zero.
+        This will cause ovn-northd to be unable to read or write to the
+        southbound database, because it will always detect the data as stale.
+        In such a case, run this command so that ovn-northd will reset its
+        local index so that it can interact with the southbound database again.
+      </p>
+      </dd>
+
+      <dt><code>nb-cluster-state-reset</code></dt>
+      <dd>
+      <p>
+        Reset northbound database cluster status when databases are destroyed
+        and rebuilt.
+      </p>
+      <p>
+        This performs the same task as <code>sb-cluster-state-reset</code>
+        except for the northbound database client.
+      </p>
+      </dd>
       </dl>
     </p>
 
@@ -437,6 +465,12 @@
         should no longer be allowed due to a policy change.  Packets
         in the request direction are skipped here to let a newly created
         ACL re-allow this connection.
+      </li>
+
+      <li>
+        A priority-65535 flow that allows IPv6 Neighbor solicitation,
+        Neighbor discover, Router solicitation and Router advertisement
+        packets.
       </li>
 
       <li>
@@ -2486,44 +2520,11 @@ output;
 
       <li>
         <p>
-          For distributed logical routers where one of the logical router ports
-          specifies a <code>redirect-chassis</code>, a priority-400 logical
-          flow for each <code>dnat_and_snat</code> NAT rules configured.
-          These flows will allow to properly forward traffic to the external
-          connections if available and avoid sending it through the tunnel.
-          Assuming the following NAT rule has been configured:
-        </p>
-
-        <pre>
-external_ip = <var>A</var>;
-external_mac = <var>B</var>;
-logical_ip = <var>C</var>;
-        </pre>
-
-        <p>
-          the following action will be applied:
-        </p>
-
-        <pre>
-ip.ttl--;
-reg0 = <var>ip.dst</var>;
-reg1 = <var>A</var>;
-eth.src = <var>B</var>;
-outport = <var>router-port</var>;
-next;
-        </pre>
-
-      </li>
-
-      <li>
-        <p>
           IPv4 routing table.  For each route to IPv4 network <var>N</var> with
           netmask <var>M</var>, on router port <var>P</var> with IP address
           <var>A</var> and Ethernet
           address <var>E</var>, a logical flow with match <code>ip4.dst ==
-          <var>N</var>/<var>M</var></code>, whose priority is <code>400</code>
-          + the number of 1-bits in <var>M</var> if the router port is not a
-          distributed gateway port, else the priority is the number of
+          <var>N</var>/<var>M</var></code>, whose priority is the number of
           1-bits in <var>M</var>, has the following actions:
         </p>
 
@@ -2910,11 +2911,15 @@ icmp4 {
     <ul>
       <li>
         For each NAT rule in the OVN Northbound database that can
-        be handled in a distributed manner, a priority-200 logical
+        be handled in a distributed manner, a priority-100 logical
         flow with match <code>ip4.src == <var>B</var> &amp;&amp;
-        outport == <var>GW</var></code>, where <var>GW</var> is
-        the logical router distributed gateway port, with actions
-        <code>next;</code>.
+        outport == <var>GW</var></code> &amp;&amp;
+        is_chassis_resident(<var>P</var>), where <var>GW</var> is
+        the logical router distributed gateway port and <var>P</var>
+        is the NAT logical port. IP traffic matching the above rule
+        will be managed locally setting <code>reg1</code> to <var>C</var>
+        and <code>eth.src</code> to <var>D</var>, where <var>C</var> is NAT
+        external ip and <var>D</var> is NAT external mac.
       </li>
 
       <li>

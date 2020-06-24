@@ -1978,6 +1978,10 @@ parse_gen_opt(struct action_context *ctx, struct ovnact_gen_option *o,
         return;
     }
 
+    if (!strcmp(o->option->type, "host_id")) {
+        return;
+    }
+
     if (!strcmp(o->option->type, "str")) {
         if (o->value.type != EXPR_C_STRING) {
             lexer_error(ctx->lexer, "%s option %s requires string value.",
@@ -2305,6 +2309,14 @@ encode_put_dhcpv4_option(const struct ovnact_gen_option *o,
     } else if (!strcmp(o->option->type, "str")) {
         opt_header[1] = strlen(c->string);
         ofpbuf_put(ofpacts, c->string, opt_header[1]);
+    } else if (!strcmp(o->option->type, "host_id")) {
+        if (o->value.type == EXPR_C_STRING) {
+            opt_header[1] = strlen(c->string);
+            ofpbuf_put(ofpacts, c->string, opt_header[1]);
+        } else {
+           opt_header[1] = sizeof(ovs_be32);
+           ofpbuf_put(ofpacts, &c->value.ipv4, sizeof(ovs_be32));
+        }
     }
 }
 
@@ -2535,6 +2547,12 @@ parse_put_nd_ra_opts(struct action_context *ctx, const struct expr_field *dst,
             }
             break;
 
+        case ND_RA_FLAG_PRF:
+            ok = (c->string && (!strcmp(c->string, "MEDIUM") ||
+                                !strcmp(c->string, "HIGH") ||
+                                !strcmp(c->string, "LOW")));
+            break;
+
         case ND_OPT_SOURCE_LINKADDR:
             ok = c->format == LEX_F_ETHERNET;
             slla_present = true;
@@ -2589,9 +2607,22 @@ encode_put_nd_ra_option(const struct ovnact_gen_option *o,
     {
         struct ovs_ra_msg *ra = ofpbuf_at(ofpacts, ra_offset, sizeof *ra);
         if (!strcmp(c->string, "dhcpv6_stateful")) {
-            ra->mo_flags = IPV6_ND_RA_FLAG_MANAGED_ADDR_CONFIG;
+            ra->mo_flags |= IPV6_ND_RA_FLAG_MANAGED_ADDR_CONFIG;
         } else if (!strcmp(c->string, "dhcpv6_stateless")) {
-            ra->mo_flags = IPV6_ND_RA_FLAG_OTHER_ADDR_CONFIG;
+            ra->mo_flags |= IPV6_ND_RA_FLAG_OTHER_ADDR_CONFIG;
+        }
+        break;
+    }
+
+    case ND_RA_FLAG_PRF:
+    {
+        struct ovs_ra_msg *ra = ofpbuf_at(ofpacts, ra_offset, sizeof *ra);
+        if (!strcmp(c->string, "LOW")) {
+            ra->mo_flags |= IPV6_ND_RA_OPT_PRF_LOW;
+        } else if (!strcmp(c->string, "HIGH")) {
+            ra->mo_flags |= IPV6_ND_RA_OPT_PRF_HIGH;
+        } else {
+            ra->mo_flags |= IPV6_ND_RA_OPT_PRF_NORMAL;
         }
         break;
     }
@@ -2670,6 +2701,12 @@ encode_PUT_ND_RA_OPTS(const struct ovnact_put_opts *po,
     for (const struct ovnact_gen_option *o = po->options;
          o < &po->options[po->n_options]; o++) {
         encode_put_nd_ra_option(o, ofpacts, ra_offset);
+    }
+
+    /* RFC4191 section 2.2 */
+    struct ovs_ra_msg *new_ra = ofpbuf_at(ofpacts, ra_offset, sizeof *new_ra);
+    if (ntohs(new_ra->router_lifetime) == 0) {
+        new_ra->mo_flags &= IPV6_ND_RA_OPT_PRF_RESET_MASK;
     }
 
     encode_finish_controller_op(oc_offset, ofpacts);

@@ -2747,12 +2747,28 @@ ADD_VETH(alice1, alice1, br-int, "172.16.1.2/24", "f0:00:00:01:02:05", \
 ovn-nbctl lsp-add alice alice1 \
 -- lsp-set-addresses alice1 "f0:00:00:01:02:05 172.16.1.2"
 
+# Add external network
+ADD_NAMESPACES(ext-net)
+AT_CHECK([ip link add alice-ext netns alice1 type veth peer name ext-veth netns ext-net])
+NS_CHECK_EXEC([ext-net], [ip link set dev ext-veth up], [0], [])
+NS_CHECK_EXEC([ext-net], [ip addr add 10.0.0.1/24 dev ext-veth], [0], [])
+NS_CHECK_EXEC([ext-net], [ip route add default via 10.0.0.2], [0], [])
+
+NS_CHECK_EXEC([alice1], [ip link set dev alice-ext up], [0], [])
+NS_CHECK_EXEC([alice1], [ip addr add 10.0.0.2/24 dev alice-ext], [0], [])
+NS_CHECK_EXEC([alice1], [sysctl -w net.ipv4.conf.all.forwarding=1],[0], [dnl
+net.ipv4.conf.all.forwarding = 1
+])
+
 # Add DNAT rules
 AT_CHECK([ovn-nbctl lr-nat-add R1 dnat_and_snat 172.16.1.3 192.168.1.2 foo1 00:00:02:02:03:04])
 AT_CHECK([ovn-nbctl lr-nat-add R1 dnat_and_snat 172.16.1.4 192.168.1.3 foo2 00:00:02:02:03:05])
 
 # Add a SNAT rule
 AT_CHECK([ovn-nbctl lr-nat-add R1 snat 172.16.1.1 192.168.0.0/16])
+
+# Add default route to ext-net
+AT_CHECK([ovn-nbctl lr-route-add R1 10.0.0.0/24 172.16.1.2])
 
 ovn-nbctl --wait=hv sync
 OVS_WAIT_UNTIL([ovs-ofctl dump-flows br-int | grep 'nat(src=172.16.1.1)'])
@@ -2795,6 +2811,20 @@ NS_CHECK_EXEC([bar1], [ping -q -c 3 -i 0.3 -w 2 172.16.1.2 | FORMAT_PING], \
 AT_CHECK([ovs-appctl dpctl/dump-conntrack | FORMAT_CT(172.16.1.1) | \
 sed -e 's/zone=[[0-9]]*/zone=<cleared>/'], [0], [dnl
 icmp,orig=(src=192.168.2.2,dst=172.16.1.2,id=<cleared>,type=8,code=0),reply=(src=172.16.1.2,dst=172.16.1.1,id=<cleared>,type=0,code=0),zone=<cleared>
+])
+
+# Try to ping external network
+NS_CHECK_EXEC([ext-net], [tcpdump -n -c 3 -i ext-veth dst 172.16.1.3 and icmp > ext-net.pcap &])
+sleep 1
+AT_CHECK([ovn-nbctl lr-nat-del R1 snat])
+NS_CHECK_EXEC([foo1], [ping -q -c 3 -i 0.3 -w 2 10.0.0.1 | FORMAT_PING], \
+[0], [dnl
+3 packets transmitted, 3 received, 0% packet loss, time 0ms
+])
+
+OVS_WAIT_UNTIL([
+    total_pkts=$(cat ext-net.pcap | wc -l)
+    test "${total_pkts}" = "3"
 ])
 
 OVS_APP_EXIT_AND_WAIT([ovn-controller])
@@ -3897,6 +3927,24 @@ ovn-nbctl acl-add pg0 to-lport 1002 "outport == @pg0 && ip4 && ip4.src == 0.0.0.
 ovn-nbctl --log acl-add pg0 to-lport 1004 "inport == @pg0 && ip && tcp && tcp.dst == 84" reject
 ovn-nbctl --log acl-add pg0 to-lport 1004 "inport == @pg0 && ip && udp && udp.dst == 94" reject
 
+ovn-nbctl ls-add sw1
+ovn-nbctl lsp-add sw1 sw1-p1-rej
+ovn-nbctl lsp-set-addresses sw1-p1-rej "40:54:00:00:00:03 20.0.0.3"
+ovn-nbctl lsp-set-port-security sw1-p1-rej "40:54:00:00:00:03 20.0.0.3"
+
+ovn-nbctl lr-add lr0
+ovn-nbctl lrp-add lr0 lr0-sw0 00:00:00:00:ff:01 10.0.0.1/24
+ovn-nbctl lsp-add sw0 sw0-lr0
+ovn-nbctl lsp-set-type sw0-lr0 router
+ovn-nbctl lsp-set-addresses sw0-lr0 router
+ovn-nbctl lsp-set-options sw0-lr0 router-port=lr0-sw0
+
+ovn-nbctl lrp-add lr0 lr0-sw1 00:00:00:00:ff:02 20.0.0.1/24
+ovn-nbctl lsp-add sw1 sw1-lr0
+ovn-nbctl lsp-set-type sw1-lr0 router
+ovn-nbctl lsp-set-addresses sw1-lr0 router
+ovn-nbctl lsp-set-options sw1-lr0 router-port=lr0-sw1
+
 OVN_POPULATE_ARP
 ovn-nbctl --wait=hv sync
 
@@ -3910,6 +3958,10 @@ ADD_VETH(sw0-p2-rej, sw0-p2-rej, br-int, "10.0.0.4/24", "50:54:00:00:00:04", \
 
 NS_CHECK_EXEC([sw0-p1-rej], [ip a a aef0::3/64 dev sw0-p1-rej], [0])
 NS_CHECK_EXEC([sw0-p2-rej], [ip a a aef0::4/64 dev sw0-p2-rej], [0])
+
+ADD_NAMESPACES(sw1-p1-rej)
+ADD_VETH(sw1-p1-rej, sw1-p1-rej, br-int, "20.0.0.3/24", "40:54:00:00:00:03", \
+         "20.0.0.1")
 
 sleep 1
 
@@ -3963,11 +4015,21 @@ OVS_WAIT_UNTIL([
     test "${total}" = "2"
 ])
 
+ovn-nbctl acl-add sw1 from-lport 1004 "ip" allow-related
+ovn-nbctl acl-add sw1 to-lport 1004 "ip" allow-related
+ovn-nbctl --log acl-add pg0 to-lport 1004 "outport == @pg0 && ip && tcp && tcp.dst == 84" reject
+
+OVS_WAIT_UNTIL([
+    ip netns exec sw1-p1-rej nc  10.0.0.4 84 2> r
+    res=$(cat r)
+    test "$res" = "Ncat: Connection refused."
+])
+
 # Now test for IPv4 UDP.
 NS_CHECK_EXEC([sw0-p1-rej], [tcpdump -n -c 1 -i sw0-p1-rej udp port 90 > sw0-p1-rej-udp.pcap &], [0])
 NS_CHECK_EXEC([sw0-p1-rej], [tcpdump -n -c 1 -i sw0-p1-rej icmp > sw0-p1-rej-icmp.pcap &], [0])
 
-echo "foo" > foo
+printf '.%.0s' {1..100} > foo
 OVS_WAIT_UNTIL([
     ip netns exec sw0-p1-rej nc -u 10.0.0.4 90 < foo
     c=$(cat sw0-p1-rej-icmp.pcap | grep \

@@ -18,6 +18,10 @@
 #define OVN_BINDING_H 1
 
 #include <stdbool.h>
+#include "openvswitch/shash.h"
+#include "openvswitch/hmap.h"
+#include "openvswitch/uuid.h"
+#include "openvswitch/list.h"
 
 struct hmap;
 struct ovsdb_idl;
@@ -31,6 +35,7 @@ struct ovsrec_open_vswitch_table;
 struct sbrec_chassis;
 struct sbrec_port_binding_table;
 struct sset;
+struct sbrec_port_binding;
 
 struct binding_ctx_in {
     struct ovsdb_idl_txn *ovnsb_idl_txn;
@@ -51,8 +56,69 @@ struct binding_ctx_in {
 
 struct binding_ctx_out {
     struct hmap *local_datapaths;
+    struct shash *local_bindings;
+
+    /* sset of (potential) local lports. */
     struct sset *local_lports;
+    /* Track if local_lports have been updated. */
+    bool local_lports_changed;
+
+    /* sset of local lport ids in the format
+     * <datapath-tunnel-key>_<port-tunnel-key>. */
     struct sset *local_lport_ids;
+    /* Track if local_lport_ids has been updated. */
+    bool local_lport_ids_changed;
+
+    /* Track if non-vif port bindings (e.g., patch, external) have been
+     * added/deleted.
+     */
+    bool non_vif_ports_changed;
+
+    struct sset *egress_ifaces;
+    /* smap of OVS interface name as key and
+     * OVS interface external_ids:iface-id as value. */
+    struct smap *local_iface_ids;
+
+    /* hmap of 'struct tracked_binding_datapath' which the
+     * callee (binding_handle_ovs_interface_changes and
+     * binding_handle_port_binding_changes) fills in for
+     * the changed datapaths and port bindings. */
+    struct hmap *tracked_dp_bindings;
+};
+
+enum local_binding_type {
+    BT_VIF,
+    BT_CONTAINER,
+    BT_VIRTUAL
+};
+
+struct local_binding {
+    char *name;
+    enum local_binding_type type;
+    const struct ovsrec_interface *iface;
+    const struct sbrec_port_binding *pb;
+
+    /* shash of 'struct local_binding' representing children. */
+    struct shash children;
+};
+
+static inline struct local_binding *
+local_binding_find(struct shash *local_bindings, const char *name)
+{
+    return shash_find_data(local_bindings, name);
+}
+
+/* Represents a tracked binding logical port. */
+struct tracked_binding_lport {
+    const struct sbrec_port_binding *pb;
+};
+
+/* Represent a tracked binding datapath. */
+struct tracked_binding_datapath {
+    struct hmap_node node;
+    const struct sbrec_datapath_binding *dp;
+    bool is_new;
+    struct shash lports; /* shash of struct tracked_binding_lport. */
 };
 
 void binding_register_ovs_idl(struct ovsdb_idl *);
@@ -60,11 +126,12 @@ void binding_run(struct binding_ctx_in *, struct binding_ctx_out *);
 bool binding_cleanup(struct ovsdb_idl_txn *ovnsb_idl_txn,
                      const struct sbrec_port_binding_table *,
                      const struct sbrec_chassis *);
-bool binding_evaluate_port_binding_changes(
-        const struct sbrec_port_binding_table *,
-        const struct ovsrec_bridge *br_int,
-        const struct sbrec_chassis *,
-        struct sset *active_tunnels,
-        struct sset *local_lports);
 
+void local_bindings_init(struct shash *local_bindings);
+void local_bindings_destroy(struct shash *local_bindings);
+bool binding_handle_ovs_interface_changes(struct binding_ctx_in *,
+                                          struct binding_ctx_out *);
+bool binding_handle_port_binding_changes(struct binding_ctx_in *,
+                                         struct binding_ctx_out *);
+void binding_tracked_dp_destroy(struct hmap *tracked_datapaths);
 #endif /* controller/binding.h */

@@ -424,7 +424,7 @@ populate_remote_chassis_macs(const struct sbrec_chassis *my_chassis,
         }
 
         const char *tokens
-            = get_chassis_mac_mappings(&chassis->external_ids);
+            = get_chassis_mac_mappings(&chassis->other_config);
 
         if (!strlen(tokens)) {
             continue;
@@ -765,12 +765,18 @@ put_local_common_flows(uint32_t dp_key, uint32_t port_key,
      *   - or if the destination is a nested container
      *   - or if "nested_container" flag is set and the destination is the
      *     parent port,
-     * temporarily set the in_port to zero, resubmit to
+     * temporarily set the in_port to OFPP_NONE, resubmit to
      * table 65 for logical-to-physical translation, then restore
      * the port number.
      *
      * If 'parent_port_key' is set, then the 'port_key' represents a nested
-     * container. */
+     * container.
+     *
+     * Note:We can set in_port to 0 too. But if recirculation happens
+     * later (eg. clone action to enter peer pipeline and a subsequent
+     * ct action), ovs-vswitchd will drop the packet if the frozen metadata
+     * in_port is 0.
+     * */
 
     bool nested_container = parent_port_key ? true: false;
     match_init_catchall(&match);
@@ -783,7 +789,7 @@ put_local_common_flows(uint32_t dp_key, uint32_t port_key,
     }
 
     put_stack(MFF_IN_PORT, ofpact_put_STACK_PUSH(ofpacts_p));
-    put_load(0, MFF_IN_PORT, 0, 16, ofpacts_p);
+    put_load(ofp_to_u16(OFPP_NONE), MFF_IN_PORT, 0, 16, ofpacts_p);
     put_resubmit(OFTABLE_LOG_TO_PHY, ofpacts_p);
     put_stack(MFF_IN_PORT, ofpact_put_STACK_POP(ofpacts_p));
     ofctrl_add_flow(flow_table, OFTABLE_SAVE_INPORT, 100, 0,
@@ -792,8 +798,8 @@ put_local_common_flows(uint32_t dp_key, uint32_t port_key,
     if (nested_container) {
         /* It's a nested container and when the packet from the nested
          * container is to be sent to the parent port, "nested_container"
-         * flag will be set. We need to temporarily set the in_port to zero
-         * as mentioned in the comment above.
+         * flag will be set. We need to temporarily set the in_port to
+         * OFPP_NONE as mentioned in the comment above.
          *
          * If a parent port has multiple child ports, then this if condition
          * will be hit multiple times, but we want to add only one flow.
@@ -814,7 +820,7 @@ put_local_common_flows(uint32_t dp_key, uint32_t port_key,
                              MLF_NESTED_CONTAINER, MLF_NESTED_CONTAINER);
 
         put_stack(MFF_IN_PORT, ofpact_put_STACK_PUSH(ofpacts_p));
-        put_load(0, MFF_IN_PORT, 0, 16, ofpacts_p);
+        put_load(ofp_to_u16(OFPP_NONE), MFF_IN_PORT, 0, 16, ofpacts_p);
         put_resubmit(OFTABLE_LOG_TO_PHY, ofpacts_p);
         put_stack(MFF_IN_PORT, ofpact_put_STACK_POP(ofpacts_p));
         ofctrl_check_and_add_flow(flow_table, OFTABLE_SAVE_INPORT, 100, 0,
@@ -1517,7 +1523,7 @@ physical_run(struct physical_ctx *p_ctx,
                 /*
                  * We split the tunnel_id to get the chassis-id
                  * and hash the tunnel list on the chassis-id. The
-                 * reason to use the chassis-id alone is because 
+                 * reason to use the chassis-id alone is because
                  * there might be cases (multicast, gateway chassis)
                  * where we need to tunnel to the chassis, but won't
                  * have the encap-ip specifically.
@@ -1778,6 +1784,59 @@ physical_run(struct physical_ctx *p_ctx,
     ofpbuf_uninit(&ofpacts);
 
     simap_destroy(&new_tunnel_to_ofport);
+}
+
+bool
+physical_handle_ovs_iface_changes(struct physical_ctx *p_ctx,
+                                  struct ovn_desired_flow_table *flow_table)
+{
+    const struct ovsrec_interface *iface_rec;
+    OVSREC_INTERFACE_TABLE_FOR_EACH_TRACKED (iface_rec, p_ctx->iface_table) {
+        if (!strcmp(iface_rec->type, "geneve") ||
+            !strcmp(iface_rec->type, "patch") ||
+            !strcmp(iface_rec->type, "vxlan") ||
+            !strcmp(iface_rec->type, "stt")) {
+            return false;
+        }
+    }
+
+    struct ofpbuf ofpacts;
+    ofpbuf_init(&ofpacts, 0);
+
+    OVSREC_INTERFACE_TABLE_FOR_EACH_TRACKED (iface_rec, p_ctx->iface_table) {
+        const char *iface_id = smap_get(&iface_rec->external_ids, "iface-id");
+        if (!iface_id) {
+            continue;
+        }
+
+        const struct local_binding *lb =
+            local_binding_find(p_ctx->local_bindings, iface_id);
+
+        if (!lb || !lb->pb) {
+            continue;
+        }
+
+        int64_t ofport = iface_rec->n_ofport ? *iface_rec->ofport : 0;
+        if (ovsrec_interface_is_deleted(iface_rec)) {
+            ofctrl_remove_flows(flow_table, &lb->pb->header_.uuid);
+            simap_find_and_delete(&localvif_to_ofport, iface_id);
+        } else {
+            if (!ovsrec_interface_is_new(iface_rec)) {
+                ofctrl_remove_flows(flow_table, &lb->pb->header_.uuid);
+            }
+
+            simap_put(&localvif_to_ofport, iface_id, ofport);
+            consider_port_binding(p_ctx->sbrec_port_binding_by_name,
+                                  p_ctx->mff_ovn_geneve, p_ctx->ct_zones,
+                                  p_ctx->active_tunnels,
+                                  p_ctx->local_datapaths,
+                                  lb->pb, p_ctx->chassis,
+                                  flow_table, &ofpacts);
+        }
+    }
+
+    ofpbuf_uninit(&ofpacts);
+    return true;
 }
 
 bool

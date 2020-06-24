@@ -45,7 +45,8 @@ SYSTEM_USERSPACE_TESTSUITE_AT = \
 
 SYSTEM_TESTSUITE_AT = \
 	tests/system-common-macros.at \
-	tests/system-ovn.at
+	tests/system-ovn.at \
+	tests/system-ovn-kmod.at
 
 check_SCRIPTS += tests/atlocal
 
@@ -127,7 +128,8 @@ $(valgrind_wrappers): tests/valgrind-wrapper.in
 CLEANFILES += $(valgrind_wrappers)
 EXTRA_DIST += tests/valgrind-wrapper.in
 
-VALGRIND = valgrind --log-file=valgrind.%p --leak-check=full \
+VALGRIND = valgrind --log-file=valgrind.%p \
+	--leak-check=full --track-origins=yes \
 	--suppressions=$(abs_top_srcdir)/tests/glibc.supp \
 	--suppressions=$(abs_top_srcdir)/tests/openssl.supp --num-callers=20
 HELGRIND = valgrind --log-file=helgrind.%p --tool=helgrind \
@@ -200,7 +202,8 @@ tests_ovstest_SOURCES = \
 	tests/ovstest.h \
 	tests/test-ovn.c
 
-tests_ovstest_LDADD = $(OVS_LIBDIR)/libopenvswitch.la lib/libovn.la
+tests_ovstest_LDADD = $(OVS_LIBDIR)/daemon.lo \
+    $(OVS_LIBDIR)/libopenvswitch.la lib/libovn.la
 
 # Python tests.
 CHECK_PYFILES = \

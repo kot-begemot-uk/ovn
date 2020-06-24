@@ -149,6 +149,10 @@ struct engine_node {
      * doesn't store pointers to DB records it's still safe to use).
      */
     bool (*is_valid)(struct engine_node *);
+
+    /* Method to clear up tracked data maintained by the engine node in the
+     * engine 'data'. It may be NULL. */
+    void (*clear_tracked_data)(void *tracked_data);
 };
 
 /* Initialize the data for the engine nodes. It calls each node's
@@ -259,6 +263,13 @@ struct ed_type_ovsdb_table {
 struct ovsdb_idl_index * engine_ovsdb_node_get_index(struct engine_node *,
                                                      const char *name);
 
+/* Any engine node can use this function for no-op handlers. */
+static inline bool
+engine_noop_handler(struct engine_node *node OVS_UNUSED, void *data OVS_UNUSED)
+{
+    return true;
+}
+
 /* Adds an OVSDB IDL index to the node. This should be called only after
  * engine_init() as the index is stored in the node data.
  */
@@ -275,6 +286,7 @@ void engine_ovsdb_node_add_index(struct engine_node *, const char *name,
         .run = en_##NAME##_run, \
         .cleanup = en_##NAME##_cleanup, \
         .is_valid = en_##NAME##_is_valid, \
+        .clear_tracked_data = NULL, \
     };
 
 #define ENGINE_NODE_CUSTOM_DATA(NAME, NAME_STR) \
@@ -283,6 +295,10 @@ void engine_ovsdb_node_add_index(struct engine_node *, const char *name,
 #define ENGINE_NODE(NAME, NAME_STR) \
     static bool (*en_##NAME##_is_valid)(struct engine_node *node) = NULL; \
     ENGINE_NODE_DEF(NAME, NAME_STR)
+
+#define ENGINE_NODE_WITH_CLEAR_TRACK_DATA(NAME, NAME_STR) \
+    ENGINE_NODE(NAME, NAME_STR) \
+    en_##NAME.clear_tracked_data = en_##NAME##_clear_tracked_data;
 
 /* Macro to define member functions of an engine node which represents
  * a table of OVSDB */
