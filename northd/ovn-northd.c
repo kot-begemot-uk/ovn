@@ -10697,6 +10697,9 @@ static void *build_lrouter_flows_od_thread(void *arg) {
 
     while (!seize_fire()) {
         sem_wait(&control->fire);
+        if (seize_fire()) {
+            return NULL;
+        }
         workload = (struct lrouter_thread_od_pool *) control->workload;
         lfbi = (struct lrouter_flow_build_info *) control->data;
         if (lfbi && workload) {
@@ -10735,6 +10738,9 @@ static void *build_lrouter_flows_op_thread(void *arg) {
 
     while (!seize_fire()) {
         sem_wait(&control->fire);
+        if (seize_fire()) {
+            return NULL;
+        }
         workload = (struct lrouter_thread_op_pool *) control->workload;
         lfbi = (struct lrouter_flow_build_info *) control->data;
         if (lfbi && workload) {
@@ -10899,6 +10905,9 @@ static void *reconciliation_thread(void *arg) {
 
     while (!seize_fire()) {
         sem_wait(&control->fire);
+        if (seize_fire()) {
+            return NULL;
+        }
         workload = (struct lflow_reconciliation_pool *) control->workload;
         ri = (struct reconcile_info *) control->data;
         if (ri && workload) {
@@ -10958,7 +10967,7 @@ static void init_reconciliation_pool(void) {
     }
 }
 
-#define RECONCILE_CUTOFF 1
+#define RECONCILE_CUTOFF UINT64_MAX
 
 static ssize_t max_seen_lflow_size = 1;
 
