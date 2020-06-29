@@ -4001,7 +4001,9 @@ static void
 ovn_lflow_destroy(struct hmap *lflows, struct ovn_lflow *lflow)
 {
     if (lflow) {
-        hmap_remove(lflows, &lflow->hmap_node);
+        if (lflows) {
+            hmap_remove(lflows, &lflow->hmap_node);
+        }
         free(lflow->match);
         free(lflow->actions);
         free(lflow->stage_hint);
@@ -10884,6 +10886,7 @@ struct sbrec_result {
     struct ovs_list list_node;
     const struct sbrec_logical_flow *sbflow;
     struct ovn_lflow *lflow;
+    ssize_t lflow_hash;
 };
 
 struct reconcile_info {
@@ -10933,7 +10936,8 @@ static void *reconciliation_thread(void *arg) {
                     sbflow->priority, sbflow->match, sbflow->actions, sbflow->hash);
                 if (lflow) {
                     res->lflow = lflow;
-                    res->sbflow = NULL;
+                    res->lflow_hash = lflow->hmap_node.hash;
+                    res->sbflow = sbflow;
                 } else {
                     res->sbflow = sbflow;
                     res->lflow = NULL;
@@ -10967,7 +10971,33 @@ static void init_reconciliation_pool(void) {
     }
 }
 
-#define RECONCILE_CUTOFF UINT64_MAX
+#define RECONCILE_CUTOFF 1024
+
+/* Removes 'node' from 'hmap' if present. Does not shrink the hash table; call
+ * hmap_shrink() directly if desired. 
+ * Returns true if the node was found and removed, false otherwise.
+ * It needs both a node and a hash in order to function even if the node
+ * has already been freed.
+ */
+static bool
+hmap_safe_remove(struct hmap *hmap, struct hmap_node *node, size_t hash)
+{
+    struct hmap_node **bucket = &hmap->buckets[hash & hmap->mask];
+
+    if (!node) {
+        return false;
+    }
+
+    while ((*bucket) && (*bucket != node)) {
+        bucket = &(*bucket)->next;
+    }
+    if (*bucket) {
+        *bucket = node->next;
+        hmap->n--;
+        return true;
+    }
+    return false;
+}
 
 static ssize_t max_seen_lflow_size = 1;
 
@@ -11046,10 +11076,9 @@ build_lflows(struct northd_context *ctx, struct hmap *datapaths,
 
         struct sbrec_result *res;
         LIST_FOR_EACH_POP (res, list_node, combined_result) {
-            if (res->lflow) {
-                ovn_lflow_destroy(&lflows, res->lflow);
-            }
-            if (res->sbflow) {
+            if (hmap_safe_remove(&lflows, &res->lflow->hmap_node, res->lflow_hash)) {
+                ovn_lflow_destroy(NULL, res->lflow);
+            } else {
                 sbrec_logical_flow_delete(res->sbflow);
             }
             free(res);
