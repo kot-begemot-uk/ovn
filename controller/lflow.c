@@ -476,6 +476,7 @@ lflow_handle_changed_ref(enum ref_type ref_type, const char *ref_name,
         ovs_list_remove(&lrln->ref_list);
         free(lrln);
     }
+    free(rlfn->ref_name);
     free(rlfn);
 
     dhcp_opts_destroy(&dhcp_opts);
@@ -566,7 +567,9 @@ consider_logical_flow(const struct sbrec_logical_flow *lflow,
     struct sset port_groups_ref = SSET_INITIALIZER(&port_groups_ref);
     expr = expr_parse_string(lflow->match, &symtab, l_ctx_in->addr_sets,
                              l_ctx_in->port_groups,
-                             &addr_sets_ref, &port_groups_ref, &error);
+                             &addr_sets_ref, &port_groups_ref,
+                             lflow->logical_datapath->tunnel_key,
+                             &error);
     const char *addr_set_name;
     SSET_FOR_EACH (addr_set_name, &addr_sets_ref) {
         lflow_resource_add(l_ctx_out->lfrr, REF_TYPE_ADDRSET, addr_set_name,
@@ -912,6 +915,7 @@ lflow_add_flows_for_datapath(const struct sbrec_datapath_binding *dp,
             break;
         }
     }
+    sbrec_logical_flow_index_destroy_row(lf_row);
 
     dhcp_opts_destroy(&dhcp_opts);
     dhcp_opts_destroy(&dhcpv6_opts);

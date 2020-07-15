@@ -889,7 +889,8 @@ read_flows(void)
         char *error;
         struct expr *match;
         match = expr_parse_string(sblf->match, &symtab, &address_sets,
-                                  &port_groups, NULL, NULL, &error);
+                                  &port_groups, NULL, NULL, dp->tunnel_key,
+                                  &error);
         if (error) {
             VLOG_WARN("%s: parsing expression failed (%s)",
                       sblf->match, error);
@@ -2080,7 +2081,12 @@ execute_ovnfield_load(const struct ovnact_load *load,
                              ntohs(load->imm.value.be16_int));
         break;
     }
-
+    case OVN_ICMP6_FRAG_MTU: {
+        ovntrace_node_append(super, OVNTRACE_NODE_MODIFY,
+                             "icmp6.frag_mtu = %u",
+                             ntohs(load->imm.value.be16_int));
+        break;
+    }
     case OVN_FIELD_N_IDS:
     default:
         OVS_NOT_REACHED();
@@ -2267,6 +2273,11 @@ trace_actions(const struct ovnact *ovnacts, size_t ovnacts_len,
         case OVNACT_ICMP6:
             execute_icmp6(ovnact_get_ICMP6(a), dp, uflow, table_id, pipeline,
                           super);
+            break;
+
+        case OVNACT_ICMP6_ERROR:
+            execute_icmp6(ovnact_get_ICMP6_ERROR(a), dp, uflow, table_id,
+                          pipeline, super);
             break;
 
         case OVNACT_IGMP:

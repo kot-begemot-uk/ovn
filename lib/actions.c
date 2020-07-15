@@ -242,7 +242,7 @@ add_prerequisite(struct action_context *ctx, const char *prerequisite)
     char *error;
 
     expr = expr_parse_string(prerequisite, ctx->pp->symtab, NULL, NULL,
-                             NULL, NULL, &error);
+                             NULL, NULL, 0, &error);
     ovs_assert(!error);
     ctx->prereqs = expr_combine(EXPR_T_AND, ctx->prereqs, expr);
 }
@@ -1409,6 +1409,12 @@ parse_ICMP6(struct action_context *ctx)
 }
 
 static void
+parse_ICMP6_ERROR(struct action_context *ctx)
+{
+    parse_nested_action(ctx, OVNACT_ICMP6_ERROR, "ip6");
+}
+
+static void
 parse_TCP_RESET(struct action_context *ctx)
 {
     parse_nested_action(ctx, OVNACT_TCP_RESET, "tcp");
@@ -1469,6 +1475,12 @@ static void
 format_ICMP6(const struct ovnact_nest *nest, struct ds *s)
 {
     format_nested_action(nest, "icmp6", s);
+}
+
+static void
+format_ICMP6_ERROR(const struct ovnact_nest *nest, struct ds *s)
+{
+    format_nested_action(nest, "icmp6_error", s);
 }
 
 static void
@@ -1580,6 +1592,14 @@ encode_ICMP6(const struct ovnact_nest *on,
              struct ofpbuf *ofpacts)
 {
     encode_nested_actions(on, ep, ACTION_OPCODE_ICMP, ofpacts);
+}
+
+static void
+encode_ICMP6_ERROR(const struct ovnact_nest *on,
+                   const struct ovnact_encode_params *ep,
+                   struct ofpbuf *ofpacts)
+{
+    encode_nested_actions(on, ep, ACTION_OPCODE_ICMP6_ERROR, ofpacts);
 }
 
 static void
@@ -1982,7 +2002,8 @@ parse_gen_opt(struct action_context *ctx, struct ovnact_gen_option *o,
         return;
     }
 
-    if (!strcmp(o->option->type, "str")) {
+    if (!strcmp(o->option->type, "str") ||
+        !strcmp(o->option->type, "domains")) {
         if (o->value.type != EXPR_C_STRING) {
             lexer_error(ctx->lexer, "%s option %s requires string value.",
                         opts_type, o->option->name);
@@ -2317,6 +2338,90 @@ encode_put_dhcpv4_option(const struct ovnact_gen_option *o,
            opt_header[1] = sizeof(ovs_be32);
            ofpbuf_put(ofpacts, &c->value.ipv4, sizeof(ovs_be32));
         }
+    } else if (!strcmp(o->option->type, "domains")) {
+        /* Please refer to RFC 1035, section 4.1.4 for the format of encoding
+         * domain names. Below is an example for encoding a search list
+         * consisting of the "abc.com" and "xyz.abc.com".
+         *
+         * +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
+         * |119|14 | 3 |'a'|'b'|'c'| 3 |'c'|'o'|'m'| 0 |'x'|'y'|'z'|xC0|x00|
+         * +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
+         *
+         * The encoding of "abc.com" ends with 0 to mark the end of the
+         * domain name as required by RFC 1035.
+         *
+         * The encoding of "xyz" (for "xyz.abc.com") ends with the two-octet
+         * compression pointer C000 (hex), which points to offset 0 where
+         * another validly encoded domain name can be found to complete
+         * the name ("abc.com").
+         *
+         * Encoding adds 2 bytes (one for length and one for delimiter) for
+         * every domain name that is unique. If all the domain names are unique
+         * (which probably never happens in real world), then encoded string
+         * could be longer than the original string. Just to be on the safer
+         * side, allocate the (approx.) worst case length here.
+         */
+        uint8_t *dns_encoded = xzalloc(2 * strlen(c->string));
+        uint16_t encode_offset = 0;
+        struct shash label_offset_map = SHASH_INITIALIZER(&label_offset_map);
+        char *domain_list = xstrdup(c->string), *dom_ptr = NULL;
+        char *suffix = xzalloc(strlen(domain_list));
+        for (char *domain = strtok_r(domain_list, ",", &dom_ptr);
+             domain != NULL;
+             domain = strtok_r(NULL, ",", &dom_ptr)) {
+            if (strlen(domain) > DOMAIN_NAME_MAX_LEN) {
+                VLOG_WARN("Domain names longer than 255 characters are not"
+                          "supported");
+                goto out;
+            }
+            ovs_strlcpy(suffix, domain, strlen(domain));
+            char *label;
+            for (label = strtok_r(domain, ".", &domain);
+                 label != NULL;
+                 label = strtok_r(NULL, ".", &domain)) {
+                /* Check if we have already encoded this suffix.
+                 * If yes, fill in the reference and break. */
+                uint16_t *get_offset;
+                get_offset  = shash_find_data(&label_offset_map, suffix);
+                if (get_offset != NULL) {
+                    ovs_be16 temp = htons(0xc000) | htons(*get_offset);
+                    memcpy(dns_encoded + encode_offset, &temp,
+                        sizeof(temp));
+                    encode_offset += sizeof(temp);
+                    break;
+                } else {
+                    /* The suffix was not encoded before, encode it now
+                     * and add the offset to the label_offset_map. */
+                    uint16_t *set_offset = xzalloc(sizeof(uint16_t));
+                    *set_offset = encode_offset;
+                    shash_add_once(&label_offset_map, suffix, set_offset);
+
+                    uint8_t len = strlen(label);
+                    memcpy(dns_encoded + encode_offset, &len, sizeof(uint8_t));
+                    encode_offset += sizeof(uint8_t);
+                    memcpy(dns_encoded + encode_offset, label, len);
+                    encode_offset += len;
+                }
+                if (domain != NULL) {
+                    ovs_strlcpy(suffix, domain, strlen(domain));
+                }
+            }
+            /* Add the end marker (0 byte) to determine the end of the
+             * domain. */
+            if (label == NULL) {
+                uint8_t end = 0;
+                memcpy(dns_encoded + encode_offset, &end, sizeof(uint8_t));
+                encode_offset += sizeof(uint8_t);
+            }
+        }
+        opt_header[1] = encode_offset;
+        ofpbuf_put(ofpacts, dns_encoded, encode_offset);
+
+        out:
+            free(suffix);
+            free(domain_list);
+            free(dns_encoded);
+            shash_destroy_free_data(&label_offset_map);
     }
 }
 
@@ -2951,6 +3056,7 @@ format_OVNFIELD_LOAD(const struct ovnact_load *load , struct ds *s)
     const struct ovn_field *f = ovn_field_from_name(load->dst.symbol->name);
     switch (f->id) {
     case OVN_ICMP4_FRAG_MTU:
+    case OVN_ICMP6_FRAG_MTU:
         ds_put_format(s, "%s = %u;", f->name,
                       ntohs(load->imm.value.be16_int));
         break;
@@ -2970,9 +3076,17 @@ encode_OVNFIELD_LOAD(const struct ovnact_load *load,
     switch (f->id) {
     case OVN_ICMP4_FRAG_MTU: {
         size_t oc_offset = encode_start_controller_op(
-            ACTION_OPCODE_PUT_ICMP4_FRAG_MTU, true, NX_CTLR_NO_METER,
-            ofpacts);
+            ACTION_OPCODE_PUT_ICMP4_FRAG_MTU, true,
+            NX_CTLR_NO_METER, ofpacts);
         ofpbuf_put(ofpacts, &load->imm.value.be16_int, sizeof(ovs_be16));
+        encode_finish_controller_op(oc_offset, ofpacts);
+        break;
+    }
+    case OVN_ICMP6_FRAG_MTU: {
+        size_t oc_offset = encode_start_controller_op(
+            ACTION_OPCODE_PUT_ICMP6_FRAG_MTU, true,
+            NX_CTLR_NO_METER, ofpacts);
+        ofpbuf_put(ofpacts, &load->imm.value.be32_int, sizeof(ovs_be32));
         encode_finish_controller_op(oc_offset, ofpacts);
         break;
     }
@@ -3362,6 +3476,8 @@ parse_action(struct action_context *ctx)
         parse_ICMP4_ERROR(ctx);
     } else if (lexer_match_id(ctx->lexer, "icmp6")) {
         parse_ICMP6(ctx);
+    } else if (lexer_match_id(ctx->lexer, "icmp6_error")) {
+        parse_ICMP6_ERROR(ctx);
     } else if (lexer_match_id(ctx->lexer, "igmp")) {
         ovnact_put_IGMP(ctx->ovnacts);
     } else if (lexer_match_id(ctx->lexer, "tcp_reset")) {

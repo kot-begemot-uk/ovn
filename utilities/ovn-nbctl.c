@@ -3511,28 +3511,85 @@ normalize_ipv6_prefix(struct in6_addr ipv6, unsigned int plen)
     }
 }
 
-/* The caller must free the returned string. */
 static char *
-normalize_prefix_str(const char *orig_prefix)
+normalize_ipv4_prefix_str(const char *orig_prefix)
 {
     unsigned int plen;
     ovs_be32 ipv4;
     char *error;
 
     error = ip_parse_cidr(orig_prefix, &ipv4, &plen);
-    if (!error) {
-        return normalize_ipv4_prefix(ipv4, plen);
-    } else {
-        struct in6_addr ipv6;
+    if (error) {
         free(error);
-
-        error = ipv6_parse_cidr(orig_prefix, &ipv6, &plen);
-        if (error) {
-            free(error);
-            return NULL;
-        }
-        return normalize_ipv6_prefix(ipv6, plen);
+        return NULL;
     }
+    return normalize_ipv4_prefix(ipv4, plen);
+}
+
+static char *
+normalize_ipv6_prefix_str(const char *orig_prefix)
+{
+    unsigned int plen;
+    struct in6_addr ipv6;
+    char *error;
+
+    error = ipv6_parse_cidr(orig_prefix, &ipv6, &plen);
+    if (error) {
+        free(error);
+        return NULL;
+    }
+    return normalize_ipv6_prefix(ipv6, plen);
+}
+
+/* The caller must free the returned string. */
+static char *
+normalize_prefix_str(const char *orig_prefix)
+{
+    char *ret;
+
+    ret = normalize_ipv4_prefix_str(orig_prefix);
+    if (!ret) {
+        ret = normalize_ipv6_prefix_str(orig_prefix);
+    }
+    return ret;
+}
+
+static char *
+normalize_ipv4_addr_str(const char *orig_addr)
+{
+    ovs_be32 ipv4;
+
+    if (!ip_parse(orig_addr, &ipv4)) {
+        return NULL;
+    }
+
+    return normalize_ipv4_prefix(ipv4, 32);
+}
+
+static char *
+normalize_ipv6_addr_str(const char *orig_addr)
+{
+    struct in6_addr ipv6;
+
+    if (!ipv6_parse(orig_addr, &ipv6)) {
+        return NULL;
+    }
+
+    return normalize_ipv6_prefix(ipv6, 128);
+}
+
+/* Similar to normalize_prefix_str but must be an un-masked address.
+ * The caller must free the returned string. */
+OVS_UNUSED static char *
+normalize_addr_str(const char *orig_addr)
+{
+    char *ret;
+
+    ret = normalize_ipv4_addr_str(orig_addr);
+    if (!ret) {
+        ret = normalize_ipv6_addr_str(orig_addr);
+    }
+    return ret;
 }
 
 static void
@@ -3793,7 +3850,7 @@ nbctl_lr_route_add(struct ctl_context *ctx)
         ctx->error = error;
         return;
     }
-    char *prefix, *next_hop;
+    char *prefix = NULL, *next_hop = NULL;
 
     const char *policy = shash_find_data(&ctx->options, "--policy");
     bool is_src_route = false;
@@ -3806,35 +3863,24 @@ nbctl_lr_route_add(struct ctl_context *ctx)
         }
     }
 
-    prefix = normalize_prefix_str(ctx->argv[2]);
+    bool v6_prefix = false;
+    prefix = normalize_ipv4_prefix_str(ctx->argv[2]);
+    if (!prefix) {
+        prefix = normalize_ipv6_prefix_str(ctx->argv[2]);
+        v6_prefix = true;
+    }
     if (!prefix) {
         ctl_error(ctx, "bad prefix argument: %s", ctx->argv[2]);
         return;
     }
 
-    next_hop = normalize_prefix_str(ctx->argv[3]);
+    next_hop = v6_prefix
+        ? normalize_ipv6_addr_str(ctx->argv[3])
+        : normalize_ipv4_addr_str(ctx->argv[3]);
     if (!next_hop) {
-        free(prefix);
-        ctl_error(ctx, "bad next hop argument: %s", ctx->argv[3]);
-        return;
-    }
-
-    if (strchr(prefix, '.')) {
-        ovs_be32 hop_ipv4;
-        if (!ip_parse(ctx->argv[3], &hop_ipv4)) {
-            free(prefix);
-            free(next_hop);
-            ctl_error(ctx, "bad IPv4 nexthop argument: %s", ctx->argv[3]);
-            return;
-        }
-    } else {
-        struct in6_addr hop_ipv6;
-        if (!ipv6_parse(ctx->argv[3], &hop_ipv6)) {
-            free(prefix);
-            free(next_hop);
-            ctl_error(ctx, "bad IPv6 nexthop argument: %s", ctx->argv[3]);
-            return;
-        }
+        ctl_error(ctx, "bad %s nexthop argument: %s",
+                  v6_prefix ? "IPv6" : "IPv4", ctx->argv[3]);
+        goto cleanup;
     }
 
     bool may_exist = shash_find(&ctx->options, "--may-exist") != NULL;
@@ -3870,10 +3916,8 @@ nbctl_lr_route_add(struct ctl_context *ctx)
             if (!may_exist) {
                 ctl_error(ctx, "duplicate prefix: %s (policy: %s)",
                           prefix, is_src_route ? "src-ip" : "dst-ip");
-                free(next_hop);
                 free(rt_prefix);
-                free(prefix);
-                return;
+                goto cleanup;
             }
 
             /* Update the next hop for an existing route. */
@@ -3890,9 +3934,7 @@ nbctl_lr_route_add(struct ctl_context *ctx)
                  nbrec_logical_router_static_route_set_policy(route, policy);
             }
             free(rt_prefix);
-            free(next_hop);
-            free(prefix);
-            return;
+            goto cleanup;
         }
     }
 
@@ -3916,6 +3958,8 @@ nbctl_lr_route_add(struct ctl_context *ctx)
     nbrec_logical_router_set_static_routes(lr, new_routes,
                                            lr->n_static_routes + 1);
     free(new_routes);
+
+cleanup:
     free(next_hop);
     free(prefix);
 }
@@ -4116,6 +4160,7 @@ nbctl_lr_nat_add(struct ctl_context *ctx)
     const char *external_ip = ctx->argv[3];
     const char *logical_ip = ctx->argv[4];
     char *new_logical_ip = NULL;
+    char *new_external_ip = NULL;
     bool is_portrange = shash_find(&ctx->options, "--portrange") != NULL;
 
     char *error = lr_by_name_or_uuid(ctx, ctx->argv[1], true, &lr);
@@ -4131,53 +4176,39 @@ nbctl_lr_nat_add(struct ctl_context *ctx)
         return;
     }
 
-    ovs_be32 ipv4 = 0;
-    unsigned int plen;
-    struct in6_addr ipv6;
     bool is_v6 = false;
-    if (!ip_parse(external_ip, &ipv4)) {
-        if (ipv6_parse(external_ip, &ipv6)) {
-            is_v6 = true;
-        } else {
-            ctl_error(ctx, "%s: Not a valid IPv4 or IPv6 address.",
-                      external_ip);
-            return;
-        }
+
+    new_external_ip = normalize_ipv4_addr_str(external_ip);
+    if (!new_external_ip) {
+        new_external_ip = normalize_ipv6_addr_str(external_ip);
+        is_v6 = true;
+    }
+    if (!new_external_ip) {
+        ctl_error(ctx, "%s: Not a valid IPv4 or IPv6 address.",
+                  external_ip);
+        return;
     }
 
     if (strcmp("snat", nat_type)) {
-        if (is_v6) {
-            if (!ipv6_parse(logical_ip, &ipv6)) {
-                ctl_error(ctx, "%s: Not a valid IPv6 address.", logical_ip);
-                return;
-            }
-        } else {
-            if (!ip_parse(logical_ip, &ipv4)) {
-                ctl_error(ctx, "%s: Not a valid IPv4 address.", logical_ip);
-                return;
-            }
+        new_logical_ip = is_v6
+            ? normalize_ipv6_addr_str(logical_ip)
+            : normalize_ipv4_addr_str(logical_ip);
+        if (!new_logical_ip) {
+            ctl_error(ctx, "%s: Not a valid %s address.", logical_ip,
+                      is_v6 ? "IPv6" : "IPv4");
         }
-        new_logical_ip = xstrdup(logical_ip);
     } else {
-        if (is_v6) {
-            error = ipv6_parse_cidr(logical_ip, &ipv6, &plen);
-            if (error) {
-                free(error);
-                ctl_error(ctx, "%s: should be an IPv6 address or network.",
-                          logical_ip);
-                return;
-            }
-            new_logical_ip = normalize_ipv6_prefix(ipv6, plen);
-        } else {
-            error = ip_parse_cidr(logical_ip, &ipv4, &plen);
-            if (error) {
-                free(error);
-                ctl_error(ctx, "%s: should be an IPv4 address or network.",
-                          logical_ip);
-                return;
-            }
-            new_logical_ip = normalize_ipv4_prefix(ipv4, plen);
+        new_logical_ip = is_v6
+            ? normalize_ipv6_prefix_str(logical_ip)
+            : normalize_ipv4_prefix_str(logical_ip);
+        if (!new_logical_ip) {
+            ctl_error(ctx, "%s: should be an %s address or network.",
+                      logical_ip, is_v6 ? "IPv6" : "IPv4");
         }
+    }
+
+    if (!new_logical_ip) {
+        goto cleanup;
     }
 
     const char *logical_port = NULL;
@@ -4188,29 +4219,25 @@ nbctl_lr_nat_add(struct ctl_context *ctx)
         if (!is_portrange) {
             ctl_error(ctx, "lr-nat-add with logical_port "
                       "must also specify external_mac.");
-            free(new_logical_ip);
-            return;
+            goto cleanup;
         }
         port_range = ctx->argv[5];
         if (!is_valid_port_range(port_range)) {
             ctl_error(ctx, "invalid port range %s.", port_range);
-            free(new_logical_ip);
-            return;
+            goto cleanup;
         }
 
     } else if (ctx->argc >= 7) {
         if (strcmp(nat_type, "dnat_and_snat")) {
             ctl_error(ctx, "logical_port and external_mac are only valid when "
                       "type is \"dnat_and_snat\".");
-            free(new_logical_ip);
-            return;
+            goto cleanup;
         }
 
         if (ctx->argc == 7 && is_portrange) {
             ctl_error(ctx, "lr-nat-add with logical_port "
                       "must also specify external_mac.");
-            free(new_logical_ip);
-            return;
+            goto cleanup;
         }
 
         logical_port = ctx->argv[5];
@@ -4218,24 +4245,21 @@ nbctl_lr_nat_add(struct ctl_context *ctx)
         error = lsp_by_name_or_uuid(ctx, logical_port, true, &lsp);
         if (error) {
             ctx->error = error;
-            free(new_logical_ip);
-            return;
+            goto cleanup;
         }
 
         external_mac = ctx->argv[6];
         struct eth_addr ea;
         if (!eth_addr_from_string(external_mac, &ea)) {
             ctl_error(ctx, "invalid mac address %s.", external_mac);
-            free(new_logical_ip);
-            return;
+            goto cleanup;
         }
 
         if (ctx->argc > 7) {
             port_range = ctx->argv[7];
             if (!is_valid_port_range(port_range)) {
                 ctl_error(ctx, "invalid port range %s.", port_range);
-                free(new_logical_ip);
-                return;
+                goto cleanup;
             }
         }
 
@@ -4256,48 +4280,65 @@ nbctl_lr_nat_add(struct ctl_context *ctx)
     int is_snat = !strcmp("snat", nat_type);
     for (size_t i = 0; i < lr->n_nat; i++) {
         const struct nbrec_nat *nat = lr->nat[i];
+
+        char *old_external_ip;
+        char *old_logical_ip;
+        bool should_return = false;
+        old_external_ip = normalize_prefix_str(nat->external_ip);
+        if (!old_external_ip) {
+            continue;
+        }
+        old_logical_ip = normalize_prefix_str(nat->logical_ip);
+        if (!old_logical_ip) {
+            free(old_external_ip);
+            continue;
+        }
+
         if (!strcmp(nat_type, nat->type)) {
-            if (!strcmp(is_snat ? new_logical_ip : external_ip,
-                        is_snat ? nat->logical_ip : nat->external_ip)) {
-                if (!strcmp(is_snat ? external_ip : new_logical_ip,
-                            is_snat ? nat->external_ip : nat->logical_ip)) {
+            if (!strcmp(is_snat ? new_logical_ip : new_external_ip,
+                        is_snat ? old_logical_ip : old_external_ip)) {
+                if (!strcmp(is_snat ? new_external_ip : new_logical_ip,
+                            is_snat ? old_external_ip : old_logical_ip)) {
                         if (may_exist) {
                             nbrec_nat_verify_logical_port(nat);
                             nbrec_nat_verify_external_mac(nat);
                             nbrec_nat_set_logical_port(nat, logical_port);
                             nbrec_nat_set_external_mac(nat, external_mac);
-                            free(new_logical_ip);
-                            return;
+                            should_return = true;
+                        } else {
+                            ctl_error(ctx, "%s, %s: a NAT with this "
+                                      "external_ip and logical_ip already "
+                                      "exists", new_external_ip,
+                                      new_logical_ip);
+                            should_return = true;
                         }
-                        ctl_error(ctx, "%s, %s: a NAT with this external_ip "
-                                  "and logical_ip already exists",
-                                  external_ip, new_logical_ip);
-                        free(new_logical_ip);
-                        return;
                 } else {
                     ctl_error(ctx, "a NAT with this type (%s) and %s (%s) "
                               "already exists",
                               nat_type,
                               is_snat ? "logical_ip" : "external_ip",
-                              is_snat ? new_logical_ip : external_ip);
-                    free(new_logical_ip);
-                    return;
+                              is_snat ? new_logical_ip : new_external_ip);
+                    should_return = true;
                 }
             }
-
         }
         if (!strcmp(nat_type, "dnat_and_snat") ||
             !strcmp(nat->type, "dnat_and_snat")) {
 
-            if (!strcmp(nat->external_ip, external_ip)) {
+            if (!strcmp(old_external_ip, new_external_ip)) {
                 struct smap nat_options = SMAP_INITIALIZER(&nat_options);
                 if (!strcmp(smap_get(&nat->options, "stateless"),
                             "true") || stateless) {
                     ctl_error(ctx, "%s, %s: External ip cannot be shared "
                               "across stateless and stateful NATs",
-                              external_ip, new_logical_ip);
+                              new_external_ip, new_logical_ip);
                 }
             }
+        }
+        free(old_external_ip);
+        free(old_logical_ip);
+        if (should_return) {
+            goto cleanup;
         }
     }
 
@@ -4319,7 +4360,6 @@ nbctl_lr_nat_add(struct ctl_context *ctx)
     smap_add(&nat_options, "stateless", stateless ? "true":"false");
     nbrec_nat_set_options(nat, &nat_options);
 
-    free(new_logical_ip);
     smap_destroy(&nat_options);
 
     /* Insert the NAT into the logical router. */
@@ -4329,6 +4369,10 @@ nbctl_lr_nat_add(struct ctl_context *ctx)
     new_nats[lr->n_nat] = nat;
     nbrec_logical_router_set_nat(lr, new_nats, lr->n_nat + 1);
     free(new_nats);
+
+cleanup:
+    free(new_logical_ip);
+    free(new_external_ip);
 }
 
 static void
@@ -4374,13 +4418,24 @@ nbctl_lr_nat_del(struct ctl_context *ctx)
         return;
     }
 
-    const char *nat_ip = ctx->argv[3];
+    char *nat_ip = normalize_prefix_str(ctx->argv[3]);
+    if (!nat_ip) {
+        ctl_error(ctx, "%s: Invalid IP address or CIDR", ctx->argv[3]);
+        return;
+    }
+
     int is_snat = !strcmp("snat", nat_type);
     /* Remove the matching NAT. */
     for (size_t i = 0; i < lr->n_nat; i++) {
         struct nbrec_nat *nat = lr->nat[i];
-        if (!strcmp(nat_type, nat->type) &&
-             !strcmp(nat_ip, is_snat ? nat->logical_ip : nat->external_ip)) {
+        bool should_return = false;
+        char *old_ip = normalize_prefix_str(is_snat
+                                            ? nat->logical_ip
+                                            : nat->external_ip);
+        if (!old_ip) {
+            continue;
+        }
+        if (!strcmp(nat_type, nat->type) && !strcmp(nat_ip, old_ip)) {
             struct nbrec_nat **new_nats
                 = xmemdup(lr->nat, sizeof *new_nats * lr->n_nat);
             new_nats[i] = lr->nat[lr->n_nat - 1];
@@ -4388,15 +4443,21 @@ nbctl_lr_nat_del(struct ctl_context *ctx)
             nbrec_logical_router_set_nat(lr, new_nats,
                                           lr->n_nat - 1);
             free(new_nats);
-            return;
+            should_return = true;
+        }
+        free(old_ip);
+        if (should_return) {
+            goto cleanup;
         }
     }
 
     if (must_exist) {
         ctl_error(ctx, "no matching NAT with the type (%s) and %s (%s)",
                   nat_type, is_snat ? "logical_ip" : "external_ip", nat_ip);
-        return;
     }
+
+cleanup:
+    free(nat_ip);
 }
 
 static void
@@ -4680,6 +4741,23 @@ nbctl_lrp_get_gateway_chassis(struct ctl_context *ctx)
     free(gcs);
 }
 
+static struct sset *
+lrp_network_sset(const char **networks, int n_networks)
+{
+    struct sset *network_set = xzalloc(sizeof *network_set);
+    sset_init(network_set);
+    for (int i = 0; i < n_networks; i++) {
+        char *norm = normalize_prefix_str(networks[i]);
+        if (!norm) {
+            sset_destroy(network_set);
+            free(network_set);
+            return NULL;
+        }
+        sset_add_and_free(network_set, norm);
+    }
+    return network_set;
+}
+
 static void
 nbctl_lrp_add(struct ctl_context *ctx)
 {
@@ -4713,6 +4791,12 @@ nbctl_lrp_add(struct ctl_context *ctx)
     char **settings = (char **) &ctx->argv[n_networks + 4];
     int n_settings = ctx->argc - 4 - n_networks;
 
+    struct eth_addr ea;
+    if (!eth_addr_from_string(mac, &ea)) {
+        ctl_error(ctx, "%s: invalid mac address %s", lrp_name, mac);
+        return;
+    }
+
     const struct nbrec_logical_router_port *lrp;
     error = lrp_by_name_or_uuid(ctx, lrp_name, false, &lrp);
     if (error) {
@@ -4739,23 +4823,34 @@ nbctl_lrp_add(struct ctl_context *ctx)
             return;
         }
 
-        if (strcmp(mac, lrp->mac)) {
+        struct eth_addr lrp_ea;
+        eth_addr_from_string(lrp->mac, &lrp_ea);
+        if (!eth_addr_equals(ea, lrp_ea)) {
             ctl_error(ctx, "%s: port already exists with mac %s", lrp_name,
                       lrp->mac);
             return;
         }
 
-        struct sset new_networks = SSET_INITIALIZER(&new_networks);
-        for (int i = 0; i < n_networks; i++) {
-            sset_add(&new_networks, networks[i]);
+        struct sset *new_networks = lrp_network_sset(networks, n_networks);
+        if (!new_networks) {
+            ctl_error(ctx, "%s: Invalid networks configured", lrp_name);
+            return;
+        }
+        struct sset *orig_networks = lrp_network_sset(
+            (const char **)lrp->networks, lrp->n_networks);
+        if (!orig_networks) {
+            ctl_error(ctx, "%s: Existing port has invalid networks configured",
+                      lrp_name);
+            sset_destroy(new_networks);
+            free(new_networks);
+            return;
         }
 
-        struct sset orig_networks = SSET_INITIALIZER(&orig_networks);
-        sset_add_array(&orig_networks, lrp->networks, lrp->n_networks);
-
-        bool same_networks = sset_equals(&orig_networks, &new_networks);
-        sset_destroy(&orig_networks);
-        sset_destroy(&new_networks);
+        bool same_networks = sset_equals(orig_networks, new_networks);
+        sset_destroy(orig_networks);
+        free(orig_networks);
+        sset_destroy(new_networks);
+        free(new_networks);
         if (!same_networks) {
             ctl_error(ctx, "%s: port already exists with different network",
                       lrp_name);
@@ -4778,12 +4873,6 @@ nbctl_lrp_add(struct ctl_context *ctx)
             return;
         }
 
-        return;
-    }
-
-    struct eth_addr ea;
-    if (!eth_addr_from_string(mac, &ea)) {
-        ctl_error(ctx, "%s: invalid mac address %s", lrp_name, mac);
         return;
     }
 

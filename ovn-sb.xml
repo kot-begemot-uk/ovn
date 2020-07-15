@@ -1170,10 +1170,11 @@
           <ul>
             <li>
               <code>icmp4.frag_mtu</code>
+              <code>icmp6.frag_mtu</code>
               <p>
-                This field sets the low-order 16 bits of the ICMP4 header field
-                that is labelled "unused" in the ICMP specification as defined
-                in the RFC 1191 with the value specified in
+                This field sets the low-order 16 bits of the ICMP{4,6} header
+                field that is labelled "unused" in the ICMP specification as
+                defined in the RFC 1191 with the value specified in
                 <var>constant</var>.
               </p>
 
@@ -2035,6 +2036,9 @@
         </dd>
 
         <dt><code>icmp6 { <var>action</var>; </code>...<code> };</code></dt>
+        <dt>
+          <code>icmp6_error { <var>action</var>; </code>...<code> };</code>
+        </dt>
         <dd>
           <p>
             Temporarily replaces the IPv6 packet being processed by an ICMPv6
@@ -2057,6 +2061,11 @@
             <li><code>icmp6.code = 1</code> (administratively prohibited)</li>
           </ul>
 
+          <p>
+              <code>icmp6_error</code> action is expected to be used to
+              generate an ICMPv6 packet in response to an error in original
+              IPv6 packet.
+          </p>
           <p><b>Prerequisite:</b> <code>ip6</code></p>
         </dd>
 
@@ -3233,6 +3242,17 @@ tcp.flags = RST;
           </p>
         </dd>
 
+        <dt><code>value: domains</code></dt>
+        <dd>
+          <p>
+            This indicates that the value of the DHCP option is a domain name
+            or a comma separated list of domain names.
+          </p>
+
+          <p>
+            Example. "name=domain_search_list", "code=119", "type=domains".
+          </p>
+        </dd>
       </dl>
     </column>
   </table>

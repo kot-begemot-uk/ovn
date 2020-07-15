@@ -1487,7 +1487,9 @@ output;
           For each enabled router port <var>P</var> with Ethernet address
           <var>E</var>, a priority-50 flow that matches <code>inport ==
           <var>P</var> &amp;&amp; (eth.mcast || eth.dst ==
-          <var>E</var></code>), with action <code>next;</code>.
+          <var>E</var></code>), stores the router port ethernet address
+          and advances to next table, with action
+          <code>xreg0[0..47]=E; next;</code>.
         </p>
 
         <p>
@@ -1507,7 +1509,7 @@ output;
           a priority-50 flow that matches <code>inport == <var>GW</var>
           &amp;&amp; eth.dst == <var>E</var></code>, where <var>GW</var>
           is the logical router gateway port, with action
-          <code>next;</code>.
+          <code>xreg0[0..47]=E; next;</code>.
         </p>
 
         <p>
@@ -1770,13 +1772,13 @@ next;
 
         <pre>
 eth.dst = eth.src;
-eth.src = <var>E</var>;
+eth.src = xreg0[0..47];
 arp.op = 2; /* ARP reply. */
 arp.tha = arp.sha;
-arp.sha = <var>E</var>;
+arp.sha = xreg0[0..47];
 arp.tpa = arp.spa;
 arp.spa = <var>A</var>;
-outport = <var>P</var>;
+outport = inport;
 flags.loopback = 1;
 output;
         </pre>
@@ -1822,10 +1824,10 @@ output;
 
         <pre>
 nd_na_router {
-    eth.src = <var>E</var>;
+    eth.src = xreg0[0..47];
     ip6.src = <var>A</var>;
     nd.target = <var>A</var>;
-    nd.tll = <var>E</var>;
+    nd.tll = xreg0[0..47];
     outport = inport;
     flags.loopback = 1;
     output;
@@ -1855,23 +1857,27 @@ nd_na_router {
           IPv4: For a configured DNAT IP address or a load balancer
           IPv4 VIP <var>A</var>, for each router port <var>P</var> with
           Ethernet address <var>E</var>, a priority-90 flow matches
-          <code>inport == <var>P</var> &amp;&amp; arp.op == 1 &amp;&amp;
-          arp.tpa == <var>A</var></code> (ARP request)
-          with the following actions:
+          <code>arp.op == 1 &amp;&amp; arp.tpa == <var>A</var></code>
+          (ARP request) with the following actions:
         </p>
 
         <pre>
 eth.dst = eth.src;
-eth.src = <var>E</var>;
+eth.src = xreg0[0..47];
 arp.op = 2; /* ARP reply. */
 arp.tha = arp.sha;
-arp.sha = <var>E</var>;
+arp.sha = xreg0[0..47];
 arp.tpa = arp.spa;
 arp.spa = <var>A</var>;
-outport = <var>P</var>;
+outport = inport;
 flags.loopback = 1;
 output;
         </pre>
+
+        <p>
+          IPv4: For a configured load balancer IPv4 VIP, a similar flow is
+          added with the additional match <code>inport == <var>P</var></code>.
+        </p>
 
         <p>
           If the router port <var>P</var> is a distributed gateway router
@@ -1894,11 +1900,11 @@ output;
         <pre>
 eth.dst = eth.src;
 nd_na {
-    eth.src = <var>E</var>;
-    nd.tll = <var>E</var>;
+    eth.src = xreg0[0..47];
+    nd.tll = xreg0[0..47];
     ip6.src = <var>A</var>;
     nd.target = <var>A</var>;
-    outport = <var>P</var>;
+    outport = inport;
     flags.loopback = 1;
     output;
 }
@@ -1920,9 +1926,11 @@ nd_na {
         <ul>
           <li>
             If the corresponding NAT rule cannot be handled in a
-            distributed manner, then this flow is only programmed on
+            distributed manner, then a priority-92 flow is programmed on
             the gateway port instance on the
-            <code>redirect-chassis</code>.  This behavior avoids
+            <code>redirect-chassis</code>.  A priority-91 drop flow is
+            programmed on the other chassis when ARP requests/NS packets
+            are received on the gateway port. This behavior avoids
             generation of multiple ARP responses from different chassis,
             and allows upstream MAC learning to point to the
             <code>redirect-chassis</code>.
@@ -2568,7 +2576,7 @@ reg8[0..15] = 0;
 xxreg0 = <var>G</var>;
 xxreg1 = <var>A</var>;
 eth.src = <var>E</var>;
-outport = <var>P</var>;
+outport = inport;
 flags.loopback = 1;
 next;
         </pre>
@@ -2856,11 +2864,11 @@ REGBIT_PKT_LARGER = check_pkt_larger(<var>L</var>); next;
       For distributed logical routers with distributed gateway port configured
       with <code>options:gateway_mtu</code> to a valid integer value, this
       table adds the following priority-50 logical flow for each
-      logical router port with the match <code>ip4 &amp;&amp;
-      inport == <var>LRP</var> &amp;&amp; outport == <var>GW_PORT</var>
-      &amp;&amp; REGBIT_PKT_LARGER</code>, where <var>LRP</var> is the logical
-      router port and <var>GW_PORT</var> is the distributed gateway router port
-      and applies the following action
+      logical router port with the match <code>inport == <var>LRP</var>
+      &amp;&amp; outport == <var>GW_PORT</var> &amp;&amp;
+      REGBIT_PKT_LARGER</code>, where <var>LRP</var> is the logical
+      router port and <var>GW_PORT</var> is the distributed gateway router
+      port and applies the following action for ipv4 and ipv6 respectively:
     </p>
 
     <pre>
@@ -2871,6 +2879,18 @@ icmp4 {
     eth.dst = <var>E</var>;
     ip4.dst = ip4.src;
     ip4.src = <var>I</var>;
+    ip.ttl = 255;
+    REGBIT_EGRESS_LOOPBACK = 1;
+    next(pipeline=ingress, table=0);
+};
+
+icmp6 {
+    icmp6.type = 2;
+    icmp6.code = 0;
+    icmp6.frag_mtu = <var>M</var>;
+    eth.dst = <var>E</var>;
+    ip6.dst = ip6.src;
+    ip6.src = <var>I</var>;
     ip.ttl = 255;
     REGBIT_EGRESS_LOOPBACK = 1;
     next(pipeline=ingress, table=0);
@@ -2890,7 +2910,7 @@ icmp4 {
       </li>
 
       <li>
-        <var>I</var> is the IPv4 address of the logical router port.
+        <var>I</var> is the IPv4/IPv6 address of the logical router port.
       </li>
     </ul>
 

@@ -1472,3 +1472,304 @@ AT_CHECK([ovn-nbctl --wait=sb sync], [0])
 AT_CHECK([test 0 = $(ovn-sbctl list Ha_Chassis_Group | wc -l)])
 
 AT_CLEANUP
+
+AT_SETUP([ovn -- check NB/SB Port_Group translation (lsp add/del)])
+ovn_start
+
+ovn-nbctl ls-add ls1
+ovn-nbctl ls-add ls2
+ovn-nbctl lsp-add ls1 lsp1
+ovn-nbctl lsp-add ls2 lsp2
+ovn-nbct --wait=sb sync
+ls1_key=$(ovn-sbctl --columns tunnel_key --bare list Datapath_Binding ls1)
+ls2_key=$(ovn-sbctl --columns tunnel_key --bare list Datapath_Binding ls2)
+
+# Add an empty port group. This should generate no entry in the SB.
+ovn-nbctl --wait=sb pg-add pg_test
+AT_CHECK([test 0 = $(ovn-sbctl --columns _uuid list Port_Group | grep uuid -c)])
+
+# Add lsp1 to the port group. This should generate an entry in the SB only
+# for ls1.
+ovn-nbctl --wait=sb pg-set-ports pg_test lsp1
+AT_CHECK([test 1 = $(ovn-sbctl --columns _uuid list Port_Group | grep uuid -c)])
+AT_CHECK([ovn-sbctl --columns ports --bare find Port_Group name=${ls1_key}_pg_test], [0], [dnl
+lsp1
+])
+
+# Add lsp2 to the port group. This should generate a new entry in the SB, for
+# ls2.
+ovn-nbctl --wait=sb pg-set-ports pg_test lsp1 lsp2
+AT_CHECK([test 2 = $(ovn-sbctl --columns _uuid list Port_Group | grep uuid -c)])
+AT_CHECK([ovn-sbctl --columns ports --bare find Port_Group name=${ls1_key}_pg_test], [0], [dnl
+lsp1
+])
+AT_CHECK([ovn-sbctl --columns ports --bare find Port_Group name=${ls2_key}_pg_test], [0], [dnl
+lsp2
+])
+
+# Remove lsp1 from the port group. The SB Port_Group for ls1 should be
+# removed.
+ovn-nbctl --wait=sb pg-set-ports pg_test lsp2
+AT_CHECK([test 1 = $(ovn-sbctl --columns _uuid list Port_Group | grep uuid -c)])
+AT_CHECK([ovn-sbctl --columns ports --bare find Port_Group name=${ls2_key}_pg_test], [0], [dnl
+lsp2
+])
+
+# Remove lsp2 from the port group. All SB Port_Groups should be purged.
+ovn-nbctl --wait=sb clear Port_Group pg_test ports
+AT_CHECK([test 0 = $(ovn-sbctl --columns _uuid list Port_Group | grep uuid -c)])
+
+AT_CLEANUP
+
+AT_SETUP([ovn -- check NB/SB Port_Group translation (ls del)])
+ovn_start
+
+ovn-nbctl ls-add ls1
+ovn-nbctl ls-add ls2
+ovn-nbctl lsp-add ls1 lsp1
+ovn-nbctl lsp-add ls2 lsp2
+ovn-nbct --wait=sb sync
+ls1_key=$(ovn-sbctl --columns tunnel_key --bare list Datapath_Binding ls1)
+ls2_key=$(ovn-sbctl --columns tunnel_key --bare list Datapath_Binding ls2)
+
+# Add lsp1 & lsp2 to a port group. This should generate two entries in the
+# SB (one per logical switch).
+ovn-nbctl --wait=sb pg-add pg_test lsp1 lsp2
+AT_CHECK([test 2 = $(ovn-sbctl --columns _uuid list Port_Group | grep uuid -c)])
+AT_CHECK([ovn-sbctl --columns ports --bare find Port_Group name=${ls1_key}_pg_test], [0], [dnl
+lsp1
+])
+AT_CHECK([ovn-sbctl --columns ports --bare find Port_Group name=${ls2_key}_pg_test], [0], [dnl
+lsp2
+])
+
+# Delete logical switch ls1. This should remove the associated SB Port_Group.
+ovn-nbctl --wait=sb ls-del ls1
+AT_CHECK([test 1 = $(ovn-sbctl --columns _uuid list Port_Group | grep uuid -c)])
+AT_CHECK([ovn-sbctl --columns ports --bare find Port_Group name=${ls2_key}_pg_test], [0], [dnl
+lsp2
+])
+
+AT_CLEANUP
+
+AT_SETUP([ovn -- check router ARP/NS responder])
+ovn_start
+
+ovn-sbctl chassis-add ch geneve 127.0.0.1
+
+ovn-nbctl lr-add lr
+ovn-nbctl lrp-add lr lrp-public 00:00:00:00:01:00 43.43.43.1/24
+ovn-nbctl lrp-add lr lrp 00:00:00:00:00:01 42.42.42.1/24
+
+ovn-nbctl ls-add ls
+ovn-nbctl lsp-add ls ls-rp
+ovn-nbctl lsp-set-type ls-rp router
+ovn-nbctl lsp-set-addresses ls-rp router
+ovn-nbctl lsp-set-options ls-rp router-port=lrp
+ovn-nbctl lsp-add ls ls-vm
+
+ovn-nbctl set logical_router lr options:chassis=ch
+ovn-nbctl lr-nat-add lr dnat_and_snat 43.43.43.2 42.42.42.2
+ovn-nbctl lr-nat-add lr dnat 43.43.43.3 42.42.42.3
+ovn-nbctl lr-nat-add lr dnat_and_snat 43.43.43.4 42.42.42.4 ls-vm 00:00:00:00:00:02
+
+ovn-nbctl --wait=sb sync
+
+# Ingress router port ETH address is stored in lr_in_admission.
+AT_CHECK([ovn-sbctl lflow-list | grep -E "lr_in_admission.*xreg0\[[0..47\]]" | sort], [0], [dnl
+  table=0 (lr_in_admission    ), priority=50   , dnl
+match=(eth.dst == 00:00:00:00:00:01 && inport == "lrp"), dnl
+action=(xreg0[[0..47]] = 00:00:00:00:00:01; next;)
+  table=0 (lr_in_admission    ), priority=50   , dnl
+match=(eth.dst == 00:00:00:00:01:00 && inport == "lrp-public"), dnl
+action=(xreg0[[0..47]] = 00:00:00:00:01:00; next;)
+  table=0 (lr_in_admission    ), priority=50   , dnl
+match=(eth.mcast && inport == "lrp"), dnl
+action=(xreg0[[0..47]] = 00:00:00:00:00:01; next;)
+  table=0 (lr_in_admission    ), priority=50   , dnl
+match=(eth.mcast && inport == "lrp-public"), dnl
+action=(xreg0[[0..47]] = 00:00:00:00:01:00; next;)
+])
+
+# Ingress router port ETH address is used for ARP reply/NA in lr_in_ip_input.
+AT_CHECK([ovn-sbctl lflow-list | grep -E "lr_in_ip_input.*priority=90" | grep "arp\|nd" | sort], [0], [dnl
+  table=3 (lr_in_ip_input     ), priority=90   , dnl
+match=(arp.op == 1 && arp.tpa == 43.43.43.2), dnl
+action=(eth.dst = eth.src; eth.src = xreg0[[0..47]]; arp.op = 2; /* ARP reply */ arp.tha = arp.sha; arp.sha = xreg0[[0..47]]; arp.tpa = arp.spa; arp.spa = 43.43.43.2; outport = inport; flags.loopback = 1; output;)
+  table=3 (lr_in_ip_input     ), priority=90   , dnl
+match=(arp.op == 1 && arp.tpa == 43.43.43.3), dnl
+action=(eth.dst = eth.src; eth.src = xreg0[[0..47]]; arp.op = 2; /* ARP reply */ arp.tha = arp.sha; arp.sha = xreg0[[0..47]]; arp.tpa = arp.spa; arp.spa = 43.43.43.3; outport = inport; flags.loopback = 1; output;)
+  table=3 (lr_in_ip_input     ), priority=90   , dnl
+match=(arp.op == 1 && arp.tpa == 43.43.43.4), dnl
+action=(eth.dst = eth.src; eth.src = xreg0[[0..47]]; arp.op = 2; /* ARP reply */ arp.tha = arp.sha; arp.sha = xreg0[[0..47]]; arp.tpa = arp.spa; arp.spa = 43.43.43.4; outport = inport; flags.loopback = 1; output;)
+  table=3 (lr_in_ip_input     ), priority=90   , dnl
+match=(inport == "lrp" && arp.op == 1 && arp.tpa == 42.42.42.1 && arp.spa == 42.42.42.0/24), dnl
+action=(eth.dst = eth.src; eth.src = xreg0[[0..47]]; arp.op = 2; /* ARP reply */ arp.tha = arp.sha; arp.sha = xreg0[[0..47]]; arp.tpa = arp.spa; arp.spa = 42.42.42.1; outport = inport; flags.loopback = 1; output;)
+  table=3 (lr_in_ip_input     ), priority=90   , dnl
+match=(inport == "lrp" && ip6.dst == {fe80::200:ff:fe00:1, ff02::1:ff00:1} && nd_ns && nd.target == fe80::200:ff:fe00:1), dnl
+action=(nd_na_router { eth.src = xreg0[[0..47]]; ip6.src = fe80::200:ff:fe00:1; nd.target = fe80::200:ff:fe00:1; nd.tll = xreg0[[0..47]]; outport = inport; flags.loopback = 1; output; };)
+  table=3 (lr_in_ip_input     ), priority=90   , dnl
+match=(inport == "lrp-public" && arp.op == 1 && arp.tpa == 43.43.43.1 && arp.spa == 43.43.43.0/24), dnl
+action=(eth.dst = eth.src; eth.src = xreg0[[0..47]]; arp.op = 2; /* ARP reply */ arp.tha = arp.sha; arp.sha = xreg0[[0..47]]; arp.tpa = arp.spa; arp.spa = 43.43.43.1; outport = inport; flags.loopback = 1; output;)
+  table=3 (lr_in_ip_input     ), priority=90   , dnl
+match=(inport == "lrp-public" && ip6.dst == {fe80::200:ff:fe00:100, ff02::1:ff00:100} && nd_ns && nd.target == fe80::200:ff:fe00:100), dnl
+action=(nd_na_router { eth.src = xreg0[[0..47]]; ip6.src = fe80::200:ff:fe00:100; nd.target = fe80::200:ff:fe00:100; nd.tll = xreg0[[0..47]]; outport = inport; flags.loopback = 1; output; };)
+])
+
+# xreg0[0..47] isn't used anywhere else.
+AT_CHECK([ovn-sbctl lflow-list | grep "xreg0\[[0..47\]]" | grep -vE 'lr_in_admission|lr_in_ip_input'], [1], [])
+
+# Test chassis redirect port.
+ovn-nbctl remove logical_router lr options chassis
+ovn-nbctl lrp-set-gateway-chassis lrp-public ch
+ovn-nbctl --wait=sb sync
+
+# Ingress router port ETH address is stored in lr_in_admission.
+AT_CHECK([ovn-sbctl lflow-list | grep -E "lr_in_admission.*xreg0\[[0..47\]]" | sort], [0], [dnl
+  table=0 (lr_in_admission    ), priority=50   , dnl
+match=(eth.dst == 00:00:00:00:00:01 && inport == "lrp"), dnl
+action=(xreg0[[0..47]] = 00:00:00:00:00:01; next;)
+  table=0 (lr_in_admission    ), priority=50   , dnl
+match=(eth.dst == 00:00:00:00:00:02 && inport == "lrp-public" && is_chassis_resident("ls-vm")), dnl
+action=(xreg0[[0..47]] = 00:00:00:00:01:00; next;)
+  table=0 (lr_in_admission    ), priority=50   , dnl
+match=(eth.dst == 00:00:00:00:01:00 && inport == "lrp-public" && is_chassis_resident("cr-lrp-public")), dnl
+action=(xreg0[[0..47]] = 00:00:00:00:01:00; next;)
+  table=0 (lr_in_admission    ), priority=50   , dnl
+match=(eth.mcast && inport == "lrp"), dnl
+action=(xreg0[[0..47]] = 00:00:00:00:00:01; next;)
+  table=0 (lr_in_admission    ), priority=50   , dnl
+match=(eth.mcast && inport == "lrp-public"), dnl
+action=(xreg0[[0..47]] = 00:00:00:00:01:00; next;)
+])
+
+# Ingress router port is used for ARP reply/NA in lr_in_ip_input.
+# xxreg0[0..47] is used unless external_mac is set.
+# Priority 90 flows (per router).
+AT_CHECK([ovn-sbctl lflow-list | grep -E "lr_in_ip_input.*priority=90" | grep "arp\|nd" | sort], [0], [dnl
+  table=3 (lr_in_ip_input     ), priority=90   , dnl
+match=(arp.op == 1 && arp.tpa == 43.43.43.2), dnl
+action=(eth.dst = eth.src; eth.src = xreg0[[0..47]]; arp.op = 2; /* ARP reply */ arp.tha = arp.sha; arp.sha = xreg0[[0..47]]; arp.tpa = arp.spa; arp.spa = 43.43.43.2; outport = inport; flags.loopback = 1; output;)
+  table=3 (lr_in_ip_input     ), priority=90   , dnl
+match=(arp.op == 1 && arp.tpa == 43.43.43.3), dnl
+action=(eth.dst = eth.src; eth.src = xreg0[[0..47]]; arp.op = 2; /* ARP reply */ arp.tha = arp.sha; arp.sha = xreg0[[0..47]]; arp.tpa = arp.spa; arp.spa = 43.43.43.3; outport = inport; flags.loopback = 1; output;)
+  table=3 (lr_in_ip_input     ), priority=90   , dnl
+match=(arp.op == 1 && arp.tpa == 43.43.43.4), dnl
+action=(eth.dst = eth.src; eth.src = xreg0[[0..47]]; arp.op = 2; /* ARP reply */ arp.tha = arp.sha; arp.sha = xreg0[[0..47]]; arp.tpa = arp.spa; arp.spa = 43.43.43.4; outport = inport; flags.loopback = 1; output;)
+  table=3 (lr_in_ip_input     ), priority=90   , dnl
+match=(inport == "lrp" && arp.op == 1 && arp.tpa == 42.42.42.1 && arp.spa == 42.42.42.0/24), dnl
+action=(eth.dst = eth.src; eth.src = xreg0[[0..47]]; arp.op = 2; /* ARP reply */ arp.tha = arp.sha; arp.sha = xreg0[[0..47]]; arp.tpa = arp.spa; arp.spa = 42.42.42.1; outport = inport; flags.loopback = 1; output;)
+  table=3 (lr_in_ip_input     ), priority=90   , dnl
+match=(inport == "lrp" && ip6.dst == {fe80::200:ff:fe00:1, ff02::1:ff00:1} && nd_ns && nd.target == fe80::200:ff:fe00:1), dnl
+action=(nd_na_router { eth.src = xreg0[[0..47]]; ip6.src = fe80::200:ff:fe00:1; nd.target = fe80::200:ff:fe00:1; nd.tll = xreg0[[0..47]]; outport = inport; flags.loopback = 1; output; };)
+  table=3 (lr_in_ip_input     ), priority=90   , dnl
+match=(inport == "lrp-public" && arp.op == 1 && arp.tpa == 43.43.43.1 && arp.spa == 43.43.43.0/24), dnl
+action=(eth.dst = eth.src; eth.src = xreg0[[0..47]]; arp.op = 2; /* ARP reply */ arp.tha = arp.sha; arp.sha = xreg0[[0..47]]; arp.tpa = arp.spa; arp.spa = 43.43.43.1; outport = inport; flags.loopback = 1; output;)
+  table=3 (lr_in_ip_input     ), priority=90   , dnl
+match=(inport == "lrp-public" && ip6.dst == {fe80::200:ff:fe00:100, ff02::1:ff00:100} && nd_ns && nd.target == fe80::200:ff:fe00:100 && is_chassis_resident("cr-lrp-public")), dnl
+action=(nd_na_router { eth.src = xreg0[[0..47]]; ip6.src = fe80::200:ff:fe00:100; nd.target = fe80::200:ff:fe00:100; nd.tll = xreg0[[0..47]]; outport = inport; flags.loopback = 1; output; };)
+])
+
+# Priority 91 drop flows (per distributed gw port), if port is not resident.
+AT_CHECK([ovn-sbctl lflow-list | grep -E "lr_in_ip_input.*priority=91" | grep "arp\|nd" | sort], [0], [dnl
+  table=3 (lr_in_ip_input     ), priority=91   , dnl
+match=(inport == "lrp-public" && arp.op == 1 && arp.tpa == 43.43.43.2), dnl
+action=(drop;)
+  table=3 (lr_in_ip_input     ), priority=91   , dnl
+match=(inport == "lrp-public" && arp.op == 1 && arp.tpa == 43.43.43.3), dnl
+action=(drop;)
+  table=3 (lr_in_ip_input     ), priority=91   , dnl
+match=(inport == "lrp-public" && arp.op == 1 && arp.tpa == 43.43.43.4), dnl
+action=(drop;)
+])
+
+# Priority 92 ARP/NS responders (per distributed gw port), if port is resident.
+AT_CHECK([ovn-sbctl lflow-list | grep -E "lr_in_ip_input.*priority=92" | grep "arp\|nd" | sort], [0], [dnl
+  table=3 (lr_in_ip_input     ), priority=92   , dnl
+match=(inport == "lrp-public" && arp.op == 1 && arp.tpa == 43.43.43.2 && is_chassis_resident("cr-lrp-public")), dnl
+action=(eth.dst = eth.src; eth.src = xreg0[[0..47]]; arp.op = 2; /* ARP reply */ arp.tha = arp.sha; arp.sha = xreg0[[0..47]]; arp.tpa = arp.spa; arp.spa = 43.43.43.2; outport = inport; flags.loopback = 1; output;)
+  table=3 (lr_in_ip_input     ), priority=92   , dnl
+match=(inport == "lrp-public" && arp.op == 1 && arp.tpa == 43.43.43.3 && is_chassis_resident("cr-lrp-public")), dnl
+action=(eth.dst = eth.src; eth.src = xreg0[[0..47]]; arp.op = 2; /* ARP reply */ arp.tha = arp.sha; arp.sha = xreg0[[0..47]]; arp.tpa = arp.spa; arp.spa = 43.43.43.3; outport = inport; flags.loopback = 1; output;)
+  table=3 (lr_in_ip_input     ), priority=92   , dnl
+match=(inport == "lrp-public" && arp.op == 1 && arp.tpa == 43.43.43.4 && is_chassis_resident("ls-vm")), dnl
+action=(eth.dst = eth.src; eth.src = 00:00:00:00:00:02; arp.op = 2; /* ARP reply */ arp.tha = arp.sha; arp.sha = 00:00:00:00:00:02; arp.tpa = arp.spa; arp.spa = 43.43.43.4; outport = inport; flags.loopback = 1; output;)
+])
+
+# xreg0[0..47] isn't used anywhere else.
+AT_CHECK([ovn-sbctl lflow-list | grep "xreg0\[[0..47\]]" | grep -vE 'lr_in_admission|lr_in_ip_input'], [1], [])
+
+AT_CLEANUP
+
+# This test case tests that when a logical switch has load balancers associated
+# (with VIPs configured), the below logical flow is added by ovn-northd.
+# table=0 (ls_out_pre_lb      ), priority=100  , match=(ip), action=(reg0[[0]] = 1; next;)
+# This test case is added for the BZ -
+# https://bugzilla.redhat.com/show_bug.cgi?id=1849162
+#
+# ovn-northd was not adding the above lflow if the last load balancer associated
+# to the logical switch doesn't have the VIP configured even if other load
+# balancers before the last one in the last have VIPs configured.
+# So make sure that the above lflow is added even if one load balancer has VIP
+# associated.
+
+AT_SETUP([ovn -- Load balancer - missing ls_out_pre_lb flows])
+ovn_start
+
+ovn-nbctl ls-add sw0
+ovn-nbctl lsp-add sw0 sw0-p1
+
+ovn-nbctl lb-add lb1 "10.0.0.10" "10.0.0.3"
+ovn-nbctl lb-add lb2 "10.0.0.11" "10.0.0.4"
+
+ovn-nbctl --wait=sb sync
+AT_CHECK([ovn-sbctl lflow-list | grep "ls_out_pre_lb.*priority=100" | grep reg0 | sort], [0], [dnl
+])
+
+ovn-nbctl ls-lb-add sw0 lb1
+ovn-nbctl --wait=sb sync
+AT_CHECK([ovn-sbctl lflow-list | grep "ls_out_pre_lb.*priority=100" | grep reg0 | sort], [0], [dnl
+  table=0 (ls_out_pre_lb      ), priority=100  , match=(ip), action=(reg0[[0]] = 1; next;)
+])
+
+ovn-nbctl ls-lb-add sw0 lb2
+ovn-nbctl --wait=sb sync
+AT_CHECK([ovn-sbctl lflow-list | grep "ls_out_pre_lb.*priority=100" | grep reg0 | sort], [0], [dnl
+  table=0 (ls_out_pre_lb      ), priority=100  , match=(ip), action=(reg0[[0]] = 1; next;)
+])
+
+lb1_uuid=$(ovn-nbctl --bare --columns _uuid find load_balancer name=lb1)
+lb2_uuid=$(ovn-nbctl --bare --columns _uuid find load_balancer name=lb2)
+
+ovn-nbctl clear load_balancer $lb1_uuid vips
+ovn-nbctl --wait=sb sync
+AT_CHECK([ovn-sbctl lflow-list | grep "ls_out_pre_lb.*priority=100" | grep reg0 | sort], [0], [dnl
+  table=0 (ls_out_pre_lb      ), priority=100  , match=(ip), action=(reg0[[0]] = 1; next;)
+])
+
+ovn-nbctl clear load_balancer $lb2_uuid vips
+ovn-nbctl --wait=sb sync
+AT_CHECK([ovn-sbctl lflow-list | grep "ls_out_pre_lb.*priority=100" | grep reg0 | sort], [0], [dnl
+])
+
+ovn-nbctl set load_balancer $lb1_uuid vips:"10.0.0.10"="10.0.0.3"
+ovn-nbctl set load_balancer $lb2_uuid vips:"10.0.0.11"="10.0.0.4"
+
+ovn-nbctl --wait=sb sync
+AT_CHECK([ovn-sbctl lflow-list | grep "ls_out_pre_lb.*priority=100" | grep reg0 | sort], [0], [dnl
+  table=0 (ls_out_pre_lb      ), priority=100  , match=(ip), action=(reg0[[0]] = 1; next;)
+])
+
+# Now reverse the order of clearing the vip.
+ovn-nbctl clear load_balancer $lb2_uuid vips
+ovn-nbctl --wait=sb sync
+AT_CHECK([ovn-sbctl lflow-list | grep "ls_out_pre_lb.*priority=100" | grep reg0 | sort], [0], [dnl
+  table=0 (ls_out_pre_lb      ), priority=100  , match=(ip), action=(reg0[[0]] = 1; next;)
+])
+
+ovn-nbctl clear load_balancer $lb1_uuid vips
+ovn-nbctl --wait=sb sync
+AT_CHECK([ovn-sbctl lflow-list | grep "ls_out_pre_lb.*priority=100" | grep reg0 | sort], [0], [dnl
+])
+
+AT_CLEANUP

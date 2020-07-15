@@ -79,7 +79,7 @@ a/b => a error("`/' is only valid as part of `//' or `/*'.") b
 
 0/0
 0/1
-1/0 => error("Value contains unmasked 1-bits.")
+1/0 => 0/0
 1/1
 128/384
 1/3
@@ -99,7 +99,7 @@ a/b => a error("`/' is only valid as part of `//' or `/*'.") b
 0X => error("Hex digits expected following 0X.")
 0x0/0x0 => 0/0
 0x0/0x1 => 0/0x1
-0x1/0x0 => error("Value contains unmasked 1-bits.")
+0x1/0x0 => 0/0
 0xffff/0x1ffff
 0x. => error("Invalid syntax in hexadecimal constant.")
 
@@ -109,9 +109,12 @@ a/b => a error("`/' is only valid as part of `//' or `/*'.") b
 192.168.0.0/255.255.0.0 => 192.168.0.0/16
 192.168.0.0/255.255.255.0 => 192.168.0.0/24
 192.168.0.0/255.255.0.255
-192.168.0.0/255.0.0.0 => error("Value contains unmasked 1-bits.")
+192.168.0.0/255.0.0.0 => 192.0.0.0/8
 192.168.0.0/32
 192.168.0.0/255.255.255.255 => 192.168.0.0/32
+192.168.0.2/32
+192.168.0.2/30 => 192.168.0.0/30
+192.168.0.2/24 => 192.168.0.0/24
 1.2.3.4:5 => 1.2.3.4 : 5
 
 ::
@@ -135,7 +138,7 @@ FE:DC:ba:98:76:54 => fe:dc:ba:98:76:54
 01:00:00:00:00:00/01:00:00:00:00:00
 ff:ff:ff:ff:ff:ff/ff:ff:ff:ff:ff:ff
 fe:ff:ff:ff:ff:ff/ff:ff:ff:ff:ff:ff
-ff:ff:ff:ff:ff:ff/fe:ff:ff:ff:ff:ff => error("Value contains unmasked 1-bits.")
+ff:ff:ff:ff:ff:ff/fe:ff:ff:ff:ff:ff => fe:ff:ff:ff:ff:ff/fe:ff:ff:ff:ff:ff
 fe:x => error("Invalid numeric constant.")
 00:01:02:03:04:x => error("Invalid numeric constant.")
 
@@ -1026,6 +1029,18 @@ ct_lb(backends=fd0f::2,fd0f::3; hash_fields="eth_src,eth_dst,ip_src,ip_dst,tp_sr
     encodes as group:5
     uses group: id(5), name(type=select,selection_method=hash,fields(eth_src,eth_dst,ip_src,ip_dst,tp_src,tp_dst),bucket=bucket_id=0,weight:100,actions=ct(nat(dst=fd0f::2),commit,table=19,zone=NXM_NX_REG13[0..15]),bucket=bucket_id=1,weight:100,actions=ct(nat(dst=fd0f::3),commit,table=19,zone=NXM_NX_REG13[0..15]))
     has prereqs ip
+ct_lb(backends=fd0f::2,fd0f::3; hash_fields="eth_src,eth_dst,ip_src,ip_dst,tcp_src,tcp_dst");
+    encodes as group:6
+    uses group: id(6), name(type=select,selection_method=hash,fields(eth_src,eth_dst,ip_src,ip_dst,tcp_src,tcp_dst),bucket=bucket_id=0,weight:100,actions=ct(nat(dst=fd0f::2),commit,table=19,zone=NXM_NX_REG13[0..15]),bucket=bucket_id=1,weight:100,actions=ct(nat(dst=fd0f::3),commit,table=19,zone=NXM_NX_REG13[0..15]))
+    has prereqs ip
+ct_lb(backends=fd0f::2,fd0f::3; hash_fields="eth_src,eth_dst,ip_src,ip_dst,udp_src,udp_dst");
+    encodes as group:7
+    uses group: id(7), name(type=select,selection_method=hash,fields(eth_src,eth_dst,ip_src,ip_dst,udp_src,udp_dst),bucket=bucket_id=0,weight:100,actions=ct(nat(dst=fd0f::2),commit,table=19,zone=NXM_NX_REG13[0..15]),bucket=bucket_id=1,weight:100,actions=ct(nat(dst=fd0f::3),commit,table=19,zone=NXM_NX_REG13[0..15]))
+    has prereqs ip
+ct_lb(backends=fd0f::2,fd0f::3; hash_fields="eth_src,eth_dst,ip_src,ip_dst,sctp_src,sctp_dst");
+    encodes as group:8
+    uses group: id(8), name(type=select,selection_method=hash,fields(eth_src,eth_dst,ip_src,ip_dst,sctp_src,sctp_dst),bucket=bucket_id=0,weight:100,actions=ct(nat(dst=fd0f::2),commit,table=19,zone=NXM_NX_REG13[0..15]),bucket=bucket_id=1,weight:100,actions=ct(nat(dst=fd0f::3),commit,table=19,zone=NXM_NX_REG13[0..15]))
+    has prereqs ip
 
 # ct_next
 ct_next;
@@ -1235,6 +1250,12 @@ reg0[15] = put_dhcp_opts(offerip=10.0.0.4,router=10.0.0.1,netmask=255.255.255.0,
 reg0[15] = put_dhcp_opts(offerip=10.0.0.4,router=10.0.0.1,netmask=255.255.255.0,mtu=1400,ip_forward_enable=1,default_ttl=121,dns_server={8.8.8.8,7.7.7.7},classless_static_route={30.0.0.0/24,10.0.0.4,40.0.0.0/16,10.0.0.6,0.0.0.0/0,10.0.0.1},ethernet_encap=1,router_discovery=0,tftp_server="tftp_server_test");
     formats as reg0[15] = put_dhcp_opts(offerip = 10.0.0.4, router = 10.0.0.1, netmask = 255.255.255.0, mtu = 1400, ip_forward_enable = 1, default_ttl = 121, dns_server = {8.8.8.8, 7.7.7.7}, classless_static_route = {30.0.0.0/24, 10.0.0.4, 40.0.0.0/16, 10.0.0.6, 0.0.0.0/0, 10.0.0.1}, ethernet_encap = 1, router_discovery = 0, tftp_server = "tftp_server_test");
     encodes as controller(userdata=00.00.00.02.00.00.00.00.00.01.de.10.00.00.00.6f.0a.00.00.04.03.04.0a.00.00.01.01.04.ff.ff.ff.00.1a.02.05.78.13.01.01.17.01.79.06.08.08.08.08.08.07.07.07.07.79.14.18.1e.00.00.0a.00.00.04.10.28.00.0a.00.00.06.00.0a.00.00.01.24.01.01.1f.01.00.42.10.74.66.74.70.5f.73.65.72.76.65.72.5f.74.65.73.74,pause)
+reg2[5] = put_dhcp_opts(offerip=10.0.0.4,router=10.0.0.1,netmask=255.255.254.0,mtu=1400,domain_name="ovn.org",wpad="https://example.org",bootfile_name="https://127.0.0.1/boot.ipxe",path_prefix="/tftpboot",domain_search_list="ovn.org,abc.ovn.org");
+    formats as reg2[5] = put_dhcp_opts(offerip = 10.0.0.4, router = 10.0.0.1, netmask = 255.255.254.0, mtu = 1400, domain_name = "ovn.org", wpad = "https://example.org", bootfile_name = "https://127.0.0.1/boot.ipxe", path_prefix = "/tftpboot", domain_search_list = "ovn.org,abc.ovn.org");
+    encodes as controller(userdata=00.00.00.02.00.00.00.00.00.01.de.10.00.00.00.25.0a.00.00.04.03.04.0a.00.00.01.01.04.ff.ff.fe.00.1a.02.05.78.0f.07.6f.76.6e.2e.6f.72.67.fc.13.68.74.74.70.73.3a.2f.2f.65.78.61.6d.70.6c.65.2e.6f.72.67.43.1b.68.74.74.70.73.3a.2f.2f.31.32.37.2e.30.2e.30.2e.31.2f.62.6f.6f.74.2e.69.70.78.65.d2.09.2f.74.66.74.70.62.6f.6f.74.77.0f.03.6f.76.6e.03.6f.72.67.00.03.61.62.63.c0.00,pause)
+reg2[5] = put_dhcp_opts(offerip=10.0.0.4,router=10.0.0.1,netmask=255.255.254.0,mtu=1400,domain_name="ovn.org",wpad="https://example.org",bootfile_name="https://127.0.0.1/boot.ipxe",path_prefix="/tftpboot",domain_search_list="ovn.org,abc.ovn.org,def.ovn.org,ovn.test,def.ovn.test,test.org,abc.com");
+    formats as reg2[5] = put_dhcp_opts(offerip = 10.0.0.4, router = 10.0.0.1, netmask = 255.255.254.0, mtu = 1400, domain_name = "ovn.org", wpad = "https://example.org", bootfile_name = "https://127.0.0.1/boot.ipxe", path_prefix = "/tftpboot", domain_search_list = "ovn.org,abc.ovn.org,def.ovn.org,ovn.test,def.ovn.test,test.org,abc.com");
+    encodes as controller(userdata=00.00.00.02.00.00.00.00.00.01.de.10.00.00.00.25.0a.00.00.04.03.04.0a.00.00.01.01.04.ff.ff.fe.00.1a.02.05.78.0f.07.6f.76.6e.2e.6f.72.67.fc.13.68.74.74.70.73.3a.2f.2f.65.78.61.6d.70.6c.65.2e.6f.72.67.43.1b.68.74.74.70.73.3a.2f.2f.31.32.37.2e.30.2e.30.2e.31.2f.62.6f.6f.74.2e.69.70.78.65.d2.09.2f.74.66.74.70.62.6f.6f.74.77.35.03.6f.76.6e.03.6f.72.67.00.03.61.62.63.c0.00.03.64.65.66.c0.00.03.6f.76.6e.04.74.65.73.74.00.03.64.65.66.c0.15.04.74.65.73.74.c0.04.03.61.62.63.03.63.6f.6d.00,pause)
 
 reg1[0..1] = put_dhcp_opts(offerip = 1.2.3.4, router = 10.0.0.1);
     Cannot use 2-bit field reg1[0..1] where 1-bit field is required.
@@ -1252,6 +1273,8 @@ reg1[0] = put_dhcp_opts(offerip="xyzzy");
     DHCPv4 option offerip requires numeric value.
 reg1[0] = put_dhcp_opts(offerip=1.2.3.4, domain_name=1.2.3.4);
     DHCPv4 option domain_name requires string value.
+reg1[0] = put_dhcp_opts(offerip=1.2.3.4, domain_search_list=1.2.3.4);
+    DHCPv4 option domain_search_list requires string value.
 
 # nd_ns
 nd_ns { nd.target = xxreg0; output; };
@@ -1477,6 +1500,24 @@ icmp6 { };
     encodes as controller(userdata=00.00.00.0a.00.00.00.00)
     has prereqs ip6
 
+# icmp6_error
+icmp6_error { eth.dst = ff:ff:ff:ff:ff:ff; output; }; output;
+    encodes as controller(userdata=00.00.00.14.00.00.00.00.00.19.00.10.80.00.06.06.ff.ff.ff.ff.ff.ff.00.00.ff.ff.00.10.00.00.23.20.00.0e.ff.f8.40.00.00.00),resubmit(,64)
+    has prereqs ip6
+
+icmp6_error { };
+    formats as icmp6_error { drop; };
+    encodes as controller(userdata=00.00.00.14.00.00.00.00)
+    has prereqs ip6
+
+# icmp6_error with icmp6.frag_mtu
+icmp6_error { eth.dst = ff:ff:ff:ff:ff:ff; icmp6.frag_mtu = 1500; output; }; output;
+    encodes as controller(userdata=00.00.00.14.00.00.00.00.00.19.00.10.80.00.06.06.ff.ff.ff.ff.ff.ff.00.00.ff.ff.00.28.00.00.23.20.00.25.00.00.00.00.00.00.00.03.00.10.00.00.00.15.00.00.00.00.00.00.05.dc.00.04.00.04.00.00.00.00.ff.ff.00.10.00.00.23.20.00.0e.ff.f8.40.00.00.00),resubmit(,64)
+    has prereqs ip6
+
+icmp6.frag_mtu = 1500;
+    encodes as controller(userdata=00.00.00.15.00.00.00.00.00.00.05.dc,pause)
+
 # tcp_reset
 tcp_reset { eth.dst = ff:ff:ff:ff:ff:ff; output; }; output;
     encodes as controller(userdata=00.00.00.0b.00.00.00.00.00.19.00.10.80.00.06.06.ff.ff.ff.ff.ff.ff.00.00.ff.ff.00.10.00.00.23.20.00.0e.ff.f8.40.00.00.00),resubmit(,64)
@@ -1560,13 +1601,13 @@ handle_svc_check(reg0);
 # select
 reg9[16..31] = select(1=50, 2=100, 3, );
     formats as reg9[16..31] = select(1=50, 2=100, 3=100);
-    encodes as group:6
-    uses group: id(6), name(type=select,selection_method=dp_hash,bucket=bucket_id=0,weight:50,actions=load:1->xreg4[16..31],resubmit(,19),bucket=bucket_id=1,weight:100,actions=load:2->xreg4[16..31],resubmit(,19),bucket=bucket_id=2,weight:100,actions=load:3->xreg4[16..31],resubmit(,19))
+    encodes as group:9
+    uses group: id(9), name(type=select,selection_method=dp_hash,bucket=bucket_id=0,weight:50,actions=load:1->xreg4[16..31],resubmit(,19),bucket=bucket_id=1,weight:100,actions=load:2->xreg4[16..31],resubmit(,19),bucket=bucket_id=2,weight:100,actions=load:3->xreg4[16..31],resubmit(,19))
 
 reg0 = select(1, 2);
     formats as reg0 = select(1=100, 2=100);
-    encodes as group:7
-    uses group: id(7), name(type=select,selection_method=dp_hash,bucket=bucket_id=0,weight:100,actions=load:1->xxreg0[96..127],resubmit(,19),bucket=bucket_id=1,weight:100,actions=load:2->xxreg0[96..127],resubmit(,19))
+    encodes as group:10
+    uses group: id(10), name(type=select,selection_method=dp_hash,bucket=bucket_id=0,weight:100,actions=load:1->xxreg0[96..127],resubmit(,19),bucket=bucket_id=1,weight:100,actions=load:2->xxreg0[96..127],resubmit(,19))
 
 reg0 = select(1=, 2);
     Syntax error at `,' expecting weight.
@@ -1582,12 +1623,12 @@ reg0[0..14] = select(1, 2, 3);
     cannot use 15-bit field reg0[0..14] for "select", which requires at least 16 bits.
 
 fwd_group(liveness="true", childports="eth0", "lsp1");
-    encodes as group:8
-    uses group: id(8), name(type=select,selection_method=dp_hash,bucket=watch_port:5,load=0x5->NXM_NX_REG15[0..15],resubmit(,64),bucket=watch_port:17,load=0x17->NXM_NX_REG15[0..15],resubmit(,64))
+    encodes as group:11
+    uses group: id(11), name(type=select,selection_method=dp_hash,bucket=watch_port:5,load=0x5->NXM_NX_REG15[0..15],resubmit(,64),bucket=watch_port:17,load=0x17->NXM_NX_REG15[0..15],resubmit(,64))
 
 fwd_group(childports="eth0", "lsp1");
-    encodes as group:9
-    uses group: id(9), name(type=select,selection_method=dp_hash,bucket=load=0x5->NXM_NX_REG15[0..15],resubmit(,64),bucket=load=0x17->NXM_NX_REG15[0..15],resubmit(,64))
+    encodes as group:12
+    uses group: id(12), name(type=select,selection_method=dp_hash,bucket=load=0x5->NXM_NX_REG15[0..15],resubmit(,64),bucket=load=0x17->NXM_NX_REG15[0..15],resubmit(,64))
 
 fwd_group(childports=eth0);
     Syntax error at `eth0' expecting logical switch port.
@@ -5736,6 +5777,37 @@ test_dhcp 2 f00000000002 03 0 $ciaddr $offer_ip $request_ip 0 ff1000000001 $serv
 
 # NXT_RESUMEs should be 15.
 OVS_WAIT_UNTIL([test 15 = `cat ofctl_monitor*.log | grep -c NXT_RESUME`])
+
+$PYTHON "$ovs_srcdir/utilities/ovs-pcap.in" hv1/vif2-tx.pcap > 2.packets
+cat 2.expected | cut -c -48 > expout
+AT_CHECK([cat 2.packets | cut -c -48], [0], [expout])
+# Skipping the IPv4 checksum.
+cat 2.expected | cut -c 53- > expout
+AT_CHECK([cat 2.packets | cut -c 53-], [0], [expout])
+
+reset_pcap_file hv1-vif1 hv1/vif1
+reset_pcap_file hv1-vif2 hv1/vif2
+rm -f 1.expected
+rm -f 2.expected
+
+# Set domain search list option for ls1
+echo "------ Set domain search list --------"
+ovn-nbctl dhcp-options-set-options $d1 server_id=10.0.0.1 \
+server_mac=ff:10:00:00:00:01 lease_time=3600 router=10.0.0.1 \
+domain_search_list=\"test1.com,test2.com\"
+echo "------------------------------------------"
+
+# Send DHCPREQUEST in the SELECTING/INIT-REBOOT state with the offered IP
+# address in the Requested IP Address option.
+offer_ip=`ip_to_hex 10 0 0 6`
+server_ip=`ip_to_hex 10 0 0 1`
+ciaddr=`ip_to_hex 0 0 0 0`
+request_ip=$offer_ip
+expected_dhcp_opts=771305746573743103636f6d00057465737432c006330400000e100104ffffff0003040a00000136040a000001
+test_dhcp 2 f00000000002 03 0 $ciaddr $offer_ip $request_ip 0 ff1000000001 $server_ip 05 $expected_dhcp_opts
+
+# NXT_RESUMEs should be 16.
+OVS_WAIT_UNTIL([test 16 = `cat ofctl_monitor*.log | grep -c NXT_RESUME`])
 
 $PYTHON "$ovs_srcdir/utilities/ovs-pcap.in" hv1/vif2-tx.pcap > 2.packets
 cat 2.expected | cut -c -48 > expout
@@ -14943,17 +15015,17 @@ ovn_start
 
 ovn-nbctl ls-add sw0
 ovn-nbctl lsp-add sw0 sw0-port1
-ovn-nbctl lsp-set-addresses sw0-port1 "50:54:00:00:00:01 10.0.0.3"
+ovn-nbctl lsp-set-addresses sw0-port1 "50:54:00:00:00:01 10.0.0.3 1000::3"
 
 ovn-nbctl lr-add lr0
-ovn-nbctl lrp-add lr0 lr0-sw0 00:00:00:00:ff:01 10.0.0.1/24
+ovn-nbctl lrp-add lr0 lr0-sw0 00:00:00:00:ff:01 10.0.0.1/24 1000::1/64
 ovn-nbctl lsp-add sw0 sw0-lr0
 ovn-nbctl lsp-set-type sw0-lr0 router
 ovn-nbctl lsp-set-addresses sw0-lr0 router
 ovn-nbctl lsp-set-options sw0-lr0 router-port=lr0-sw0
 
 ovn-nbctl ls-add public
-ovn-nbctl lrp-add lr0 lr0-public 00:00:20:20:12:13 172.168.0.100/24
+ovn-nbctl lrp-add lr0 lr0-public 00:00:20:20:12:13 172.168.0.100/24 2000::1/64
 ovn-nbctl lsp-add public public-lr0
 ovn-nbctl lsp-set-type public-lr0 router
 ovn-nbctl lsp-set-addresses public-lr0 router
@@ -14967,6 +15039,7 @@ ovn-nbctl lsp-set-options ln-public network_name=phys
 
 ovn-nbctl lrp-set-gateway-chassis lr0-public hv1 20
 ovn-nbctl lr-nat-add lr0 snat 172.168.0.100 10.0.0.0/24
+ovn-nbctl lr-nat-add lr0 snat 2000::1 1000::/64
 
 net_add n1
 
@@ -15077,6 +15150,41 @@ test_ip_packet_larger() {
     fi
 }
 
+test_ip6_packet_larger() {
+    local icmp_pmtu_reply_expected=$1
+
+    local eth_src=505400000001
+    local eth_dst=00000000ff01
+
+    local ipv6_src=10000000000000000000000000000003
+    local ipv6_dst=20000000000000000000000000000002
+    local ipv6_rt=10000000000000000000000000000001
+
+    local payload=0000000000000000000000000000000000000000
+    local payload=${payload}0000000000000000000000000000000000000000
+    local payload=${payload}0000000000000000000000000000000000000000
+    local payload=${payload}0000000000000000000000000000000000000000
+
+    local ip6_hdr=6000000000583aff${ipv6_src}${ipv6_dst}
+    local packet=${eth_dst}${eth_src}86dd${ip6_hdr}8000ec7662f00001${payload}
+
+    as hv1 reset_pcap_file br-phys_n1 hv1/br-phys_n1
+    as hv1 reset_pcap_file hv1-vif1 hv1/vif1
+
+    # Send packet from sw0-port1 to outside
+    as hv1 ovs-appctl netdev-dummy/receive hv1-vif1 $packet
+
+    if test $icmp_pmtu_reply_expected = 1; then
+        icmp6_reply=${eth_src}${eth_dst}86dd6000000000883afe
+        icmp6_reply=${icmp6_reply}${ipv6_rt}${ipv6_src}020041ff00000076
+        icmp6_reply=${icmp6_reply}6000000000583afe${ipv6_src}${ipv6_dst}
+        icmp6_reply=${icmp6_reply}8000ec7662f00001${payload}
+        echo $icmp6_reply > hv1-vif1.expected
+
+        OVN_CHECK_PACKETS([hv1/vif1-tx.pcap], [hv1-vif1.expected])
+    fi
+}
+
 ovn-nbctl show
 ovn-sbctl show
 
@@ -15111,6 +15219,12 @@ OVS_WAIT_UNTIL([
 # Now the packet should be sent via the localnet port to br-phys.
 icmp_reply_expected=0
 test_ip_packet_larger $icmp_reply_expected
+
+# Set the gateway mtu to 118
+ovn-nbctl --wait=hv set logical_router_port lr0-public options:gateway_mtu=118
+icmp_reply_expected=1
+test_ip6_packet_larger $icmp_reply_expected
+
 OVN_CLEANUP([hv1])
 AT_CLEANUP
 
@@ -19282,7 +19396,7 @@ OVS_WAIT_UNTIL([
 send_arp_request 1 0 ${src_mac} $(ip_to_hex 10 0 0 254) $(ip_to_hex 10 0 0 121)
 
 # Verify that the ARP request is replied to from hv1 and not hv2.
-match_arp_req="priority=90.*${match_r1_metadata}.*arp_tpa=10.0.0.121,arp_op=1"
+match_arp_req="priority=92.*${match_r1_metadata}.*arp_tpa=10.0.0.121,arp_op=1"
 
 as hv1
 OVS_WAIT_UNTIL([
@@ -19302,7 +19416,7 @@ OVS_WAIT_UNTIL([
 send_arp_request 1 0 ${src_mac} $(ip_to_hex 10 0 0 254) $(ip_to_hex 10 0 0 122)
 
 # Verify that the ARP request is replied to from hv2 and not hv1.
-match_arp_req="priority=90.*${match_r1_metadata}.*arp_tpa=10.0.0.122,arp_op=1"
+match_arp_req="priority=92.*${match_r1_metadata}.*arp_tpa=10.0.0.122,arp_op=1"
 
 as hv2
 OVS_WAIT_UNTIL([
@@ -19346,7 +19460,7 @@ dst_ipv6=00100000000000000000000000000121
 send_nd_ns 1 0 ${src_mac} ${src_ipv6} ${dst_ipv6} 72dd
 
 # Verify that the ND_NS is replied to from hv1 and not hv2.
-match_nd_ns="priority=90.*${match_r1_metadata}.*icmp_type=135.*nd_target=10::121"
+match_nd_ns="priority=92.*${match_r1_metadata}.*icmp_type=135.*nd_target=10::121"
 
 as hv1
 OVS_WAIT_UNTIL([
@@ -19368,7 +19482,7 @@ dst_ipv6=00100000000000000000000000000122
 send_nd_ns 1 0 ${src_mac} ${src_ipv6} ${dst_ipv6} 72db
 
 # Verify that the ND_NS is replied to from hv2 and not hv1.
-match_nd_ns="priority=90.*${match_r1_metadata}.*icmp_type=135.*nd_target=10::122"
+match_nd_ns="priority=92.*${match_r1_metadata}.*icmp_type=135.*nd_target=10::122"
 
 as hv2
 OVS_WAIT_UNTIL([
@@ -20304,4 +20418,186 @@ AT_CHECK([
 ])
 
 OVN_CLEANUP([hv1])
+AT_CLEANUP
+
+AT_SETUP([ovn -- normalized lrp-add])
+ovn_start
+
+ovn-nbctl lr-add r1
+ovn-nbctl lrp-add r1 rp1 CC:DD:EE:EE:DD:CC AEF0::1/64 BEF0::1/64
+
+AT_CHECK([ovn-nbctl --may-exist lrp-add r1 rp1 cc:dd:ee:ee:dd:cc bef0:0000:0000:0000::1/64 aef0::1/64])
+AT_CLEANUP
+
+AT_SETUP([ovn -- normalized lr-nat-add])
+ovn_start
+
+ovn-nbctl lr-add r1
+ovn-nbctl lr-nat-add r1 snat AEF0::1 BEEF::/64
+ovn-nbctl lr-nat-add r1 dnat AEF0::1 BEEF::1
+
+AT_CHECK([ovn-nbctl --may-exist lr-nat-add r1 snat aef0:0000::1 beef:0000::/ffff:ffff:ffff:ffff::0])
+AT_CHECK([ovn-nbctl --may-exist lr-nat-add r1 dnat aef0:0000:00::1 beef::0001])
+AT_CLEANUP
+
+AT_SETUP([ovn -- normalized lr-nat-del])
+ovn_start
+
+ovn-nbctl lr-add r1
+ovn-nbctl lr-nat-add r1 snat AEF0::1 BEEF::/64
+ovn-nbctl lr-nat-add r1 dnat AEF0::1 BEEF::1
+
+AT_CHECK([ovn-nbctl --if-exists lr-nat-del r1 snat beef:0000::0/ffff:ffff:ffff:ffff::0])
+AT_CHECK([ovn-nbctl --if-exists lr-nat-del r1 dnat aef0:0000:00::1])
+AT_CLEANUP
+
+AT_SETUP([ovn -- Load balancer selection fields])
+AT_KEYWORDS([lb])
+ovn_start
+
+net_add n1
+
+sim_add hv1
+as hv1
+ovs-vsctl add-br br-phys
+ovn_attach n1 br-phys 192.168.0.1
+ovs-vsctl -- add-port br-int hv1-vif1 -- \
+    set interface hv1-vif1 external-ids:iface-id=sw0-p1 \
+    options:tx_pcap=hv1/vif1-tx.pcap \
+    options:rxq_pcap=hv1/vif1-rx.pcap \
+    ofport-request=1
+ovs-vsctl -- add-port br-int hv1-vif2 -- \
+    set interface hv1-vif2 external-ids:iface-id=sw0-p2 \
+    options:tx_pcap=hv1/vif2-tx.pcap \
+    options:rxq_pcap=hv1/vif2-rx.pcap \
+    ofport-request=2
+
+sim_add hv2
+as hv2
+ovs-vsctl add-br br-phys
+ovn_attach n1 br-phys 192.168.0.2
+ovs-vsctl -- add-port br-int hv2-vif1 -- \
+    set interface hv2-vif1 external-ids:iface-id=sw1-p1 \
+    options:tx_pcap=hv2/vif1-tx.pcap \
+    options:rxq_pcap=hv2/vif1-rx.pcap \
+    ofport-request=1
+
+ovn-nbctl ls-add sw0
+
+ovn-nbctl lsp-add sw0 sw0-p1
+ovn-nbctl lsp-set-addresses sw0-p1 "50:54:00:00:00:03 10.0.0.3"
+ovn-nbctl lsp-set-port-security sw0-p1 "50:54:00:00:00:03 10.0.0.3"
+
+ovn-nbctl lsp-add sw0 sw0-p2
+ovn-nbctl lsp-set-addresses sw0-p2 "50:54:00:00:00:04 10.0.0.4"
+ovn-nbctl lsp-set-port-security sw0-p2 "50:54:00:00:00:04 10.0.0.4"
+
+# Create port group and ACLs for sw0 ports.
+ovn-nbctl pg-add pg0_drop sw0-p1 sw0-p2
+ovn-nbctl acl-add pg0_drop from-lport 1001 "inport == @pg0_drop && ip" drop
+ovn-nbctl acl-add pg0_drop to-lport 1001 "outport == @pg0_drop && ip" drop
+
+ovn-nbctl pg-add pg0 sw0-p1 sw0-p2
+ovn-nbctl acl-add pg0 from-lport 1002 "inport == @pg0 && ip4" allow-related
+ovn-nbctl acl-add pg0 to-lport 1002 "outport == @pg0 && ip4 && ip4.src == 0.0.0.0/0 && icmp4" allow-related
+ovn-nbctl acl-add pg0 to-lport 1002 "outport == @pg0 && ip4 && ip4.src == 0.0.0.0/0 && tcp && tcp.dst == 80" allow-related
+ovn-nbctl acl-add pg0 to-lport 1002 "outport == @pg0 && ip4 && ip4.src == 0.0.0.0/0 && udp && udp.dst == 80" allow-related
+
+# Create the second logical switch with one port
+ovn-nbctl ls-add sw1
+ovn-nbctl lsp-add sw1 sw1-p1
+ovn-nbctl lsp-set-addresses sw1-p1 "40:54:00:00:00:03 20.0.0.3"
+ovn-nbctl lsp-set-port-security sw1-p1 "40:54:00:00:00:03 20.0.0.3"
+
+# Create port group and ACLs for sw1 ports.
+ovn-nbctl pg-add pg1_drop sw1-p1
+ovn-nbctl acl-add pg1_drop from-lport 1001 "inport == @pg1_drop && ip" drop
+ovn-nbctl acl-add pg1_drop to-lport 1001 "outport == @pg1_drop && ip" drop
+
+ovn-nbctl pg-add pg1 sw1-p1
+ovn-nbctl acl-add pg1 from-lport 1002 "inport == @pg1 && ip4" allow-related
+ovn-nbctl acl-add pg1 to-lport 1002 "outport == @pg1 && ip4 && ip4.src == 0.0.0.0/0 && icmp4" allow-related
+ovn-nbctl acl-add pg1 to-lport 1002 "outport == @pg1 && ip4 && ip4.src == 0.0.0.0/0 && tcp && tcp.dst == 80" allow-related
+ovn-nbctl acl-add pg1 to-lport 1002 "outport == @pg1 && ip4 && ip4.src == 0.0.0.0/0 && udp && udp.dst == 80" allow-related
+
+# Create a logical router and attach both logical switches
+ovn-nbctl lr-add lr0
+ovn-nbctl lrp-add lr0 lr0-sw0 00:00:00:00:ff:01 10.0.0.1/24
+ovn-nbctl lsp-add sw0 sw0-lr0
+ovn-nbctl lsp-set-type sw0-lr0 router
+ovn-nbctl lsp-set-addresses sw0-lr0 router
+ovn-nbctl lsp-set-options sw0-lr0 router-port=lr0-sw0
+
+ovn-nbctl lrp-add lr0 lr0-sw1 00:00:00:00:ff:02 20.0.0.1/24
+ovn-nbctl lsp-add sw1 sw1-lr0
+ovn-nbctl lsp-set-type sw1-lr0 router
+ovn-nbctl lsp-set-addresses sw1-lr0 router
+ovn-nbctl lsp-set-options sw1-lr0 router-port=lr0-sw1
+
+ovn-nbctl lb-add lb1 10.0.0.10:80 10.0.0.3:80,20.0.0.3:80
+lb1_uuid=$(ovn-nbctl --bare --columns _uuid list load_balancer)
+ovn-nbctl ls-lb-add sw0 lb1
+ovn-nbctl ls-lb-add sw1 lb1
+ovn-nbctl lr-lb-add lr0 lb1
+
+OVS_WAIT_UNTIL([
+    test $(as hv1 ovs-ofctl dump-groups br-int | \
+    grep "selection_method=dp_hash" -c) -eq 1
+])
+
+OVS_WAIT_UNTIL([
+    test $(as hv2 ovs-ofctl dump-groups br-int | \
+    grep "selection_method=dp_hash" -c) -eq 1
+])
+
+echo "lb1_uuid = $lb1_uuid"
+
+ovn-nbctl set load_balancer $lb1_uuid selection_fields="ip_src,ip_dst,tp_src,tp_dst"
+
+OVS_WAIT_UNTIL([
+    test $(as hv1 ovs-ofctl dump-groups br-int | \
+    grep "selection_method=hash,fields(ip_src,ip_dst,tcp_src,tcp_dst)" -c) -eq 1
+])
+
+OVS_WAIT_UNTIL([
+    test $(as hv2 ovs-ofctl dump-groups br-int | \
+    grep "selection_method=hash,fields(ip_src,ip_dst,tcp_src,tcp_dst)" -c) -eq 1
+])
+
+# Change the protocol to udp.
+ovn-nbctl set load_balancer $lb1_uuid protocol=udp
+OVS_WAIT_UNTIL([
+    test $(as hv1 ovs-ofctl dump-groups br-int | \
+    grep "selection_method=hash,fields(ip_src,ip_dst,udp_src,udp_dst)" -c) -eq 1
+])
+
+OVS_WAIT_UNTIL([
+    test $(as hv2 ovs-ofctl dump-groups br-int | \
+    grep "selection_method=hash,fields(ip_src,ip_dst,udp_src,udp_dst)" -c) -eq 1
+])
+
+# Change the protocol to udp.
+ovn-nbctl set load_balancer $lb1_uuid protocol=sctp
+OVS_WAIT_UNTIL([
+    test $(as hv1 ovs-ofctl dump-groups br-int | \
+    grep "selection_method=hash,fields(ip_src,ip_dst,sctp_src,sctp_dst)" -c) -eq 1
+])
+
+OVS_WAIT_UNTIL([
+    test $(as hv2 ovs-ofctl dump-groups br-int | \
+    grep "selection_method=hash,fields(ip_src,ip_dst,sctp_src,sctp_dst)" -c) -eq 1
+])
+
+ovn-nbctl set load_balancer $lb1_uuid selection_fields="ip_src,ip_dst,tp_dst"
+OVS_WAIT_UNTIL([
+    test $(as hv1 ovs-ofctl dump-groups br-int | \
+    grep "selection_method=hash,fields(ip_src,ip_dst,sctp_dst)" -c) -eq 1
+])
+
+OVS_WAIT_UNTIL([
+    test $(as hv2 ovs-ofctl dump-groups br-int | \
+    grep "selection_method=hash,fields(ip_src,ip_dst,sctp_dst)" -c) -eq 1
+])
+
+OVN_CLEANUP([hv1], [hv2])
 AT_CLEANUP

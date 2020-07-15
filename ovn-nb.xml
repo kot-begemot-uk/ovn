@@ -1277,7 +1277,7 @@
 
     <group title="Tunnel Key">
       <column name="options" key="requested-tnl-key"
-          type='{"type": "integer", "minInteger": 1, "maxInteger": 65535}'>
+          type='{"type": "integer", "minInteger": 1, "maxInteger": 32767}'>
         Configures the port binding tunnel key for the port.  Usually
         this is not needed because <code>ovn-northd</code> will assign an
         unique key for each port by itself.  However, if it is configured,
@@ -2334,7 +2334,7 @@
       </column>
 
       <column name="options" key="requested-tnl-key"
-          type='{"type": "integer", "minInteger": 1, "maxInteger": 65535}'>
+          type='{"type": "integer", "minInteger": 1, "maxInteger": 32767}'>
         Configures the port binding tunnel key for the port.  Usually
         this is not needed because <code>ovn-northd</code> will assign an
         unique key for each port by itself.  However, if it is configured,
@@ -2957,6 +2957,19 @@
         <column name="options" key="tftp_server">
           <p>
             The DHCPv4 option code for this option is 66.
+          </p>
+        </column>
+      </group>
+
+      <group title=" DHCP Options of type domains">
+        <p>
+          These options accept string value which is a comma separated
+          list of domain names. The domain names are encoded based on RFC 1035.
+        </p>
+
+        <column name="options" key="domain_search_list">
+          <p>
+            The DHCPv4 option code for this option is 119.
           </p>
         </column>
       </group>
