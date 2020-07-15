@@ -8417,6 +8417,64 @@ build_lrouter_force_snat_flows(struct hmap *lflows, struct ovn_datapath *od,
 }
 
 static void
+build_lrouter_flows_ingress_table_0_od(
+        struct ovn_datapath *od, struct hmap *lflows)
+{
+    /* Logical router ingress table 0: Admission control framework. */
+    if (od->nbr) {
+        /* Logical VLANs not supported.
+         * Broadcast/multicast source address is invalid. */
+        ovn_lflow_add(lflows, od, S_ROUTER_IN_ADMISSION, 100,
+                      "vlan.present || eth.src[40]", "drop;");
+    }
+}
+
+static void
+build_lrouter_flows_ingress_table_0_op(
+        struct ovn_port *op, struct hmap *lflows,
+        struct ds *match, struct ds *actions)
+{
+
+    /* Logical router ingress table 0: match (priority 50).
+     * Drop packets from disabled logical ports (since logical flow
+     * tables are default-drop).
+     * No ingress packets should be received on a chassisredirect
+     * port. */
+
+    if (op->nbrp && lrport_is_enabled(op->nbrp) && (!op->derived)) {
+        
+        ds_clear(match);
+        ds_clear(actions);
+
+        /* Store the ethernet address of the port receiving the packet.
+         * This will save us from having to match on inport further down in
+         * the pipeline.
+         */
+        ds_put_format(actions, REG_INPORT_ETH_ADDR " = %s; next;",
+                      op->lrp_networks.ea_s);
+
+        ds_put_format(match, "eth.mcast && inport == %s", op->json_key);
+        ovn_lflow_add_with_hint(lflows, op->od, S_ROUTER_IN_ADMISSION, 50,
+                                ds_cstr(match), ds_cstr(actions),
+                                &op->nbrp->header_);
+
+        ds_clear(match);
+        ds_put_format(match, "eth.dst == %s && inport == %s",
+                      op->lrp_networks.ea_s, op->json_key);
+        if (op->od->l3dgw_port && op == op->od->l3dgw_port
+            && op->od->l3redirect_port) {
+            /* Traffic with eth.dst = l3dgw_port->lrp_networks.ea_s
+             * should only be received on the "redirect-chassis". */
+            ds_put_format(match, " && is_chassis_resident(%s)",
+                          op->od->l3redirect_port->json_key);
+        }
+        ovn_lflow_add_with_hint(lflows, op->od, S_ROUTER_IN_ADMISSION, 50,
+                                ds_cstr(match),  ds_cstr(actions),
+                                &op->nbrp->header_);
+    }
+}
+
+static void
 build_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
                     struct hmap *lflows, struct shash *meter_groups,
                     struct hmap *lbs)
@@ -8427,65 +8485,14 @@ build_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
     struct ds match = DS_EMPTY_INITIALIZER;
     struct ds actions = DS_EMPTY_INITIALIZER;
 
-    /* Logical router ingress table 0: Admission control framework. */
     struct ovn_datapath *od;
     HMAP_FOR_EACH (od, key_node, datapaths) {
-        if (!od->nbr) {
-            continue;
-        }
-
-        /* Logical VLANs not supported.
-         * Broadcast/multicast source address is invalid. */
-        ovn_lflow_add(lflows, od, S_ROUTER_IN_ADMISSION, 100,
-                      "vlan.present || eth.src[40]", "drop;");
+        build_lrouter_flows_ingress_table_0_od(od, lflows);
     }
 
-    /* Logical router ingress table 0: match (priority 50). */
     struct ovn_port *op;
     HMAP_FOR_EACH (op, key_node, ports) {
-        if (!op->nbrp) {
-            continue;
-        }
-
-        if (!lrport_is_enabled(op->nbrp)) {
-            /* Drop packets from disabled logical ports (since logical flow
-             * tables are default-drop). */
-            continue;
-        }
-
-        if (op->derived) {
-            /* No ingress packets should be received on a chassisredirect
-             * port. */
-            continue;
-        }
-
-        /* Store the ethernet address of the port receiving the packet.
-         * This will save us from having to match on inport further down in
-         * the pipeline.
-         */
-        ds_clear(&actions);
-        ds_put_format(&actions, REG_INPORT_ETH_ADDR " = %s; next;",
-                      op->lrp_networks.ea_s);
-
-        ds_clear(&match);
-        ds_put_format(&match, "eth.mcast && inport == %s", op->json_key);
-        ovn_lflow_add_with_hint(lflows, op->od, S_ROUTER_IN_ADMISSION, 50,
-                                ds_cstr(&match), ds_cstr(&actions),
-                                &op->nbrp->header_);
-
-        ds_clear(&match);
-        ds_put_format(&match, "eth.dst == %s && inport == %s",
-                      op->lrp_networks.ea_s, op->json_key);
-        if (op->od->l3dgw_port && op == op->od->l3dgw_port
-            && op->od->l3redirect_port) {
-            /* Traffic with eth.dst = l3dgw_port->lrp_networks.ea_s
-             * should only be received on the "redirect-chassis". */
-            ds_put_format(&match, " && is_chassis_resident(%s)",
-                          op->od->l3redirect_port->json_key);
-        }
-        ovn_lflow_add_with_hint(lflows, op->od, S_ROUTER_IN_ADMISSION, 50,
-                                ds_cstr(&match),  ds_cstr(&actions),
-                                &op->nbrp->header_);
+        build_lrouter_flows_ingress_table_0_op(op, lflows, &match, &actions);
     }
 
     /* Logical router ingress table 1: LOOKUP_NEIGHBOR and
