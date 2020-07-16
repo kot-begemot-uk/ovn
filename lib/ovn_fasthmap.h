@@ -14,8 +14,13 @@
  * limitations under the License.
  */
 
-#ifndef HMAP_HAS_PARALLEL_MACROS
-#define HMAP_HAS_PARALLEL_MACROS 1
+#ifndef OVN_FASTHMAP_H 1
+#include "openvswitch/hmap.h"
+
+#ifdef OVS_HAS_PARALLEL_HMAP_MACROS
+#include "fasthmap.h"
+#else
+#define OVN_FASTHMAP_H 1
 
 /* if the parallel macros are defined by hmap.h or any other ovs define
  * we skip over the ovn specific definitions.
@@ -29,7 +34,6 @@ extern "C" {
 #include <stdlib.h>
 #include <semaphore.h>
 #include "openvswitch/util.h"
-#include "openvswitch/hmap.h"
 #include "openvswitch/thread.h"
 #include "ovs-atomic.h"
 
@@ -201,6 +205,8 @@ parallel_hmap_next(const struct hmap *hmap,
 
 #ifdef  __cplusplus
 }
+#endif
+
 #endif
 
 #endif /* lib/fast-hmap.h */
