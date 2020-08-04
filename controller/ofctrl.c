@@ -1125,7 +1125,6 @@ struct ofput_update_info {
         struct ovs_list to_destroy;
 };
 
-
 struct ofctrl_process_result {
     struct ovs_list list_node;
     struct ovn_flow *flow;
@@ -1298,6 +1297,91 @@ static void ofctrl_add_to_installed_iter(
     }
 }
 
+struct ofput_add_pool {
+    struct worker_pool *pool;
+};
+
+struct ofput_add_info {
+        struct ovn_desired_flow_table *flow_table;
+        struct ovs_list msgs;
+        struct ovs_list to_add;
+};
+
+struct ofput_add_final_result {
+        struct ovs_list **msgs;
+        struct ovs_list **to_add;
+};
+
+static void *ofput_add_thread(void *arg) {
+    struct worker_control *control = (struct worker_control *) arg;
+    struct ofput_add_pool *workload;
+    struct ofput_add_info *oai;
+    struct ovn_flow *i;
+    int bnum;
+
+    while (!seize_fire()) {
+        sem_wait(&control->fire);
+        workload = (struct ofput_add_pool *) control->workload;
+        oai = (struct ofput_add_info *) control->data;
+        if (oai && workload) {
+            for (bnum = control->id;
+                    bnum <= oai->flow_table->match_flow_table.mask;
+                    bnum += workload->pool->size)
+            {
+                HMAP_FOR_EACH_IN_PARALLEL (
+                        i, match_hmap_node, bnum,
+                        &oai->flow_table->match_flow_table) {
+                    if (seize_fire()) {
+                        return NULL;
+                    }
+                    ofctrl_add_to_installed_iter(
+                        i,
+                        &oai->msgs,
+                        &oai->to_add);
+                }
+            }
+            atomic_store_relaxed(&control->finished, true);
+            atomic_thread_fence(memory_order_release);
+        }
+        sem_post(control->done);
+    }
+    return NULL;
+}
+
+
+static void ofput_add_callback(
+        struct worker_pool *pool, void *fin_result, int index)
+{
+    /* fin_result is final result */
+    struct ofput_add_info *oai =
+        (struct ofput_add_info *) pool->controls[index].data;
+    struct ofput_add_final_result *result =
+        (struct ofput_add_final_result *) fin_result;
+
+    merge_lists(result->msgs, &oai->msgs);
+    merge_lists(result->to_add, &oai->to_add);
+}
+
+static struct ofput_add_pool *add_pool = NULL;
+
+static void init_add_pool(void) {
+
+    int index;
+
+    if (!add_pool) {
+        add_pool =
+            xmalloc(sizeof(struct ofput_add_pool));
+        add_pool->pool =
+            add_worker_pool(ofput_add_thread);
+
+        for (index = 0; index < add_pool->pool->size; index++) {
+            add_pool->pool->controls[index].workload =
+                add_pool;
+         }
+     }
+}
+
+
 static bool
 hmap_safe_remove(struct hmap *hmap, struct hmap_node *node, size_t hash)
 {
@@ -1430,10 +1514,12 @@ ofctrl_put(struct ovn_desired_flow_table *flow_table,
      * longer desired, delete them; if any of them should have different
      * actions, update them. */
 
-    struct ovs_list *to_destroy = NULL;
+    struct ovs_list to_destroy = OVS_LIST_INITIALIZER(&to_destroy);
+    struct ovs_list *merged_destroy = NULL;
     struct ovs_list *merged_msgs = NULL;
 
     merge_lists(&merged_msgs, &msgs);
+
     struct ofput_update_info *oui = NULL;
 
     if (hmap_count(&installed_flows) > OFPUT_CUTOFF) {
@@ -1458,22 +1544,22 @@ ofctrl_put(struct ovn_desired_flow_table *flow_table,
         }
 
         combined_result.msgs = &merged_msgs;
-        combined_result.to_destroy = &to_destroy;
+        combined_result.to_destroy = &merged_destroy;
 
         run_pool_callback(
                 update_pool->pool,
                 &combined_result,
                 ofput_update_callback);
 
-
     } else {
+        merged_destroy = &to_destroy;
         HMAP_FOR_EACH (i, match_hmap_node, &installed_flows) {
             ofctrl_update_installed_iter(
-                    i, flow_table, merged_msgs, to_destroy);
+                    i, flow_table, &msgs, merged_destroy);
         }
     }
-    if (to_destroy != NULL) {
-        LIST_FOR_EACH_POP (td, list_node, to_destroy) {
+    if (merged_destroy != NULL) {
+        LIST_FOR_EACH_POP (td, list_node, merged_destroy) {
             struct ovn_flow *tr = td->flow;
             if (hmap_safe_remove(
                         &installed_flows, &tr->match_hmap_node, td->hash)) {
@@ -1484,19 +1570,54 @@ ofctrl_put(struct ovn_desired_flow_table *flow_table,
     }
     /* Iterate through the desired flows and add those that aren't found
      * in the installed flow table. */
+
+    struct ofput_add_info *oai = NULL;
     struct ovn_flow *d;
-    HMAP_FOR_EACH (d, match_hmap_node, &flow_table->match_flow_table) {
-        ofctrl_add_to_installed_iter(d, merged_msgs, &to_add);
+    struct ovs_list *merged_add = NULL;
+
+    if (hmap_count(&flow_table->match_flow_table) > OFPUT_CUTOFF) {
+
+        init_add_pool();
+
+        struct ofput_add_final_result combined_result;
+
+        oai = xmalloc(
+            sizeof(struct ofput_add_info) *
+                add_pool->pool->size);
+
+        int index;
+
+        for (index = 0;
+                index < add_pool->pool->size; index++) {
+
+            oai[index].flow_table = flow_table;
+            ovs_list_init(&oai[index].msgs);
+            ovs_list_init(&oai[index].to_add);
+            add_pool->pool->controls[index].data = &oai[index];
+        }
+
+        combined_result.msgs = &merged_msgs;
+        combined_result.to_add = &merged_add;
+
+        run_pool_callback(
+                add_pool->pool,
+                &combined_result,
+                ofput_add_callback);
+    } else {
+        merged_add = &to_add;
+        HMAP_FOR_EACH (d, match_hmap_node, &flow_table->match_flow_table) {
+            ofctrl_add_to_installed_iter(d, merged_msgs, merged_add);
+        }
     }
 
-
-    LIST_FOR_EACH_POP (td, list_node, &to_add) {
-        struct ovn_flow *new_node = ofctrl_dup_flow(td->flow);
-        hmap_insert(&installed_flows, &new_node->match_hmap_node,
-                    new_node->match_hmap_node.hash);
-        free(td);
+    if (merged_add != NULL) {
+        LIST_FOR_EACH_POP (td, list_node, merged_add) {
+            struct ovn_flow *new_node = ofctrl_dup_flow(td->flow);
+            hmap_insert(&installed_flows, &new_node->match_hmap_node,
+                        new_node->match_hmap_node.hash);
+            free(td);
+        }
     }
-
 
     /* Iterate through the installed groups from previous runs. If they
      * are not needed delete them. */
@@ -1548,7 +1669,7 @@ ofctrl_put(struct ovn_desired_flow_table *flow_table,
         struct ofpbuf *barrier = ofputil_encode_barrier_request(OFP15_VERSION);
         const struct ofp_header *oh = barrier->data;
         ovs_be32 xid_ = oh->xid;
-        ovs_list_push_back(&msgs, &barrier->list_node);
+        ovs_list_push_back(merged_msgs, &barrier->list_node);
 
         /* Queue the messages. */
         struct ofpbuf *msg;
@@ -1612,6 +1733,9 @@ ofctrl_put(struct ovn_desired_flow_table *flow_table,
 
     if (oui != NULL) {
         free(oui);
+    }
+    if (oai != NULL) {
+        free(oai);
     }
 }
 
