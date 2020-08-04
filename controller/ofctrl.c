@@ -1402,7 +1402,7 @@ hmap_safe_remove(struct hmap *hmap, struct hmap_node *node, size_t hash)
     return false;
 }
 
-#define OFPUT_CUTOFF 1
+#define OFPUT_CUTOFF 128
 
 /* Replaces the flow table on the switch, if possible, by the flows added
  * with ofctrl_add_flow().
