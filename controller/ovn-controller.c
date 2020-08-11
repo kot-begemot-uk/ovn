@@ -2390,9 +2390,17 @@ main(int argc, char *argv[])
             }
 
             if (br_int) {
+                int64_t old_nb_cfg = get_nb_cfg(sbrec_sb_global_table_get(
+                                                   ovnsb_idl_loop.idl));
                 ct_zones_data = engine_get_data(&en_ct_zones);
                 if (ct_zones_data) {
                     ofctrl_run(br_int, &ct_zones_data->pending);
+                    if (ovnsb_idl_txn && chassis) {
+                        int64_t cur_cfg = ofctrl_get_cur_cfg();
+                        if (cur_cfg && cur_cfg != chassis->nb_cfg) {
+                            sbrec_chassis_set_nb_cfg(chassis, cur_cfg);
+                        }
+                    }
                 }
 
                 if (chassis) {
@@ -2452,8 +2460,7 @@ main(int argc, char *argv[])
                         ofctrl_put(&flow_output_data->flow_table,
                                    &ct_zones_data->pending,
                                    sbrec_meter_table_get(ovnsb_idl_loop.idl),
-                                   get_nb_cfg(sbrec_sb_global_table_get(
-                                                   ovnsb_idl_loop.idl)),
+                                   old_nb_cfg,
                                    engine_node_changed(&en_flow_output));
                     }
                     runtime_data = engine_get_data(&en_runtime_data);
@@ -2515,6 +2522,10 @@ main(int argc, char *argv[])
                 int64_t cur_cfg = ofctrl_get_cur_cfg();
                 if (cur_cfg && cur_cfg != chassis->nb_cfg) {
                     sbrec_chassis_set_nb_cfg(chassis, cur_cfg);
+                    if (!ovsdb_idl_loop_commit_and_wait(&ovnsb_idl_loop)) {
+                        VLOG_INFO("OVNSB commit failed, force recompute next time.");
+                        engine_set_force_recompute(true);
+                    }
                 }
             }
 
