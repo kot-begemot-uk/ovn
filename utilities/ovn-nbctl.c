@@ -43,6 +43,7 @@
 #include "unixctl.h"
 #include "util.h"
 #include "openvswitch/vlog.h"
+#include "async-io.h"
 
 VLOG_DEFINE_THIS_MODULE(nbctl);
 
@@ -6722,6 +6723,7 @@ server_loop(struct ovsdb_idl *idl, int argc, char *argv[])
     puts(unixctl_server_get_path(server));
     fflush(stdout);
     server_cmd_init(idl, &exiting);
+    async_io_enable();
 
     for (;;) {
         ovsdb_idl_run(idl);
