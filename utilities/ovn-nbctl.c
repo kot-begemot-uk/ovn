@@ -40,7 +40,7 @@
 #include "table.h"
 #include "timeval.h"
 #include "timer.h"
-#include "unixctl.h"
+#include "unbctl.h"
 #include "util.h"
 #include "openvswitch/vlog.h"
 #include "async-io.h"
@@ -88,12 +88,12 @@ static int leader_only = true;
  * are specified in the connetion method string. */
 static int shuffle_remotes = true;
 
-/* --unixctl-path: Path to use for unixctl server, for "monitor" and "snoop"
+/* --unbctl-path: Path to use for unbctl server, for "monitor" and "snoop"
      commands. */
-static char *unixctl_path;
+static char *unbctl_path;
 
-static unixctl_cb_func server_cmd_exit;
-static unixctl_cb_func server_cmd_run;
+static unbctl_cb_func server_cmd_exit;
+static unbctl_cb_func server_cmd_run;
 
 static void nbctl_cmd_init(void);
 OVS_NO_RETURN static void usage(void);
@@ -171,7 +171,7 @@ main(int argc, char *argv[])
      *    - An OVN_NB_DAEMON environment variable implies client mode.
      *
      *    - Otherwise, we're in direct mode. */
-    char *socket_name = unixctl_path ?: getenv("OVN_NB_DAEMON");
+    char *socket_name = unbctl_path ?: getenv("OVN_NB_DAEMON");
     if (((socket_name && socket_name[0])
          || has_option(parsed_options, n_parsed_options, 'u'))
         && !will_detach(parsed_options, n_parsed_options)) {
@@ -427,7 +427,7 @@ get_all_options(void)
         {"shuffle-remotes", no_argument, NULL, OPT_SHUFFLE_REMOTES},
         {"no-shuffle-remotes", no_argument, NULL, OPT_NO_SHUFFLE_REMOTES},
         {"version", no_argument, NULL, 'V'},
-        {"unixctl", required_argument, NULL, 'u'},
+        {"unbctl", required_argument, NULL, 'u'},
         MAIN_LOOP_LONG_OPTIONS,
         OVN_DAEMON_LONG_OPTIONS,
         VLOG_LONG_OPTIONS,
@@ -540,7 +540,7 @@ apply_options_direct(const struct ovs_cmdl_parsed_option *parsed_options,
             break;
 
         case 'u':
-            unixctl_path = optarg;
+            unbctl_path = optarg;
             break;
 
         case 'V':
@@ -6596,16 +6596,16 @@ out:
 }
 
 static void
-server_cmd_exit(struct unixctl_conn *conn, int argc OVS_UNUSED,
+server_cmd_exit(struct unbctl_conn *conn, int argc OVS_UNUSED,
                 const char *argv[] OVS_UNUSED, void *exiting_)
 {
     bool *exiting = exiting_;
     *exiting = true;
-    unixctl_command_reply(conn, NULL);
+    unbctl_command_reply(conn, NULL);
 }
 
 static void
-server_cmd_run(struct unixctl_conn *conn, int argc, const char **argv_,
+server_cmd_run(struct unbctl_conn *conn, int argc, const char **argv_,
                void *idl_)
 {
     struct ovsdb_idl *idl = idl_;
@@ -6634,13 +6634,13 @@ server_cmd_run(struct unixctl_conn *conn, int argc, const char **argv_,
     shash_init(&local_options);
     error = server_parse_options(argc, argv, &local_options, &n_options);
     if (error) {
-        unixctl_command_reply_error(conn, error);
+        unbctl_command_reply_error(conn, error);
         goto out;
     }
     error = ctl_parse_commands(argc - n_options, argv + n_options,
                                &local_options, &commands, &n_commands);
     if (error) {
-        unixctl_command_reply_error(conn, error);
+        unbctl_command_reply_error(conn, error);
         goto out;
     }
     VLOG(ctl_might_write_to_db(commands, n_commands) ? VLL_INFO : VLL_DBG,
@@ -6655,12 +6655,12 @@ server_cmd_run(struct unixctl_conn *conn, int argc, const char **argv_,
 
     error = run_prerequisites(commands, n_commands, idl);
     if (error) {
-        unixctl_command_reply_error(conn, error);
+        unbctl_command_reply_error(conn, error);
         goto out;
     }
     error = main_loop(args, commands, n_commands, idl, wait_timeout);
     if (error) {
-        unixctl_command_reply_error(conn, error);
+        unbctl_command_reply_error(conn, error);
         goto out;
     }
 
@@ -6679,7 +6679,7 @@ server_cmd_run(struct unixctl_conn *conn, int argc, const char **argv_,
         table_destroy(c->table);
         free(c->table);
     }
-    unixctl_command_reply(conn, ds_cstr_ro(&output));
+    unbctl_command_reply(conn, ds_cstr_ro(&output));
     ds_destroy(&output);
 
 out:
@@ -6699,28 +6699,28 @@ out:
 static void
 server_cmd_init(struct ovsdb_idl *idl, bool *exiting)
 {
-    unixctl_command_register("exit", "", 0, 0, server_cmd_exit, exiting);
-    unixctl_command_register("run", "", 0, INT_MAX, server_cmd_run, idl);
+    unbctl_command_register("exit", "", 0, 0, server_cmd_exit, exiting);
+    unbctl_command_register("run", "", 0, INT_MAX, server_cmd_run, idl);
 }
 
 static void
 server_loop(struct ovsdb_idl *idl, int argc, char *argv[])
 {
-    struct unixctl_server *server = NULL;
+    struct unbctl_server *server = NULL;
     bool exiting = false;
 
     service_start(&argc, &argv);
     daemonize_start(false);
 
-    char *abs_unixctl_path = get_abs_unix_ctl_path(unixctl_path);
-    int error = unixctl_server_create(abs_unixctl_path, &server);
-    free(abs_unixctl_path);
+    char *abs_unbctl_path = get_abs_unix_ctl_path(unbctl_path);
+    int error = unbctl_server_create(abs_unbctl_path, &server);
+    free(abs_unbctl_path);
 
     if (error) {
-        ctl_fatal("failed to create unixctl server (%s)",
+        ctl_fatal("failed to create unbctl server (%s)",
                   ovs_retval_to_string(error));
     }
-    puts(unixctl_server_get_path(server));
+    puts(unbctl_server_get_path(server));
     fflush(stdout);
     server_cmd_init(idl, &exiting);
     async_io_enable();
@@ -6735,18 +6735,18 @@ server_loop(struct ovsdb_idl *idl, int argc, char *argv[])
 
         if (ovsdb_idl_has_ever_connected(idl)) {
             daemonize_complete();
-            unixctl_server_run(server);
+            unbctl_server_run(server);
         }
         if (exiting) {
             break;
         }
 
         ovsdb_idl_wait(idl);
-        unixctl_server_wait(server);
+        unbctl_server_wait(server);
         poll_block();
     }
 
-    unixctl_server_destroy(server);
+    unbctl_server_destroy(server);
 }
 
 static void
@@ -6832,7 +6832,7 @@ nbctl_client(const char *socket_name,
     ctl_timeout_setup(timeout);
 
     struct jsonrpc *client;
-    int error = unixctl_client_create(socket_name, &client);
+    int error = unbctl_client_create(socket_name, &client);
     if (error) {
         ctl_fatal("%s: could not connect to ovn-nb daemon (%s); "
                   "unset OVN_NB_DAEMON to avoid using daemon",
@@ -6841,7 +6841,7 @@ nbctl_client(const char *socket_name,
 
     char *cmd_result;
     char *cmd_error;
-    error = unixctl_client_transact(client, "run",
+    error = unbctl_client_transact(client, "run",
                                     args.n, args.names,
                                     &cmd_result, &cmd_error);
     if (error) {
