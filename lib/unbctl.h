@@ -42,6 +42,8 @@ int unbctl_client_transact(struct jsonrpc *client,
 struct unbctl_conn;
 typedef void unbctl_cb_func(struct unbctl_conn *,
                              int argc, const char *argv[], void *aux);
+typedef void unbctl_onclose_func(struct unbctl_conn *);
+void unbctl_onclose_register(unbctl_onclose_func *cl);
 void unbctl_command_register(const char *name, const char *usage,
                               int min_args, int max_args,
                               unbctl_cb_func *cb, void *aux);

@@ -59,9 +59,17 @@ struct unbctl_server {
     char *path;
 };
 
+static unbctl_onclose_func *close_hook = NULL;
+
 static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 5);
 
 static struct shash commands = SHASH_INITIALIZER(&commands);
+
+void unbctl_onclose_register(unbctl_onclose_func *cl)
+{
+    close_hook = cl;
+}
+
 
 static void
 unbctl_list_commands(struct unbctl_conn *conn, int argc OVS_UNUSED,
@@ -357,6 +365,9 @@ run_connection(struct unbctl_conn *conn)
 static void
 kill_connection(struct unbctl_conn *conn)
 {
+    if (close_hook) {
+        (close_hook)(conn);
+    }
     ovs_list_remove(&conn->node);
     jsonrpc_close(conn->rpc);
     json_destroy(conn->request_id);
