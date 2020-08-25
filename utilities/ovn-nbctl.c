@@ -92,6 +92,20 @@ static int shuffle_remotes = true;
      commands. */
 static char *unbctl_path;
 
+struct nbctl_queue_element {
+    struct ovs_list list_node;
+    struct unbctl_conn *conn;
+    char *args;
+    struct ctl_command *commands;
+    size_t n_commands;
+    struct ovsdb_idl *idl;
+    unsigned int timeout;
+    int argc;
+    char **argv;
+};
+
+static struct ovs_list nbctl_queue = OVS_LIST_INITIALIZER(&nbctl_queue);
+
 static unbctl_cb_func server_cmd_exit;
 static unbctl_cb_func server_cmd_run;
 
@@ -123,6 +137,8 @@ static char * OVS_WARN_UNUSED_RESULT main_loop(const char *args,
                                                struct ovsdb_idl *idl,
                                                const struct timer *);
 static void server_loop(struct ovsdb_idl *idl, int argc, char *argv[]);
+
+static void nbctl_run_queue(void);
 
 int
 main(int argc, char *argv[])
@@ -245,6 +261,17 @@ main(int argc, char *argv[])
 
     free(args);
     exit(EXIT_SUCCESS);
+}
+
+static void on_close_func(struct unbctl_conn *conn)
+{
+    struct nbctl_queue_element *elem, *next;
+    LIST_FOR_EACH_SAFE (elem, next, list_node, &nbctl_queue) {
+        if (elem->conn == conn) {
+            ovs_list_remove(&elem->list_node);
+            free(elem);
+        }
+    }
 }
 
 static char *
@@ -6604,6 +6631,93 @@ server_cmd_exit(struct unbctl_conn *conn, int argc OVS_UNUSED,
     unbctl_command_reply(conn, NULL);
 }
 
+static void server_run_element(struct nbctl_queue_element *elem)
+{
+    char *error = run_prerequisites(
+            elem->commands, elem->n_commands, elem->idl);
+    struct timer *wait_timeout = NULL;
+    struct timer wait_timeout_;
+    if (elem->timeout) {
+        timer_set_duration(&wait_timeout_, timeout * 1000);
+        wait_timeout = &wait_timeout_;
+    }
+    if (error) {
+        unbctl_command_reply_error(elem->conn, error);
+        return;
+    }
+    error = main_loop(
+            elem->args, elem->commands, elem->n_commands,
+            elem->idl, wait_timeout);
+    if (error) {
+        unbctl_command_reply_error(elem->conn, error);
+        return;
+    }
+
+    struct ds output = DS_EMPTY_INITIALIZER;
+    table_format_reset();
+    for (struct ctl_command *c = elem->commands;
+            c < &elem->commands[elem->n_commands]; c++) {
+        if (c->table) {
+            table_format(c->table, &table_style, &output);
+        } else if (oneline) {
+            oneline_format(&c->output, &output);
+        } else {
+            ds_put_cstr(&output, ds_cstr_ro(&c->output));
+        }
+        ds_destroy(&c->output);
+        table_destroy(c->table);
+        free(c->table);
+    }
+    unbctl_command_reply(elem->conn, ds_cstr_ro(&output));
+    ds_destroy(&output);
+}
+
+static void nbctl_destroy_element(struct nbctl_queue_element *elem)
+{
+    for (struct ctl_command *c = elem->commands; c < &elem->commands[elem->n_commands]; c++) {
+        shash_destroy_free_data(&c->options);
+    }
+    free(elem->commands);
+    free(elem->args);
+    for (int i = 0; i < elem->argc; i++) {
+        free(elem->argv[i]);
+    }
+    free(elem->argv);
+    free(elem);
+}
+
+
+static void nbctl_run_queue(void)
+{
+    struct nbctl_queue_element *elem;
+    LIST_FOR_EACH_POP (elem, list_node, &nbctl_queue) {
+        server_run_element(elem);
+        nbctl_destroy_element(elem);
+    }
+}
+
+static void server_cmd_run_exec(
+        struct unbctl_conn *conn,
+        char *args,
+        struct ctl_command *commands,
+        size_t n_commands,
+        struct ovsdb_idl *idl,
+        unsigned int tm,
+        int argc, char **argv)
+{
+    struct nbctl_queue_element *elem
+        = xmalloc(sizeof(struct nbctl_queue_element));
+    elem->conn = conn;
+    elem->args = args;
+    elem->commands = commands;
+    elem->n_commands = n_commands;
+    elem->idl = idl;
+    elem->timeout = tm;
+    elem->argc = argc;
+    elem->argv = argv;
+    ovs_list_push_back(&nbctl_queue, &elem->list_node);
+}
+
 static void
 server_cmd_run(struct unbctl_conn *conn, int argc, const char **argv_,
                void *idl_)
@@ -6646,54 +6760,12 @@ server_cmd_run(struct unbctl_conn *conn, int argc, const char **argv_,
     VLOG(ctl_might_write_to_db(commands, n_commands) ? VLL_INFO : VLL_DBG,
          "Running command %s", args);
 
-    struct timer *wait_timeout = NULL;
-    struct timer wait_timeout_;
-    if (timeout) {
-        wait_timeout = &wait_timeout_;
-        timer_set_duration(wait_timeout, timeout * 1000);
-    }
 
-    error = run_prerequisites(commands, n_commands, idl);
-    if (error) {
-        unbctl_command_reply_error(conn, error);
-        goto out;
-    }
-    error = main_loop(args, commands, n_commands, idl, wait_timeout);
-    if (error) {
-        unbctl_command_reply_error(conn, error);
-        goto out;
-    }
-
-    struct ds output = DS_EMPTY_INITIALIZER;
-    table_format_reset();
-    for (struct ctl_command *c = commands; c < &commands[n_commands]; c++) {
-        if (c->table) {
-            table_format(c->table, &table_style, &output);
-        } else if (oneline) {
-            oneline_format(&c->output, &output);
-        } else {
-            ds_put_cstr(&output, ds_cstr_ro(&c->output));
-        }
-
-        ds_destroy(&c->output);
-        table_destroy(c->table);
-        free(c->table);
-    }
-    unbctl_command_reply(conn, ds_cstr_ro(&output));
-    ds_destroy(&output);
+    server_cmd_run_exec(conn, args, commands, n_commands, idl, timeout, argc, argv);
 
 out:
-    free(error);
-    for (struct ctl_command *c = commands; c < &commands[n_commands]; c++) {
-        shash_destroy_free_data(&c->options);
-    }
-    free(commands);
     shash_destroy_free_data(&local_options);
-    free(args);
-    for (int i = 0; i < argc; i++) {
-        free(argv[i]);
-    }
-    free(argv);
+    free(error);
 }
 
 static void
@@ -6724,6 +6796,7 @@ server_loop(struct ovsdb_idl *idl, int argc, char *argv[])
     fflush(stdout);
     server_cmd_init(idl, &exiting);
     async_io_enable();
+    unbctl_onclose_register(on_close_func);
 
     for (;;) {
         ovsdb_idl_run(idl);
@@ -6736,6 +6809,7 @@ server_loop(struct ovsdb_idl *idl, int argc, char *argv[])
         if (ovsdb_idl_has_ever_connected(idl)) {
             daemonize_complete();
             unbctl_server_run(server);
+            nbctl_run_queue();
         }
         if (exiting) {
             break;
