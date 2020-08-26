@@ -6708,6 +6708,9 @@ static void nbctl_run_queue(struct ovsdb_idl *idl)
             struct ovsdb_idl_txn *txn =
                 the_idl_txn = ovsdb_idl_txn_create(idl);
             const struct nbrec_nb_global *nb = nbrec_nb_global_first(idl);
+            if (!nb) {
+                nb = nbrec_nb_global_insert(txn);
+            }
 
             struct ovs_list completed = OVS_LIST_INITIALIZER(&completed);
             struct ovs_list in_error = OVS_LIST_INITIALIZER(&in_error);
