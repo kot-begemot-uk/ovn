@@ -6638,42 +6638,6 @@ server_cmd_exit(struct unbctl_conn *conn, int argc OVS_UNUSED,
     unbctl_command_reply(conn, NULL);
 }
 
-static void server_run_element(struct nbctl_queue_element *elem,
-        struct ovsdb_idl *idl)
-{
-    char *error = run_prerequisites(elem, idl);
-    if (elem->timeout) {
-        timer_set_duration(&elem->wait_timeout, timeout * 1000);
-    }
-    if (error) {
-        unbctl_command_reply_error(elem->conn, error);
-        return;
-    }
-    error = main_loop(elem, idl);
-    if (error) {
-        unbctl_command_reply_error(elem->conn, error);
-        return;
-    }
-
-    struct ds output = DS_EMPTY_INITIALIZER;
-    table_format_reset();
-    for (struct ctl_command *c = elem->commands;
-            c < &elem->commands[elem->n_commands]; c++) {
-        if (c->table) {
-            table_format(c->table, &table_style, &output);
-        } else if (oneline) {
-            oneline_format(&c->output, &output);
-        } else {
-            ds_put_cstr(&output, ds_cstr_ro(&c->output));
-        }
-        ds_destroy(&c->output);
-        table_destroy(c->table);
-        free(c->table);
-    }
-    unbctl_command_reply(elem->conn, ds_cstr_ro(&output));
-    ds_destroy(&output);
-}
-
 static void nbctl_destroy_element(struct nbctl_queue_element *elem)
 {
     for (struct ctl_command *c = elem->commands; c < &elem->commands[elem->n_commands]; c++) {
@@ -6687,14 +6651,169 @@ static void nbctl_destroy_element(struct nbctl_queue_element *elem)
     free(elem->argv);
     free(elem);
 }
+static void
+nbctl_cleanup_element(struct nbctl_queue_element *elem)
+{
+    struct ctl_command *c;
 
+    for (c = elem->commands; c < &elem->commands[elem->n_commands]; c++) {
+        ds_destroy(&c->output);
+        table_destroy(c->table);
+        free(c->table);
+    }
+    if (elem->symtab) {
+        ovsdb_symbol_table_destroy(elem->symtab);
+    }
+    elem->symtab = NULL;
+}
 
 static void nbctl_run_queue(struct ovsdb_idl *idl)
-{
-    struct nbctl_queue_element *elem;
-    LIST_FOR_EACH_POP (elem, list_node, &nbctl_queue) {
-        server_run_element(elem, idl);
-        nbctl_destroy_element(elem);
+ {
+     unsigned int seqno;
+     bool idl_ready;
+
+     struct nbctl_queue_element *elem = NULL, *last = NULL;
+
+     char *error;
+     bool retry;
+
+
+    /* Execute the commands.
+     *
+     * 'seqno' is the database sequence number for which we last tried to
+     * execute our transaction.  There's no point in trying to commit more than
+     * once for any given sequence number, because if the transaction fails
+     * it's because the database changed and we need to obtain an up-to-date
+     * view of the database before we try the transaction again. */
+
+    seqno = ovsdb_idl_get_seqno(idl);
+
+    /* IDL might have already obtained the database copy during previous
+     * invocation. If so, we can't expect the sequence number to change before
+     * we issue any new requests. */
+
+    idl_ready = ovsdb_idl_has_ever_connected(idl);
+
+    while (!ovs_list_is_empty(&nbctl_queue)) {
+
+        ovsdb_idl_run(idl);
+        if ((idl_ready || seqno != ovsdb_idl_get_seqno(idl)) &&
+                (!ovs_list_is_empty(&nbctl_queue))) {
+            idl_ready = false;
+            seqno = ovsdb_idl_get_seqno(idl);
+
+            retry = false;
+            error = NULL;
+
+            struct ovsdb_idl_txn *txn =
+                the_idl_txn = ovsdb_idl_txn_create(idl);
+            const struct nbrec_nb_global *nb = nbrec_nb_global_first(idl);
+
+            struct ovs_list completed = OVS_LIST_INITIALIZER(&completed);
+            struct ovs_list in_error = OVS_LIST_INITIALIZER(&in_error);
+
+
+            LIST_FOR_EACH_POP (elem, list_node, &nbctl_queue) {
+                last = elem;
+                elem->retry = false;
+                error = run_prerequisites(elem, idl);
+                if (error) {
+                    unbctl_command_reply_error(elem->conn, error);
+                    ovs_list_push_back(&in_error, &elem->list_node);
+                    break;
+                }
+
+                retry |= elem->retry;
+                if (retry) {
+                    ovs_list_push_back(&completed, &elem->list_node);
+                    break;
+                }
+
+                error = do_nbctl_pre_commit(elem, idl, txn, nb);
+                retry |= elem->retry;
+
+                if (error) {
+                    unbctl_command_reply_error(elem->conn, error);
+                    ovs_list_push_back(&in_error, &elem->list_node);
+                    break;
+                }
+
+                ovs_list_push_back(&completed, &elem->list_node);
+                if (retry || elem->postprocess) {
+                    break;
+                }
+            }
+
+
+            /* commit on last element of queue or element
+             * with postprocess != NULL */
+
+            if (last != NULL) {
+
+                if ((!error) && (!retry)) {
+                    do_nbctl_commit(last, idl, txn, nb);
+                    retry |= last->retry;
+                }
+
+                /* restore queue if error for rerun */
+
+                if (retry) {
+                    LIST_FOR_EACH_POP (elem, list_node, &completed) {
+                        nbctl_cleanup_element(elem);
+                        ovs_list_push_front(&nbctl_queue, &elem->list_node);
+                    }
+                }
+
+                LIST_FOR_EACH_POP (elem, list_node, &completed) {
+                    struct ds output = DS_EMPTY_INITIALIZER;
+                    table_format_reset();
+                    for (struct ctl_command *c = elem->commands;
+                            c < &elem->commands[elem->n_commands]; c++) {
+                        if (c->table) {
+                            table_format(c->table, &table_style, &output);
+                        } else if (oneline) {
+                            oneline_format(&c->output, &output);
+                        } else {
+                            ds_put_cstr(&output, ds_cstr_ro(&c->output));
+                        }
+                        ds_destroy(&c->output);
+                        table_destroy(c->table);
+                        free(c->table);
+                    }
+                    unbctl_command_reply(elem->conn, ds_cstr_ro(&output));
+                    ds_destroy(&output);
+                    if (elem->symtab) {
+                        ovsdb_symbol_table_destroy(elem->symtab);
+                    }
+                    nbctl_destroy_element(elem);
+                }
+                LIST_FOR_EACH_POP (elem, list_node, &in_error) {
+                    if (elem->symtab) {
+                        ovsdb_symbol_table_destroy(elem->symtab);
+                    }
+                    nbctl_destroy_element(elem);
+                }
+            }
+
+            if ((error != NULL) || (retry)) {
+                ovsdb_idl_txn_abort(txn);
+            }
+            ovsdb_idl_txn_destroy(txn);
+            the_idl_txn = NULL;
+
+            if (error) {
+                return;
+            }
+
+            if (!retry) {
+                return;
+            }
+        }
+
+        if (retry) {
+            ovsdb_idl_wait(idl);
+            poll_block();
+        }
     }
 }
 
@@ -6715,6 +6834,14 @@ static void server_cmd_run_exec(
     elem->timeout = tm;
     elem->argc = argc;
     elem->argv = argv;
+    elem->postprocess = false;
+    for (struct ctl_command *c = elem->commands;
+            c < &elem->commands[elem->n_commands]; c++) {
+        if (c->syntax->postprocess) {
+            elem->postprocess = true;
+            break;
+        }
+    }
     ovs_list_push_back(&nbctl_queue, &elem->list_node);
 }
 
