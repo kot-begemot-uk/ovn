@@ -6099,28 +6099,19 @@ oneline_print(struct ds *lines)
 }
 
 static char *
-do_nbctl(struct nbctl_queue_element *elem, struct ovsdb_idl *idl)
+do_nbctl_pre_commit(struct nbctl_queue_element *elem, struct ovsdb_idl *idl,
+        struct ovsdb_idl_txn *txn, const struct nbrec_nb_global *nb)
 {
-    struct ovsdb_idl_txn *txn;
-    enum ovsdb_idl_txn_status status;
     struct ctl_context ctx;
     struct ctl_command *c;
     struct shash_node *node;
-    int64_t next_cfg = 0;
     char *error = NULL;
 
-    txn = the_idl_txn = ovsdb_idl_txn_create(idl);
     if (dry_run) {
         ovsdb_idl_txn_set_dry_run(txn);
     }
 
     ovsdb_idl_txn_add_comment(txn, "ovs-nbctl: %s", elem->args);
-
-    const struct nbrec_nb_global *nb = nbrec_nb_global_first(idl);
-    if (!nb) {
-        /* XXX add verification that table is empty */
-        nb = nbrec_nb_global_insert(txn);
-    }
 
     if (wait_type != NBCTL_WAIT_NONE) {
         ovsdb_idl_txn_increment(txn, &nb->header_, &nbrec_nb_global_col_nb_cfg,
@@ -6141,13 +6132,14 @@ do_nbctl(struct nbctl_queue_element *elem, struct ovsdb_idl *idl)
         if (ctx.error) {
             error = xstrdup(ctx.error);
             ctl_context_done(&ctx, c);
-            goto out_error;
+            return error;
         }
         ctl_context_done_command(&ctx, c);
 
         if (ctx.try_again) {
             ctl_context_done(&ctx, NULL);
-            goto try_again;
+            elem->retry = true;
+            return NULL;
         }
     }
     ctl_context_done(&ctx, NULL);
@@ -6158,7 +6150,7 @@ do_nbctl(struct nbctl_queue_element *elem, struct ovsdb_idl *idl)
             error = xasprintf("row id \"%s\" is referenced but never created "
                               "(e.g. with \"-- --id=%s create ...\")",
                               node->name, node->name);
-            goto out_error;
+            return error;
         }
         if (!symbol->strong_ref) {
             if (!symbol->weak_ref) {
@@ -6172,8 +6164,18 @@ do_nbctl(struct nbctl_queue_element *elem, struct ovsdb_idl *idl)
             }
         }
     }
+    return error;
+}
+static char *
+do_nbctl_commit(struct nbctl_queue_element *elem, struct ovsdb_idl *idl,
+        struct ovsdb_idl_txn *txn, const struct nbrec_nb_global *nb)
+{
+    enum ovsdb_idl_txn_status status = ovsdb_idl_txn_commit_block(txn);
+    int64_t next_cfg = 0;
+    struct ctl_context ctx;
+    struct ctl_command *c;
+    char *error = NULL;
 
-    status = ovsdb_idl_txn_commit_block(txn);
     if (wait_type != NBCTL_WAIT_NONE && status == TXN_SUCCESS) {
         next_cfg = ovsdb_idl_txn_get_increment_new_value(txn);
     }
@@ -6185,7 +6187,7 @@ do_nbctl(struct nbctl_queue_element *elem, struct ovsdb_idl *idl)
                 if (ctx.error) {
                     error = xstrdup(ctx.error);
                     ctl_context_done(&ctx, c);
-                    goto out_error;
+                    return error;
                 }
                 ctl_context_done(&ctx, c);
             }
@@ -6200,24 +6202,25 @@ do_nbctl(struct nbctl_queue_element *elem, struct ovsdb_idl *idl)
     case TXN_ABORTED:
         /* Should not happen--we never call ovsdb_idl_txn_abort(). */
         error = xstrdup("transaction aborted");
-        goto out_error;
+        return error;
 
     case TXN_UNCHANGED:
     case TXN_SUCCESS:
         break;
 
     case TXN_TRY_AGAIN:
-        goto try_again;
+        elem->retry = true;
+        return NULL;
 
     case TXN_ERROR:
         error = xasprintf("transaction error: %s",
                           ovsdb_idl_txn_get_error(txn));
-        goto out_error;
+        return error;
 
     case TXN_NOT_LOCKED:
         /* Should not happen--we never call ovsdb_idl_set_lock(). */
         error = xstrdup("database not locked");
-        goto out_error;
+        return error;
 
     default:
         OVS_NOT_REACHED();
@@ -6254,36 +6257,44 @@ do_nbctl(struct nbctl_queue_element *elem, struct ovsdb_idl *idl)
             poll_block();
             if (elem->timeout && timer_expired(&elem->wait_timeout)) {
                 error = xstrdup("timeout expired");
-                goto out_error;
+                return error;
             }
         }
     done: ;
     }
+    return error;
+}
 
-    ovsdb_symbol_table_destroy(elem->symtab);
-    ovsdb_idl_txn_destroy(txn);
-    the_idl_txn = NULL;
+static char *
+do_nbctl(struct nbctl_queue_element *elem, struct ovsdb_idl *idl)
+{
+    char *error = NULL;
+    struct ctl_command *c;
 
-    elem->retry = false;
-    return NULL;
+    struct ovsdb_idl_txn *txn = the_idl_txn = ovsdb_idl_txn_create(idl);
+    const struct nbrec_nb_global *nb = nbrec_nb_global_first(idl);
 
-try_again:
-    /* Our transaction needs to be rerun, or a prerequisite was not met.  Free
-     * resources and return so that the caller can try again. */
-    elem->retry = true;
-
-out_error:
-    ovsdb_idl_txn_abort(txn);
-    ovsdb_idl_txn_destroy(txn);
-    the_idl_txn = NULL;
-
-    ovsdb_symbol_table_destroy(elem->symtab);
-    for (c = elem->commands; c < &elem->commands[elem->n_commands]; c++) {
-        ds_destroy(&c->output);
-        table_destroy(c->table);
-        free(c->table);
+    if (!nb) {
+        /* XXX add verification that table is empty */
+        nb = nbrec_nb_global_insert(txn);
     }
 
+    error = do_nbctl_pre_commit(elem, idl, txn, nb);
+    if (!error) {
+        error = do_nbctl_commit(elem, idl, txn, nb);
+    }
+
+    if (error || elem->retry) {
+        ovsdb_idl_txn_abort(txn);
+        for (c = elem->commands; c < &elem->commands[elem->n_commands]; c++) {
+            ds_destroy(&c->output);
+            table_destroy(c->table);
+            free(c->table);
+        }
+    }
+    ovsdb_idl_txn_destroy(txn);
+    ovsdb_symbol_table_destroy(elem->symtab);
+    the_idl_txn = NULL;
     return error;
 }
 
