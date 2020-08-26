@@ -98,10 +98,12 @@ struct nbctl_queue_element {
     char *args;
     struct ctl_command *commands;
     size_t n_commands;
-    struct ovsdb_idl *idl;
     unsigned int timeout;
+    struct timer wait_timeout;
     int argc;
     char **argv;
+    struct ovsdb_symbol_table *symtab;
+    bool retry, postprocess;
 };
 
 static struct ovs_list nbctl_queue = OVS_LIST_INITIALIZER(&nbctl_queue);
@@ -120,25 +122,18 @@ static void nbctl_client(const char *socket_name,
 static bool will_detach(const struct ovs_cmdl_parsed_option *, size_t n);
 static void apply_options_direct(const struct ovs_cmdl_parsed_option *,
                                  size_t n, struct shash *local_options);
-static char * OVS_WARN_UNUSED_RESULT run_prerequisites(struct ctl_command[],
-                                                       size_t n_commands,
-                                                       struct ovsdb_idl *);
-static char * OVS_WARN_UNUSED_RESULT do_nbctl(const char *args,
-                                              struct ctl_command *, size_t n,
-                                              struct ovsdb_idl *,
-                                              const struct timer *,
-                                              bool *retry);
+static char * OVS_WARN_UNUSED_RESULT run_prerequisites(
+    struct nbctl_queue_element *elem, struct ovsdb_idl *idl);
+static char * OVS_WARN_UNUSED_RESULT do_nbctl(
+    struct nbctl_queue_element *elem, struct ovsdb_idl *idl);
 static char * OVS_WARN_UNUSED_RESULT dhcp_options_get(
     struct ctl_context *ctx, const char *id, bool must_exist,
     const struct nbrec_dhcp_options **);
-static char * OVS_WARN_UNUSED_RESULT main_loop(const char *args,
-                                               struct ctl_command *commands,
-                                               size_t n_commands,
-                                               struct ovsdb_idl *idl,
-                                               const struct timer *);
+static char * OVS_WARN_UNUSED_RESULT main_loop(
+    struct nbctl_queue_element *elem, struct ovsdb_idl *idl);
 static void server_loop(struct ovsdb_idl *idl, int argc, char *argv[]);
 
-static void nbctl_run_queue(void);
+static void nbctl_run_queue(struct ovsdb_idl *idl);
 
 int
 main(int argc, char *argv[])
@@ -219,41 +214,47 @@ main(int argc, char *argv[])
     if (daemon_mode) {
         server_loop(idl, argc, argv);
     } else {
-        struct ctl_command *commands;
-        size_t n_commands;
+        struct nbctl_queue_element elem;
+        elem.conn = NULL;
+        elem.timeout = 0;
+        elem.args = args;
+
         char *error;
 
         error = ctl_parse_commands(argc - optind, argv + optind,
-                                   &local_options, &commands, &n_commands);
+                                   &local_options,
+                                   &elem.commands,
+                                   &elem.n_commands);
         if (error) {
             free(args);
             ctl_fatal("%s", error);
         }
-        VLOG(ctl_might_write_to_db(commands, n_commands) ? VLL_INFO : VLL_DBG,
-             "Called as %s", args);
+        VLOG(ctl_might_write_to_db(
+                    elem.commands, elem.n_commands) ? VLL_INFO : VLL_DBG,
+                    "Called as %s", args);
 
         ctl_timeout_setup(timeout);
 
-        error = run_prerequisites(commands, n_commands, idl);
+        error = run_prerequisites(&elem, idl);
         if (error) {
             free(args);
             ctl_fatal("%s", error);
         }
 
-        error = main_loop(args, commands, n_commands, idl, NULL);
+        error = main_loop(&elem, idl);
         if (error) {
             free(args);
             ctl_fatal("%s", error);
         }
 
         struct ctl_command *c;
-        for (c = commands; c < &commands[n_commands]; c++) {
+        for (c = elem.commands; c < &elem.commands[elem.n_commands]; c++) {
             ds_destroy(&c->output);
             table_destroy(c->table);
             free(c->table);
             shash_destroy_free_data(&c->options);
         }
-        free(commands);
+        free(elem.commands);
     }
 
     ovsdb_idl_destroy(idl);
@@ -275,8 +276,7 @@ static void on_close_func(struct unbctl_conn *conn)
 }
 
 static char *
-main_loop(const char *args, struct ctl_command *commands, size_t n_commands,
-          struct ovsdb_idl *idl, const struct timer *wait_timeout)
+main_loop(struct nbctl_queue_element *elem, struct ovsdb_idl *idl)
 {
     unsigned int seqno;
     bool idl_ready;
@@ -306,13 +306,12 @@ main_loop(const char *args, struct ctl_command *commands, size_t n_commands,
             idl_ready = false;
             seqno = ovsdb_idl_get_seqno(idl);
 
-            bool retry;
-            char *error = do_nbctl(args, commands, n_commands, idl,
-                                   wait_timeout, &retry);
+            elem->retry = false;
+            char *error = do_nbctl(elem, idl);
             if (error) {
                 return error;
             }
-            if (!retry) {
+            if (!elem->retry) {
                 return NULL;
             }
         }
@@ -6031,7 +6030,7 @@ static const struct ctl_table_class tables[NBREC_N_TABLES] = {
 };
 
 static char *
-run_prerequisites(struct ctl_command *commands, size_t n_commands,
+run_prerequisites(struct nbctl_queue_element *elem,
                   struct ovsdb_idl *idl)
 {
     ovsdb_idl_add_table(idl, &nbrec_table_nb_global);
@@ -6041,7 +6040,8 @@ run_prerequisites(struct ctl_command *commands, size_t n_commands,
         ovsdb_idl_add_column(idl, &nbrec_nb_global_col_hv_cfg);
     }
 
-    for (struct ctl_command *c = commands; c < &commands[n_commands]; c++) {
+    for (struct ctl_command *c = elem->commands;
+            c < &elem->commands[elem->n_commands]; c++) {
         if (c->syntax->prerequisites) {
             struct ctl_context ctx;
 
@@ -6099,26 +6099,22 @@ oneline_print(struct ds *lines)
 }
 
 static char *
-do_nbctl(const char *args, struct ctl_command *commands, size_t n_commands,
-         struct ovsdb_idl *idl, const struct timer *wait_timeout, bool *retry)
+do_nbctl(struct nbctl_queue_element *elem, struct ovsdb_idl *idl)
 {
     struct ovsdb_idl_txn *txn;
     enum ovsdb_idl_txn_status status;
-    struct ovsdb_symbol_table *symtab;
     struct ctl_context ctx;
     struct ctl_command *c;
     struct shash_node *node;
     int64_t next_cfg = 0;
     char *error = NULL;
 
-    ovs_assert(retry);
-
     txn = the_idl_txn = ovsdb_idl_txn_create(idl);
     if (dry_run) {
         ovsdb_idl_txn_set_dry_run(txn);
     }
 
-    ovsdb_idl_txn_add_comment(txn, "ovs-nbctl: %s", args);
+    ovsdb_idl_txn_add_comment(txn, "ovs-nbctl: %s", elem->args);
 
     const struct nbrec_nb_global *nb = nbrec_nb_global_first(idl);
     if (!nb) {
@@ -6131,13 +6127,13 @@ do_nbctl(const char *args, struct ctl_command *commands, size_t n_commands,
                                 force_wait);
     }
 
-    symtab = ovsdb_symbol_table_create();
-    for (c = commands; c < &commands[n_commands]; c++) {
+    elem->symtab = ovsdb_symbol_table_create();
+    for (c = elem->commands; c < &elem->commands[elem->n_commands]; c++) {
         ds_init(&c->output);
         c->table = NULL;
     }
-    ctl_context_init(&ctx, NULL, idl, txn, symtab, NULL);
-    for (c = commands; c < &commands[n_commands]; c++) {
+    ctl_context_init(&ctx, NULL, idl, txn, elem->symtab, NULL);
+    for (c = elem->commands; c < &elem->commands[elem->n_commands]; c++) {
         ctl_context_init_command(&ctx, c);
         if (c->syntax->run) {
             (c->syntax->run)(&ctx);
@@ -6156,7 +6152,7 @@ do_nbctl(const char *args, struct ctl_command *commands, size_t n_commands,
     }
     ctl_context_done(&ctx, NULL);
 
-    SHASH_FOR_EACH (node, &symtab->sh) {
+    SHASH_FOR_EACH (node, &elem->symtab->sh) {
         struct ovsdb_symbol *symbol = node->data;
         if (!symbol->created) {
             error = xasprintf("row id \"%s\" is referenced but never created "
@@ -6182,9 +6178,9 @@ do_nbctl(const char *args, struct ctl_command *commands, size_t n_commands,
         next_cfg = ovsdb_idl_txn_get_increment_new_value(txn);
     }
     if (status == TXN_UNCHANGED || status == TXN_SUCCESS) {
-        for (c = commands; c < &commands[n_commands]; c++) {
+        for (c = elem->commands; c < &elem->commands[elem->n_commands]; c++) {
             if (c->syntax->postprocess) {
-                ctl_context_init(&ctx, c, idl, txn, symtab, NULL);
+                ctl_context_init(&ctx, c, idl, txn, elem->symtab, NULL);
                 (c->syntax->postprocess)(&ctx);
                 if (ctx.error) {
                     error = xstrdup(ctx.error);
@@ -6227,7 +6223,7 @@ do_nbctl(const char *args, struct ctl_command *commands, size_t n_commands,
         OVS_NOT_REACHED();
     }
 
-    for (c = commands; c < &commands[n_commands]; c++) {
+    for (c = elem->commands; c < &elem->commands[elem->n_commands]; c++) {
         struct ds *ds = &c->output;
 
         if (c->table) {
@@ -6252,11 +6248,11 @@ do_nbctl(const char *args, struct ctl_command *commands, size_t n_commands,
                 }
             }
             ovsdb_idl_wait(idl);
-            if (wait_timeout) {
-                timer_wait(wait_timeout);
+            if (elem->timeout) {
+                timer_wait(&elem->wait_timeout);
             }
             poll_block();
-            if (wait_timeout && timer_expired(wait_timeout)) {
+            if (elem->timeout && timer_expired(&elem->wait_timeout)) {
                 error = xstrdup("timeout expired");
                 goto out_error;
             }
@@ -6264,25 +6260,25 @@ do_nbctl(const char *args, struct ctl_command *commands, size_t n_commands,
     done: ;
     }
 
-    ovsdb_symbol_table_destroy(symtab);
+    ovsdb_symbol_table_destroy(elem->symtab);
     ovsdb_idl_txn_destroy(txn);
     the_idl_txn = NULL;
 
-    *retry = false;
+    elem->retry = false;
     return NULL;
 
 try_again:
     /* Our transaction needs to be rerun, or a prerequisite was not met.  Free
      * resources and return so that the caller can try again. */
-    *retry = true;
+    elem->retry = true;
 
 out_error:
     ovsdb_idl_txn_abort(txn);
     ovsdb_idl_txn_destroy(txn);
     the_idl_txn = NULL;
 
-    ovsdb_symbol_table_destroy(symtab);
-    for (c = commands; c < &commands[n_commands]; c++) {
+    ovsdb_symbol_table_destroy(elem->symtab);
+    for (c = elem->commands; c < &elem->commands[elem->n_commands]; c++) {
         ds_destroy(&c->output);
         table_destroy(c->table);
         free(c->table);
@@ -6631,23 +6627,18 @@ server_cmd_exit(struct unbctl_conn *conn, int argc OVS_UNUSED,
     unbctl_command_reply(conn, NULL);
 }
 
-static void server_run_element(struct nbctl_queue_element *elem)
+static void server_run_element(struct nbctl_queue_element *elem,
+        struct ovsdb_idl *idl)
 {
-    char *error = run_prerequisites(
-            elem->commands, elem->n_commands, elem->idl);
-    struct timer *wait_timeout = NULL;
-    struct timer wait_timeout_;
+    char *error = run_prerequisites(elem, idl);
     if (elem->timeout) {
-        timer_set_duration(&wait_timeout_, timeout * 1000);
-        wait_timeout = &wait_timeout_;
+        timer_set_duration(&elem->wait_timeout, timeout * 1000);
     }
     if (error) {
         unbctl_command_reply_error(elem->conn, error);
         return;
     }
-    error = main_loop(
-            elem->args, elem->commands, elem->n_commands,
-            elem->idl, wait_timeout);
+    error = main_loop(elem, idl);
     if (error) {
         unbctl_command_reply_error(elem->conn, error);
         return;
@@ -6687,11 +6678,11 @@ static void nbctl_destroy_element(struct nbctl_queue_element *elem)
 }
 
 
-static void nbctl_run_queue(void)
+static void nbctl_run_queue(struct ovsdb_idl *idl)
 {
     struct nbctl_queue_element *elem;
     LIST_FOR_EACH_POP (elem, list_node, &nbctl_queue) {
-        server_run_element(elem);
+        server_run_element(elem, idl);
         nbctl_destroy_element(elem);
     }
 }
@@ -6701,7 +6692,6 @@ static void server_cmd_run_exec(
         char *args,
         struct ctl_command *commands,
         size_t n_commands,
-        struct ovsdb_idl *idl,
         unsigned int tm,
         int argc, char **argv)
 {
@@ -6711,7 +6701,6 @@ static void server_cmd_run_exec(
     elem->args = args;
     elem->commands = commands;
     elem->n_commands = n_commands;
-    elem->idl = idl;
     elem->timeout = tm;
     elem->argc = argc;
     elem->argv = argv;
@@ -6720,9 +6709,8 @@ static void server_cmd_run_exec(
 
 static void
 server_cmd_run(struct unbctl_conn *conn, int argc, const char **argv_,
-               void *idl_)
+               void *idl_ OVS_UNUSED)
 {
-    struct ovsdb_idl *idl = idl_;
     struct ctl_command *commands = NULL;
     struct shash local_options;
     size_t n_commands = 0;
@@ -6761,7 +6749,7 @@ server_cmd_run(struct unbctl_conn *conn, int argc, const char **argv_,
          "Running command %s", args);
 
 
-    server_cmd_run_exec(conn, args, commands, n_commands, idl, timeout, argc, argv);
+    server_cmd_run_exec(conn, args, commands, n_commands, timeout, argc, argv);
 
 out:
     shash_destroy_free_data(&local_options);
@@ -6809,7 +6797,7 @@ server_loop(struct ovsdb_idl *idl, int argc, char *argv[])
         if (ovsdb_idl_has_ever_connected(idl)) {
             daemonize_complete();
             unbctl_server_run(server);
-            nbctl_run_queue();
+            nbctl_run_queue(idl);
         }
         if (exiting) {
             break;
