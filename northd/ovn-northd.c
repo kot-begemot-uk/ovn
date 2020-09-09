@@ -8517,6 +8517,12 @@ build_lrouter_flows_ipv4_input_table_3_op(
         struct ovn_port *op, struct hmap *lflows,
         struct ds *match, struct ds *actions);
 
+/* DHCPv6 reply handling */
+static void
+build_lrouter_flows_dhcp_reply_op(
+        struct ovn_port *op, struct hmap *lflows,
+        struct ds *match);
+
 /*
  * Do not remove this comment - it is here on purpose
  * It serves as a marker so that pulling operations out
@@ -8565,25 +8571,9 @@ build_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
                 op, lflows, &match, &actions);
     }
 
-    /* DHCPv6 reply handling */
     HMAP_FOR_EACH (op, key_node, ports) {
-        if (!op->nbrp) {
-            continue;
-        }
-
-        if (op->derived) {
-            continue;
-        }
-
-        for (size_t i = 0; i < op->lrp_networks.n_ipv6_addrs; i++) {
-            ds_clear(&match);
-            ds_put_format(&match, "ip6.dst == %s && udp.src == 547 &&"
-                          " udp.dst == 546",
-                          op->lrp_networks.ipv6_addrs[i].addr_s);
-            ovn_lflow_add(lflows, op->od, S_ROUTER_IN_IP_INPUT, 100,
-                          ds_cstr(&match),
-                          "reg0 = 0; handle_dhcpv6_reply;");
-        }
+        build_lrouter_flows_dhcp_reply_op(
+                op, lflows, &match);
     }
 
     /* Logical router ingress table 1: IP Input for IPv6. */
@@ -11035,6 +11025,24 @@ build_lrouter_flows_ipv4_input_table_3_op(
         }
     }
 
+}
+
+static void
+build_lrouter_flows_dhcp_reply_op(
+        struct ovn_port *op, struct hmap *lflows,
+        struct ds *match)
+{
+    if (op->nbrp && (!op->derived)) {
+        for (size_t i = 0; i < op->lrp_networks.n_ipv6_addrs; i++) {
+            ds_clear(match);
+            ds_put_format(match, "ip6.dst == %s && udp.src == 547 &&"
+                          " udp.dst == 546",
+                          op->lrp_networks.ipv6_addrs[i].addr_s);
+            ovn_lflow_add(lflows, op->od, S_ROUTER_IN_IP_INPUT, 100,
+                          ds_cstr(match),
+                          "reg0 = 0; handle_dhcpv6_reply;");
+        }
+    }
 }
 
 /* Updates the Logical_Flow and Multicast_Group tables in the OVN_SB database,
