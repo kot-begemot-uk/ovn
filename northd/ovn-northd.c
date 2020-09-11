@@ -6601,6 +6601,13 @@ build_drop_arp_nd_flows_for_unbound_router_ports(struct ovn_port *op,
     ds_destroy(&match);
 }
 
+/* Build pre-ACL and ACL tables for both ingress and egress.
+ * Ingress tables 3 through 10.  Egress tables 0 through 7. */
+static void
+build_lswitch_flows_pre_acl_and_acl_od(struct ovn_datapath *od,
+                    struct hmap *lflows, struct hmap *port_groups,
+                    struct shash *meter_groups, struct hmap *lbs);
+
 /*
 * Do not remove this comment - it is here as a marker to
 * make diffs readable.
@@ -6619,21 +6626,10 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
     struct ds match = DS_EMPTY_INITIALIZER;
     struct ds actions = DS_EMPTY_INITIALIZER;
 
-    /* Build pre-ACL and ACL tables for both ingress and egress.
-     * Ingress tables 3 through 10.  Egress tables 0 through 7. */
     struct ovn_datapath *od;
     HMAP_FOR_EACH (od, key_node, datapaths) {
-        if (!od->nbs) {
-            continue;
-        }
-
-        build_pre_acls(od, lflows);
-        build_pre_lb(od, lflows, meter_groups, lbs);
-        build_pre_stateful(od, lflows);
-        build_acls(od, lflows, port_groups);
-        build_qos(od, lflows);
-        build_lb(od, lflows);
-        build_stateful(od, lflows, lbs);
+        build_lswitch_flows_pre_acl_and_acl_od(od, lflows,
+                    port_groups, meter_groups, lbs);
     }
 
     /* Build logical flows for the forwarding groups */
@@ -6641,7 +6637,6 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
         if (!od->nbs || !od->nbs->n_forwarding_groups) {
             continue;
         }
-
         build_fwd_group_lflows(od, lflows);
     }
 
@@ -7309,6 +7304,22 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
 
     ds_destroy(&match);
     ds_destroy(&actions);
+}
+
+static void
+build_lswitch_flows_pre_acl_and_acl_od(struct ovn_datapath *od,
+                    struct hmap *lflows, struct hmap *port_groups,
+                    struct shash *meter_groups, struct hmap *lbs)
+{
+    if (od->nbs) {
+        build_pre_acls(od, lflows);
+        build_pre_lb(od, lflows, meter_groups, lbs);
+        build_pre_stateful(od, lflows);
+        build_acls(od, lflows, port_groups);
+        build_qos(od, lflows);
+        build_lb(od, lflows);
+        build_stateful(od, lflows, lbs);
+    }
 }
 
 /* Returns a string of the IP address of the router port 'op' that
