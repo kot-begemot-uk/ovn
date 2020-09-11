@@ -6613,6 +6613,12 @@ static void
 build_lswitch_forwarding_group_lflows_od(
                     struct ovn_datapath *od, struct hmap *lflows);
 
+/* Logical switch ingress table 0: Admission control framework (priority
+ * 100). */
+static void
+build_lswitch_admission_control_od(
+                    struct ovn_datapath *od, struct hmap *lflows);
+
 /*
 * Do not remove this comment - it is here as a marker to
 * make diffs readable.
@@ -6641,23 +6647,8 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
         build_lswitch_forwarding_group_lflows_od(od, lflows);
     }
 
-    /* Logical switch ingress table 0: Admission control framework (priority
-     * 100). */
     HMAP_FOR_EACH (od, key_node, datapaths) {
-        if (!od->nbs) {
-            continue;
-        }
-
-        /* Logical VLANs not supported. */
-        ovn_lflow_add(lflows, od, S_SWITCH_IN_PORT_SEC_L2, 100, "vlan.present",
-                      "drop;");
-
-        /* Broadcast/multicast source address is invalid. */
-        ovn_lflow_add(lflows, od, S_SWITCH_IN_PORT_SEC_L2, 100, "eth.src[40]",
-                      "drop;");
-
-        /* Port security flows have priority 50 (see below) and will continue
-         * to the next table if packet source is acceptable. */
+        build_lswitch_admission_control_od(od, lflows);
     }
 
     build_lswitch_input_port_sec(ports, datapaths, lflows);
@@ -7331,6 +7322,26 @@ build_lswitch_forwarding_group_lflows_od(
         build_fwd_group_lflows(od, lflows);
     }
 }
+
+static void
+build_lswitch_admission_control_od(
+                    struct ovn_datapath *od, struct hmap *lflows)
+{
+    if(od->nbs) {
+
+        /* Logical VLANs not supported. */
+        ovn_lflow_add(lflows, od, S_SWITCH_IN_PORT_SEC_L2, 100, "vlan.present",
+                      "drop;");
+
+        /* Broadcast/multicast source address is invalid. */
+        ovn_lflow_add(lflows, od, S_SWITCH_IN_PORT_SEC_L2, 100, "eth.src[40]",
+                      "drop;");
+
+        /* Port security flows have priority 50 (see below) and will continue
+         * to the next table if packet source is acceptable. */
+    }
+}
+
 /* Returns a string of the IP address of the router port 'op' that
  * overlaps with 'ip_s".  If one is not found, returns NULL.
  *
