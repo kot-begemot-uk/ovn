@@ -6650,6 +6650,17 @@ build_lswitch_dhcp_response_op(
 static void
 build_lswitch_dns_lookup_response_od(
                     struct ovn_datapath *od, struct hmap *lflows);
+
+/* Ingress table 14 and 15: DHCP options and response, by default goto
+ * next. (priority 0).
+ * Ingress table 16 and 17: DNS lookup and response, by default goto next.
+ * (priority 0).
+ * Ingress table 18 - External port handling, by default goto next.
+ * (priority 0). */
+static void
+build_lswitch_dhcp_response_od(
+                    struct ovn_datapath *od, struct hmap *lflows);
+
 /*
 * Do not remove this comment - it is here as a marker to
 * make diffs readable.
@@ -6719,23 +6730,8 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
         build_lswitch_dns_lookup_response_od(od, lflows);
     }
 
-    /* Ingress table 14 and 15: DHCP options and response, by default goto
-     * next. (priority 0).
-     * Ingress table 16 and 17: DNS lookup and response, by default goto next.
-     * (priority 0).
-     * Ingress table 18 - External port handling, by default goto next.
-     * (priority 0). */
-
     HMAP_FOR_EACH (od, key_node, datapaths) {
-        if (!od->nbs) {
-            continue;
-        }
-
-        ovn_lflow_add(lflows, od, S_SWITCH_IN_DHCP_OPTIONS, 0, "1", "next;");
-        ovn_lflow_add(lflows, od, S_SWITCH_IN_DHCP_RESPONSE, 0, "1", "next;");
-        ovn_lflow_add(lflows, od, S_SWITCH_IN_DNS_LOOKUP, 0, "1", "next;");
-        ovn_lflow_add(lflows, od, S_SWITCH_IN_DNS_RESPONSE, 0, "1", "next;");
-        ovn_lflow_add(lflows, od, S_SWITCH_IN_EXTERNAL_PORT, 0, "1", "next;");
+        build_lswitch_dhcp_response_od(od, lflows);
     }
 
     HMAP_FOR_EACH (op, key_node, ports) {
@@ -7404,6 +7400,20 @@ build_lswitch_dns_lookup_response_od(
         ovn_lflow_add(lflows, od, S_SWITCH_IN_DNS_RESPONSE, 100,
                       dns_match, dns_action);
     }
+}
+
+static void
+build_lswitch_dhcp_response_od(
+                    struct ovn_datapath *od, struct hmap *lflows)
+{
+    if (od->nbs) {
+        ovn_lflow_add(lflows, od, S_SWITCH_IN_DHCP_OPTIONS, 0, "1", "next;");
+        ovn_lflow_add(lflows, od, S_SWITCH_IN_DHCP_RESPONSE, 0, "1", "next;");
+        ovn_lflow_add(lflows, od, S_SWITCH_IN_DNS_LOOKUP, 0, "1", "next;");
+        ovn_lflow_add(lflows, od, S_SWITCH_IN_DNS_RESPONSE, 0, "1", "next;");
+        ovn_lflow_add(lflows, od, S_SWITCH_IN_EXTERNAL_PORT, 0, "1", "next;");
+    }
+
 }
 /* Returns a string of the IP address of the router port 'op' that
  * overlaps with 'ip_s".  If one is not found, returns NULL.
