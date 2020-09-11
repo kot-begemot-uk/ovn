@@ -6608,6 +6608,11 @@ build_lswitch_flows_pre_acl_and_acl_od(struct ovn_datapath *od,
                     struct hmap *lflows, struct hmap *port_groups,
                     struct shash *meter_groups, struct hmap *lbs);
 
+/* Build logical flows for the forwarding groups */
+static void
+build_lswitch_forwarding_group_lflows_od(
+                    struct ovn_datapath *od, struct hmap *lflows);
+
 /*
 * Do not remove this comment - it is here as a marker to
 * make diffs readable.
@@ -6632,12 +6637,8 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
                     port_groups, meter_groups, lbs);
     }
 
-    /* Build logical flows for the forwarding groups */
     HMAP_FOR_EACH (od, key_node, datapaths) {
-        if (!od->nbs || !od->nbs->n_forwarding_groups) {
-            continue;
-        }
-        build_fwd_group_lflows(od, lflows);
+        build_lswitch_forwarding_group_lflows_od(od, lflows);
     }
 
     /* Logical switch ingress table 0: Admission control framework (priority
@@ -7322,6 +7323,14 @@ build_lswitch_flows_pre_acl_and_acl_od(struct ovn_datapath *od,
     }
 }
 
+static void
+build_lswitch_forwarding_group_lflows_od(
+                    struct ovn_datapath *od, struct hmap *lflows)
+{
+    if (!(!od->nbs || !od->nbs->n_forwarding_groups)) {
+        build_fwd_group_lflows(od, lflows);
+    }
+}
 /* Returns a string of the IP address of the router port 'op' that
  * overlaps with 'ip_s".  If one is not found, returns NULL.
  *
