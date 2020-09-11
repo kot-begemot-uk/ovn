@@ -112,16 +112,43 @@ OVN makes releases at the following three-month cadence.  All dates are
 approximate:
 
 +---------------+---------------------+--------------------------------------+
-| Time (months) | Dates               | Stage                                |
+| Time (months) | Example Dates       | Stage                                |
 +---------------+---------------------+--------------------------------------+
-| T             | Jan 1, Apr 1, ...   | Begin x.y release cycle              |
+| T             | Dec 1, Mar 1, ...   | Begin x.y release cycle              |
 +---------------+---------------------+--------------------------------------+
-| T + 1         | Feb 1, May 1, ...   | "Soft freeze" master for x.y release |
+| T + 2         | Feb 1, May 1, ...   | "Soft freeze" master for x.y release |
 +---------------+---------------------+--------------------------------------+
-| T + 1.5       | Feb 8, May 8, ...   | Fork branch-x.y from master          |
+| T + 2.5       | Feb 15, May 15, ... | Fork branch-x.y from master          |
 +---------------+---------------------+--------------------------------------+
-| T + 1.75      | Feb 22, May 22, ... | Release version x.y.0                |
+| T + 3         | Mar 1, Jun 1, ...   | Release version x.y.0                |
 +---------------+---------------------+--------------------------------------+
+
+Release Calendar
+----------------
+
+The 2020 timetable is shown below. Note that these dates are not set in stone.
+If extenuating circumstances arise, a release may be delayed from its target
+date.
+
++---------+-------------+-----------------+---------+
+| Release | Soft Freeze | Branch Creation | Release |
++---------+-------------+-----------------+---------+
+| 20.12.0 | Nov 6       | Nov 20          | Dec 4   |
++---------+-------------+-----------------+---------+
+
+Below is the 2021 timetable
+
++---------+-------------+-----------------+---------+
+| Release | Soft Freeze | Branch Creation | Release |
++---------+-------------+-----------------+---------+
+| 21.03.0 | Feb 5       | Feb 19          | Mar 5   |
++---------+-------------+-----------------+---------+
+| 21.06.0 | May 7       | May 21          | Jun 4   |
++---------+-------------+-----------------+---------+
+| 21.09.0 | Aug 6       | Aug 20          | Sep 3   |
++---------+-------------+-----------------+---------+
+| 21.12.0 | Nov 5       | Nov 19          | Dec 3   |
++---------+-------------+-----------------+---------+
 
 Contact
 -------

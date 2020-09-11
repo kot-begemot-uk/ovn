@@ -54,20 +54,40 @@
         applying the changes, it may increment this sequence number.
       </column>
 
+      <column name="nb_cfg_timestamp">
+        The timestamp (ms) when <code>ovn-northd</code> sees the latest
+        <code>nb_cfg</code> and starts processing.
+      </column>
+
       <column name="sb_cfg">
         Sequence number that <code>ovn-northd</code> sets to the value of <ref
         column="nb_cfg"/> after it finishes applying the corresponding
         configuration changes to the <ref db="OVN_Southbound"/> database.
       </column>
 
+      <column name="sb_cfg_timestamp">
+        The timestamp (ms) when <code>ovn-northd</code> finishes applying the
+        corresponding configuration changes to the <ref db="OVN_Southbound"/>
+        database successfully.
+      </column>
+
       <column name="hv_cfg">
         Sequence number that <code>ovn-northd</code> sets to the smallest
         sequence number of all the chassis in the system, as reported in the
-        <code>Chassis</code> table in the southbound database.  Thus, <ref
-        column="hv_cfg"/> equals <ref column="nb_cfg"/> if all chassis are
+        <code>Chassis_Private</code> table in the southbound database.  Thus,
+        <ref column="hv_cfg"/> equals <ref column="nb_cfg"/> if all chassis are
         caught up with the northbound configuration (which may never happen, if
         any chassis is down).  This value can regress, if a chassis was removed
         from the system and rejoins before catching up.
+      </column>
+
+      <column name="hv_cfg_timestamp">
+        The largest timestamp (ms) of the smallest sequence number of all the
+        chassis in the system, as reported in the <code>Chassis_Private</code>
+        table in the southbound database.  In other words, this timestamp
+        reflects the time when the slowest chassis catches up with the
+        northbound configuration, which is useful for end-to-end control plane
+        latency measurement.
       </column>
     </group>
 
@@ -144,6 +164,19 @@
         <p>
           If the value is nonzero, then it will be forced to a value of
           at least 1000 ms.
+        </p>
+      </column>
+
+      <column name="options" key="ignore_lsp_down">
+        <p>
+          If set to false, ARP/ND reply flows for logical switch ports will be
+          installed only if the port is up, i.e. claimed by a Chassis. If set
+          to true, these flows are installed regardless of the status of the
+          port, which can result in a situation that ARP request to an IP is
+          resolved even before the relevant VM/container is running. For
+          environments where this is not an issue, setting it to
+          <code>true</code> can reduce the load and latency of the control
+          plane. The default value is <code>false</code>.
         </p>
       </column>
 
@@ -2713,6 +2746,54 @@
         for a NAT rule on a distributed router, then this NAT rule
         will be processed in a centralized manner on the gateway
         port instance on the gateway chassis.
+      </p>
+    </column>
+
+    <column name="allowed_ext_ips">
+      It represents Address Set of external ips that NAT rule is applicable to.
+      For SNAT type NAT rules, this refers to destination addresses.
+      For DNAT type NAT rules, this refers to source addresses.
+
+      <p>
+        This configuration overrides the default NAT behavior of applying a
+        rule solely based on internal IP. Without this configuration, NAT
+        happens without considering the external IP (i.e dest/source for
+        snat/dnat type rule). With this configuration NAT rule is applied
+        ONLY if external ip is in the input Address Set.
+      </p>
+    </column>
+
+    <column name="exempted_ext_ips">
+      It represents Address Set of external ips that NAT rule is NOT
+      applicable to.
+      For SNAT type NAT rules, this refers to destination addresses.
+      For DNAT type NAT rules, this refers to source addresses.
+
+      <p>
+        This configuration overrides the default NAT behavior of applying a
+        rule solely based on internal IP. Without this configuration, NAT
+        happens without considering the external IP (i.e dest/source for
+        snat/dnat type rule). With this configuration NAT rule is NOT applied
+        if external ip is in the input Address Set.
+      </p>
+
+      <p>
+        If there are NAT rules in a logical router with overlapping IP prefixes
+        (including /32), then usage of <var>exempted_ext_ips</var> should be
+        avoided in following scenario.
+        a. SNAT rule (let us say RULE1) with logical_ip PREFIX/MASK
+           (let us say 50.0.0.0/24).
+        b. SNAT rule (let us say RULE2) with logical_ip PREFIX/MASK+1
+           (let us say 50.0.0.0/25).
+        c. Now, if exempted_ext_ips is associated with RULE2, then a logical
+           ip which matches both 50.0.0.0/24 and 50.0.0.0/25 may get the RULE2
+           applied to it instead of RULE1.
+      </p>
+
+      <p>
+        <var>allowed_ext_ips</var> and <var>exempted_ext_ips</var> are mutually
+        exclusive to each other. If both Address Sets are set for a rule,
+        then the NAT rule is not considered.
       </p>
     </column>
 

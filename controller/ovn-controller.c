@@ -76,6 +76,8 @@ static unixctl_cb_func cluster_state_reset_cmd;
 static unixctl_cb_func debug_pause_execution;
 static unixctl_cb_func debug_resume_execution;
 static unixctl_cb_func debug_status_execution;
+static unixctl_cb_func flush_lflow_cache;
+static unixctl_cb_func debug_delay_nb_cfg_report;
 
 #define DEFAULT_BRIDGE_NAME "br-int"
 #define DEFAULT_PROBE_INTERVAL_MSEC 5000
@@ -485,7 +487,8 @@ get_ofctrl_probe_interval(struct ovsdb_idl *ovs_idl)
  * updates 'sbdb_idl' with that pointer. */
 static void
 update_sb_db(struct ovsdb_idl *ovs_idl, struct ovsdb_idl *ovnsb_idl,
-             bool *monitor_all_p, bool *reset_ovnsb_idl_min_index)
+             bool *monitor_all_p, bool *reset_ovnsb_idl_min_index,
+             bool *enable_lflow_cache)
 {
     const struct ovsrec_open_vswitch *cfg = ovsrec_open_vswitch_first(ovs_idl);
     if (!cfg) {
@@ -520,6 +523,11 @@ update_sb_db(struct ovsdb_idl *ovs_idl, struct ovsdb_idl *ovnsb_idl,
         engine_set_force_recompute(true);
         ovsdb_idl_reset_min_index(ovnsb_idl);
         *reset_ovnsb_idl_min_index = false;
+    }
+
+    if (enable_lflow_cache != NULL) {
+        *enable_lflow_cache =
+            smap_get_bool(&cfg->external_ids, "ovn-enable-lflow-cache", true);
     }
 }
 
@@ -810,6 +818,10 @@ enum ovs_engine_node {
 #define OVS_NODE(NAME, NAME_STR) ENGINE_FUNC_OVS(NAME);
     OVS_NODES
 #undef OVS_NODE
+
+struct controller_engine_ctx {
+    bool enable_lflow_cache;
+};
 
 struct ed_type_ofctrl_is_connected {
     bool connected;
@@ -1542,6 +1554,12 @@ physical_flow_changes_ovs_iface_handler(struct engine_node *node, void *data)
     return true;
 }
 
+struct flow_output_persistent_data {
+    uint32_t conj_id_ofs;
+    struct hmap lflow_cache_map;
+    bool lflow_cache_enabled;
+};
+
 struct ed_type_flow_output {
     /* desired flows */
     struct ovn_desired_flow_table flow_table;
@@ -1549,10 +1567,12 @@ struct ed_type_flow_output {
     struct ovn_extend_table group_table;
     /* meter ids for QoS */
     struct ovn_extend_table meter_table;
-    /* conjunction id offset */
-    uint32_t conj_id_ofs;
     /* lflow resource cross reference */
     struct lflow_resource_ref lflow_resource_ref;
+
+    /* Data which is persistent and not cleared during
+     * full recompute. */
+    struct flow_output_persistent_data pd;
 };
 
 static void init_physical_ctx(struct engine_node *node,
@@ -1703,7 +1723,13 @@ static void init_lflow_ctx(struct engine_node *node,
     l_ctx_out->group_table = &fo->group_table;
     l_ctx_out->meter_table = &fo->meter_table;
     l_ctx_out->lfrr = &fo->lflow_resource_ref;
-    l_ctx_out->conj_id_ofs = &fo->conj_id_ofs;
+    l_ctx_out->conj_id_ofs = &fo->pd.conj_id_ofs;
+    if (fo->pd.lflow_cache_enabled) {
+        l_ctx_out->lflow_cache_map = &fo->pd.lflow_cache_map;
+    } else {
+        l_ctx_out->lflow_cache_map = NULL;
+    }
+    l_ctx_out->conj_id_overflow = false;
 }
 
 static void *
@@ -1715,8 +1741,10 @@ en_flow_output_init(struct engine_node *node OVS_UNUSED,
     ovn_desired_flow_table_init(&data->flow_table);
     ovn_extend_table_init(&data->group_table);
     ovn_extend_table_init(&data->meter_table);
-    data->conj_id_ofs = 1;
+    data->pd.conj_id_ofs = 1;
     lflow_resource_init(&data->lflow_resource_ref);
+    lflow_cache_init(&data->pd.lflow_cache_map);
+    data->pd.lflow_cache_enabled = true;
     return data;
 }
 
@@ -1728,6 +1756,7 @@ en_flow_output_cleanup(void *data)
     ovn_extend_table_destroy(&flow_output_data->group_table);
     ovn_extend_table_destroy(&flow_output_data->meter_table);
     lflow_resource_destroy(&flow_output_data->lflow_resource_ref);
+    lflow_cache_destroy(&flow_output_data->pd.lflow_cache_map);
 }
 
 static void
@@ -1761,7 +1790,6 @@ en_flow_output_run(struct engine_node *node, void *data)
     struct ovn_desired_flow_table *flow_table = &fo->flow_table;
     struct ovn_extend_table *group_table = &fo->group_table;
     struct ovn_extend_table *meter_table = &fo->meter_table;
-    uint32_t *conj_id_ofs = &fo->conj_id_ofs;
     struct lflow_resource_ref *lfrr = &fo->lflow_resource_ref;
 
     static bool first_run = true;
@@ -1774,11 +1802,38 @@ en_flow_output_run(struct engine_node *node, void *data)
         lflow_resource_clear(lfrr);
     }
 
-    *conj_id_ofs = 1;
+    struct controller_engine_ctx *ctrl_ctx = engine_get_context()->client_ctx;
+    if (fo->pd.lflow_cache_enabled && !ctrl_ctx->enable_lflow_cache) {
+        lflow_cache_destroy(&fo->pd.lflow_cache_map);
+        lflow_cache_init(&fo->pd.lflow_cache_map);
+    }
+    fo->pd.lflow_cache_enabled = ctrl_ctx->enable_lflow_cache;
+
+    if (!fo->pd.lflow_cache_enabled) {
+        fo->pd.conj_id_ofs = 1;
+    }
+
     struct lflow_ctx_in l_ctx_in;
     struct lflow_ctx_out l_ctx_out;
     init_lflow_ctx(node, rt_data, fo, &l_ctx_in, &l_ctx_out);
     lflow_run(&l_ctx_in, &l_ctx_out);
+
+    if (l_ctx_out.conj_id_overflow) {
+        /* Conjunction ids overflow. There can be many holes in between.
+         * Destroy lflow cache and call lflow_run() again. */
+        ovn_desired_flow_table_clear(flow_table);
+        ovn_extend_table_clear(group_table, false /* desired */);
+        ovn_extend_table_clear(meter_table, false /* desired */);
+        lflow_resource_clear(lfrr);
+        fo->pd.conj_id_ofs = 1;
+        lflow_cache_destroy(&fo->pd.lflow_cache_map);
+        lflow_cache_init(&fo->pd.lflow_cache_map);
+        l_ctx_out.conj_id_overflow = false;
+        lflow_run(&l_ctx_in, &l_ctx_out);
+        if (l_ctx_out.conj_id_overflow) {
+            VLOG_WARN("Conjunction id overflow.");
+        }
+    }
 
     struct physical_ctx p_ctx;
     init_physical_ctx(node, rt_data, &p_ctx);
@@ -2161,6 +2216,8 @@ main(int argc, char *argv[])
     ovsdb_idl_track_add_all(ovnsb_idl_loop.idl);
     ovsdb_idl_omit_alert(ovnsb_idl_loop.idl,
                          &sbrec_chassis_private_col_nb_cfg);
+    ovsdb_idl_omit_alert(ovnsb_idl_loop.idl,
+                         &sbrec_chassis_private_col_nb_cfg_timestamp);
 
     /* Omit the external_ids column of all the tables except for -
      *  - DNS. pinctrl.c uses the external_ids column of DNS,
@@ -2344,6 +2401,8 @@ main(int argc, char *argv[])
 
     unixctl_command_register("recompute", "", 0, 0, engine_recompute_cmd,
                              NULL);
+    unixctl_command_register("flush-lflow-cache", "", 0, 0, flush_lflow_cache,
+                             &flow_output_data->pd);
 
     bool reset_ovnsb_idl_min_index = false;
     unixctl_command_register("sb-cluster-state-reset", "", 0, 0,
@@ -2358,8 +2417,16 @@ main(int argc, char *argv[])
     unixctl_command_register("debug/status", "", 0, 0, debug_status_execution,
                              &paused);
 
+    unsigned int delay_nb_cfg_report = 0;
+    unixctl_command_register("debug/delay-nb-cfg-report", "SECONDS", 1, 1,
+                             debug_delay_nb_cfg_report, &delay_nb_cfg_report);
+
     unsigned int ovs_cond_seqno = UINT_MAX;
     unsigned int ovnsb_cond_seqno = UINT_MAX;
+
+    struct controller_engine_ctx ctrl_engine_ctx = {
+        .enable_lflow_cache = true
+    };
 
     /* Main loop. */
     exiting = false;
@@ -2389,7 +2456,8 @@ main(int argc, char *argv[])
         }
 
         update_sb_db(ovs_idl_loop.idl, ovnsb_idl_loop.idl, &sb_monitor_all,
-                     &reset_ovnsb_idl_min_index);
+                     &reset_ovnsb_idl_min_index,
+                     &ctrl_engine_ctx.enable_lflow_cache);
         update_ssl_config(ovsrec_ssl_table_get(ovs_idl_loop.idl));
         ofctrl_set_probe_interval(get_ofctrl_probe_interval(ovs_idl_loop.idl));
 
@@ -2407,7 +2475,8 @@ main(int argc, char *argv[])
 
         struct engine_context eng_ctx = {
             .ovs_idl_txn = ovs_idl_txn,
-            .ovnsb_idl_txn = ovnsb_idl_txn
+            .ovnsb_idl_txn = ovnsb_idl_txn,
+            .client_ctx = &ctrl_engine_ctx
         };
 
         engine_set_context(&eng_ctx);
@@ -2567,6 +2636,12 @@ main(int argc, char *argv[])
                 int64_t cur_cfg = ofctrl_get_cur_cfg();
                 if (cur_cfg && cur_cfg != chassis_private->nb_cfg) {
                     sbrec_chassis_private_set_nb_cfg(chassis_private, cur_cfg);
+                    sbrec_chassis_private_set_nb_cfg_timestamp(
+                        chassis_private, time_wall_msec());
+                    if (delay_nb_cfg_report) {
+                        VLOG_INFO("Sleep for %u sec", delay_nb_cfg_report);
+                        xsleep(delay_nb_cfg_report);
+                    }
                 }
             }
 
@@ -2647,7 +2722,8 @@ loop_done:
     if (!restart) {
         bool done = !ovsdb_idl_has_ever_connected(ovnsb_idl_loop.idl);
         while (!done) {
-            update_sb_db(ovs_idl_loop.idl, ovnsb_idl_loop.idl, NULL, NULL);
+            update_sb_db(ovs_idl_loop.idl, ovnsb_idl_loop.idl,
+                         NULL, NULL, NULL);
             update_ssl_config(ovsrec_ssl_table_get(ovs_idl_loop.idl));
 
             struct ovsdb_idl_txn *ovs_idl_txn
@@ -2878,6 +2954,20 @@ engine_recompute_cmd(struct unixctl_conn *conn OVS_UNUSED, int argc OVS_UNUSED,
 }
 
 static void
+flush_lflow_cache(struct unixctl_conn *conn OVS_UNUSED, int argc OVS_UNUSED,
+                     const char *argv[] OVS_UNUSED, void *arg_)
+{
+    VLOG_INFO("User triggered lflow cache flush.");
+    struct flow_output_persistent_data *fo_pd = arg_;
+    lflow_cache_destroy(&fo_pd->lflow_cache_map);
+    lflow_cache_init(&fo_pd->lflow_cache_map);
+    fo_pd->conj_id_ofs = 1;
+    engine_set_force_recompute(true);
+    poll_immediate_wake();
+    unixctl_command_reply(conn, NULL);
+}
+
+static void
 cluster_state_reset_cmd(struct unixctl_conn *conn, int argc OVS_UNUSED,
                const char *argv[] OVS_UNUSED, void *idl_reset_)
 {
@@ -2921,5 +3011,26 @@ debug_status_execution(struct unixctl_conn *conn, int argc OVS_UNUSED,
         unixctl_command_reply(conn, "paused");
     } else {
         unixctl_command_reply(conn, "running");
+    }
+}
+
+static void
+debug_delay_nb_cfg_report(struct unixctl_conn *conn, int argc OVS_UNUSED,
+                          const char *argv[], void *delay_)
+{
+    unsigned int *delay = delay_;
+
+    if (!str_to_uint(argv[1], 10, delay)) {
+        unixctl_command_reply_error(conn, "unsigned integer required");
+        return;
+    }
+
+    char *msg;
+    if (*delay) {
+        msg = xasprintf("delay nb_cfg report for %u seconds.", *delay);
+        unixctl_command_reply(conn, msg);
+        free(msg);
+    } else {
+        unixctl_command_reply(conn, "no delay for nb_cfg report.");
     }
 }
