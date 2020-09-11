@@ -6661,6 +6661,14 @@ static void
 build_lswitch_dhcp_response_od(
                     struct ovn_datapath *od, struct hmap *lflows);
 
+/* Table 18: External port. Drop ARP request for router ips from
+ * external ports  on chassis not binding those ports.
+ * This makes the router pipeline to be run only on the chassis
+ * binding the external ports. */
+static void
+build_lswitch_external_ports_op(
+                    struct ovn_port *op, struct hmap *lflows);
+
 /*
 * Do not remove this comment - it is here as a marker to
 * make diffs readable.
@@ -6735,18 +6743,7 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
     }
 
     HMAP_FOR_EACH (op, key_node, ports) {
-        if (!op->nbsp || !lsp_is_external(op->nbsp)) {
-           continue;
-        }
-
-        /* Table 18: External port. Drop ARP request for router ips from
-         * external ports  on chassis not binding those ports.
-         * This makes the router pipeline to be run only on the chassis
-         * binding the external ports. */
-        for (size_t i = 0; i < op->od->n_localnet_ports; i++) {
-            build_drop_arp_nd_flows_for_unbound_router_ports(
-                op, op->od->localnet_ports[i], lflows);
-        }
+        build_lswitch_external_ports_op(op, lflows);
     }
 
     char *svc_check_match = xasprintf("eth.dst == %s", svc_monitor_mac);
@@ -7415,6 +7412,24 @@ build_lswitch_dhcp_response_od(
     }
 
 }
+
+static void
+build_lswitch_external_ports_op(
+                    struct ovn_port *op, struct hmap *lflows)
+{
+    if (!(!op->nbsp || !lsp_is_external(op->nbsp))) {
+
+        /* Table 18: External port. Drop ARP request for router ips from
+         * external ports  on chassis not binding those ports.
+         * This makes the router pipeline to be run only on the chassis
+         * binding the external ports. */
+        for (size_t i = 0; i < op->od->n_localnet_ports; i++) {
+            build_drop_arp_nd_flows_for_unbound_router_ports(
+                op, op->od->localnet_ports[i], lflows);
+        }
+    }
+}
+
 /* Returns a string of the IP address of the router port 'op' that
  * overlaps with 'ip_s".  If one is not found, returns NULL.
  *
