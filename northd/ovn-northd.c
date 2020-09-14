@@ -8871,6 +8871,55 @@ build_lrouter_flows_delivery_op(
  * a separate new operations function and clean changes
  * to build_lroute_flows
  */
+static void
+od_build_lrouter_helper(
+        struct ovn_datapath *od, struct lswitch_flow_build_info *lri)
+{
+    build_lrouter_flows_ingress_table_0_od(od, lri->lflows);
+    build_lrouter_flows_lookup_and_learn_neighbour_od(
+            od, lri->lflows, &lri->match, &lri->actions);
+    build_lrouter_flows_ip_input_od(od, lri->lflows);
+    build_lrouter_flows_NAT_defrag_lb_od(
+            od, lri->lflows, lri->meter_groups,
+            lri->lbs, &lri->match, &lri->actions);
+    build_lrouter_flows_ingress_ND_RA_od(od, lri->lflows);
+    build_lrouter_flows_static_to_flows_od(od, lri->lflows, lri->ports);
+    build_lrouter_flows_multicast_lookup_od(
+            od, lri->lflows, &lri->match, &lri->actions);
+    build_lrouter_flows_ingress_policy_od(
+            od, lri->lflows, lri->ports);
+    build_lrouter_flows_ingress_arp_resolution_od(od, lri->lflows);
+    build_lrouter_flows_ingress_arp_resolution2_od(od, lri->lflows);
+    build_lrouter_flows_ingress_packet_size_od(
+            od, lri->lflows, lri->ports, &lri->match, &lri->actions);
+    build_lrouter_flows_gateway_redirect_od(
+            od, lri->lflows, &lri->match, &lri->actions);
+    build_lrouter_flows_arp_request_od(
+            od, lri->lflows, &lri->match, &lri->actions);
+}
+
+static void
+op_build_lrouter_helper(
+        struct ovn_port *op, struct lswitch_flow_build_info *lri)
+{
+    build_lrouter_flows_ingress_table_0_op(op,
+            lri->lflows, &lri->match, &lri->actions);
+    build_lrouter_flows_lookup_and_learn_neighbour_op(
+            op, lri->lflows, &lri->match, &lri->actions);
+    build_lrouter_flows_ipv4_input_table_3_op(
+            op, lri->lflows, &lri->match, &lri->actions);
+    build_lrouter_flows_dhcp_reply_op(
+            op, lri->lflows, &lri->match);
+    build_lrouter_flows_ingress_ip_input_v6_op(
+            op, lri->lflows, &lri->match, &lri->actions);
+    build_lrouter_flows_ingress_ND_RA_op(
+            op, lri->lflows, &lri->match, &lri->actions);
+    build_lrouter_flows_ingress_ip_routing_op(op, lri->lflows);
+    build_lrouter_flows_ingress_arp_resolution_op(
+            op, lri->lflows, lri->ports, &lri->match, &lri->actions);
+    build_lrouter_flows_delivery_op(
+            op, lri->lflows, &lri->match, &lri->actions);
+}
 
 static void
 build_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
@@ -8880,55 +8929,30 @@ build_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
     /* This flow table structure is documented in ovn-northd(8), so please
      * update ovn-northd.8.xml if you change anything. */
 
-    struct ds match = DS_EMPTY_INITIALIZER;
-    struct ds actions = DS_EMPTY_INITIALIZER;
+    struct lswitch_flow_build_info lri;
+
 
     struct ovn_datapath *od;
+    struct ovn_port *op;
+
+    lri.datapaths = datapaths;
+    lri.ports = ports;
+    lri.lflows = lflows;
+    lri.meter_groups = meter_groups;
+    lri.lbs = lbs;
+    lri.match = (struct ds) DS_EMPTY_INITIALIZER;
+    lri.actions = (struct ds) DS_EMPTY_INITIALIZER;
+
     HMAP_FOR_EACH (od, key_node, datapaths) {
-        build_lrouter_flows_ingress_table_0_od(od, lflows);
-        build_lrouter_flows_lookup_and_learn_neighbour_od(
-                od, lflows, &match, &actions);
-        build_lrouter_flows_ip_input_od(od, lflows);
-        build_lrouter_flows_NAT_defrag_lb_od(
-                od, lflows, meter_groups, lbs, &match, &actions);
-        build_lrouter_flows_ingress_ND_RA_od(od, lflows);
-        build_lrouter_flows_static_to_flows_od(od, lflows, ports);
-        build_lrouter_flows_multicast_lookup_od(
-                od, lflows, &match, &actions);
-        build_lrouter_flows_ingress_policy_od(
-                od, lflows, ports);
-        build_lrouter_flows_ingress_arp_resolution_od(od, lflows);
-        build_lrouter_flows_ingress_arp_resolution2_od(od, lflows);
-        build_lrouter_flows_ingress_packet_size_od(
-                od, lflows, ports, &match, &actions);
-        build_lrouter_flows_gateway_redirect_od(
-                od, lflows, &match, &actions);
-        build_lrouter_flows_arp_request_od(
-                od, lflows, &match, &actions);
+        od_build_lrouter_helper(od, &lri);
     }
 
-    struct ovn_port *op;
     HMAP_FOR_EACH (op, key_node, ports) {
-        build_lrouter_flows_ingress_table_0_op(op, lflows, &match, &actions);
-        build_lrouter_flows_lookup_and_learn_neighbour_op(
-                op, lflows, &match, &actions);
-        build_lrouter_flows_ipv4_input_table_3_op(
-                op, lflows, &match, &actions);
-        build_lrouter_flows_dhcp_reply_op(
-                op, lflows, &match);
-        build_lrouter_flows_ingress_ip_input_v6_op(
-                op, lflows, &match, &actions);
-        build_lrouter_flows_ingress_ND_RA_op(
-                op, lflows, &match, &actions);
-        build_lrouter_flows_ingress_ip_routing_op(op, lflows);
-        build_lrouter_flows_ingress_arp_resolution_op(
-                op, lflows, ports, &match, &actions);
-        build_lrouter_flows_delivery_op(
-                op, lflows, &match, &actions);
+        op_build_lrouter_helper(op, &lri);
     }
     
-    ds_destroy(&match);
-    ds_destroy(&actions);
+    ds_destroy(&lri.match);
+    ds_destroy(&lri.actions);
 }
 
 static void
