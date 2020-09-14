@@ -6688,6 +6688,7 @@ build_lswitch_destination_lookup_and_unicast_op(
 * make diffs readable.
 */
 
+
 static void
 build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
                     struct hmap *port_groups, struct hmap *lflows,
@@ -6706,38 +6707,33 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
     struct ovn_lb *lb;
     struct ovn_igmp_group *igmp_group;
 
+    char *svc_check_match = xasprintf("eth.dst == %s", svc_monitor_mac);
     HMAP_FOR_EACH (od, key_node, datapaths) {
         build_lswitch_flows_pre_acl_and_acl_od(od, lflows,
                     port_groups, meter_groups, lbs);
-    }
-
-    HMAP_FOR_EACH (od, key_node, datapaths) {
         build_lswitch_forwarding_group_lflows_od(od, lflows);
-    }
-
-    HMAP_FOR_EACH (od, key_node, datapaths) {
         build_lswitch_admission_control_od(od, lflows);
+        build_lswitch_input_port_sec_od(od, lflows);
+        build_lswitch_arp_nd_responder_od(od, lflows);
+        build_lswitch_dns_lookup_response_od(od, lflows);
+        build_lswitch_dhcp_response_od(od, lflows);
+        build_lswitch_destination_lookup_brodcast_multicast_od(
+            od, lflows, svc_check_match, &actions);
+        build_lswitch_output_port_sec_od(od, lflows);
     }
+    free(svc_check_match);
 
     HMAP_FOR_EACH (op, key_node, ports) {
         build_lswitch_input_port_sec_op(op, lflows, &match, &actions);
-    }
-
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-         build_lswitch_input_port_sec_od(od, lflows);
-    }
-
-    HMAP_FOR_EACH (op, key_node, ports) {
         build_lswitch_arp_nd_responder_op(op, lflows, &match);
-    }
-
-    HMAP_FOR_EACH (op, key_node, ports) {
         build_lswitch_arp_nd_responder_known_op(
                 op, lflows, ports, &match, &actions);
-    }
-
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        build_lswitch_arp_nd_responder_od(od, lflows);
+        build_lswitch_dhcp_response_op(op, lflows);
+        build_lswitch_external_ports_op(op, lflows);
+        build_lswitch_destination_lookup_and_unicast_op(
+                op, lflows, mcgroups, &match, &actions);
+        build_lswitch_output_port_sec_op(
+                op, lflows, &match, &actions);
     }
 
     HMAP_FOR_EACH (lb, hmap_node, lbs) {
@@ -6745,37 +6741,9 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
                 lb, lflows, &match, &actions);
     }
 
-    HMAP_FOR_EACH (op, key_node, ports) {
-        build_lswitch_dhcp_response_op(op, lflows);
-    }
-
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        build_lswitch_dns_lookup_response_od(od, lflows);
-    }
-
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        build_lswitch_dhcp_response_od(od, lflows);
-    }
-
-    HMAP_FOR_EACH (op, key_node, ports) {
-        build_lswitch_external_ports_op(op, lflows);
-    }
-
-    char *svc_check_match = xasprintf("eth.dst == %s", svc_monitor_mac);
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        build_lswitch_destination_lookup_brodcast_multicast_od(
-            od, lflows, svc_check_match, &actions);
-    }
-    free(svc_check_match);
-
     HMAP_FOR_EACH (igmp_group, hmap_node, igmp_groups) {
         build_lswitch_multicast_igmp_mld_igmp_group(
                 igmp_group, lflows, &match, &actions);
-    }
-
-    HMAP_FOR_EACH (op, key_node, ports) {
-        build_lswitch_destination_lookup_and_unicast_op(
-                op, lflows, mcgroups, &match, &actions);
     }
 
     /* Ingress table 19: Destination lookup for unknown MACs (priority 0).
@@ -6792,15 +6760,6 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
             ovn_lflow_add(lflows, od, S_SWITCH_IN_L2_LKUP, 0, "1",
                           "outport = \""MC_UNKNOWN"\"; output;");
         }
-    }
-
-    HMAP_FOR_EACH (op, key_node, ports) {
-        build_lswitch_output_port_sec_op(
-                op, lflows, &match, &actions);
-    }
-
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        build_lswitch_output_port_sec_od(od, lflows);
     }
 
     ds_destroy(&match);
