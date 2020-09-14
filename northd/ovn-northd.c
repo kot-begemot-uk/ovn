@@ -8831,105 +8831,43 @@ build_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
     struct ovn_datapath *od;
     HMAP_FOR_EACH (od, key_node, datapaths) {
         build_lrouter_flows_ingress_table_0_od(od, lflows);
+        build_lrouter_flows_lookup_and_learn_neighbour_od(
+                od, lflows, &match, &actions);
+        build_lrouter_flows_ip_input_od(od, lflows);
+        build_lrouter_flows_NAT_defrag_lb_od(
+                od, lflows, meter_groups, lbs, &match, &actions);
+        build_lrouter_flows_ingress_ND_RA_od(od, lflows);
+        build_lrouter_flows_static_to_flows_od(od, lflows, ports);
+        build_lrouter_flows_multicast_lookup_od(
+                od, lflows, &match, &actions);
+        build_lrouter_flows_ingress_policy_od(
+                od, lflows, ports);
+        build_lrouter_flows_ingress_arp_resolution_od(od, lflows);
+        build_lrouter_flows_ingress_arp_resolution2_od(od, lflows);
+        build_lrouter_flows_ingress_packet_size_od(
+                od, lflows, ports, &match, &actions);
+        build_lrouter_flows_gateway_redirect_od(
+                od, lflows, &match, &actions);
+        build_lrouter_flows_arp_request_od(
+                od, lflows, &match, &actions);
     }
 
     struct ovn_port *op;
     HMAP_FOR_EACH (op, key_node, ports) {
         build_lrouter_flows_ingress_table_0_op(op, lflows, &match, &actions);
-    }
-
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        build_lrouter_flows_lookup_and_learn_neighbour_od(
-                od, lflows, &match, &actions);
-    }
-
-    HMAP_FOR_EACH (op, key_node, ports) {
         build_lrouter_flows_lookup_and_learn_neighbour_op(
                 op, lflows, &match, &actions);
-    }
-
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        build_lrouter_flows_ip_input_od(od, lflows);
-    }
-
-    HMAP_FOR_EACH (op, key_node, ports) {
         build_lrouter_flows_ipv4_input_table_3_op(
                 op, lflows, &match, &actions);
-    }
-
-    HMAP_FOR_EACH (op, key_node, ports) {
         build_lrouter_flows_dhcp_reply_op(
                 op, lflows, &match);
-    }
-
-    HMAP_FOR_EACH (op, key_node, ports) {
         build_lrouter_flows_ingress_ip_input_v6_op(
                 op, lflows, &match, &actions);
-    }
-
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        build_lrouter_flows_NAT_defrag_lb_od(
-                od, lflows, meter_groups, lbs, &match, &actions);
-    }
-
-    HMAP_FOR_EACH (op, key_node, ports) {
         build_lrouter_flows_ingress_ND_RA_op(
                 op, lflows, &match, &actions);
-    }
-
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        build_lrouter_flows_ingress_ND_RA_od(od, lflows);
-    }
-
-    HMAP_FOR_EACH (op, key_node, ports) {
         build_lrouter_flows_ingress_ip_routing_op(op, lflows);
-    }
-
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        build_lrouter_flows_static_to_flows_od(od, lflows, ports);
-    }
-
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        build_lrouter_flows_multicast_lookup_od(
-                od, lflows, &match, &actions);
-    }
-
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        build_lrouter_flows_ingress_policy_od(
-                od, lflows, ports);
-    }
-
-    /* XXX destination unreachable */
-
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        build_lrouter_flows_ingress_arp_resolution_od(od, lflows);
-    }
-
-    HMAP_FOR_EACH (op, key_node, ports) {
         build_lrouter_flows_ingress_arp_resolution_op(
                 op, lflows, ports, &match, &actions);
-    }
-
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        build_lrouter_flows_ingress_arp_resolution2_od(od, lflows);
-    }
-
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        build_lrouter_flows_ingress_packet_size_od(
-                od, lflows, ports, &match, &actions);
-    }
-
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        build_lrouter_flows_gateway_redirect_od(
-                od, lflows, &match, &actions);
-    }
-
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        build_lrouter_flows_arp_request_od(
-                od, lflows, &match, &actions);
-    }
-
-    HMAP_FOR_EACH (op, key_node, ports) {
         build_lrouter_flows_delivery_op(
                 op, lflows, &match, &actions);
     }
