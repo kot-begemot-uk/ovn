@@ -6688,6 +6688,68 @@ build_lswitch_destination_lookup_and_unicast_op(
 * make diffs readable.
 */
 
+struct lswitch_flow_build_info {
+    struct hmap *datapaths;
+    struct hmap *ports;
+    struct hmap *port_groups;
+    struct hmap *lflows;
+    struct hmap *mcgroups;
+    struct hmap *igmp_groups;
+    struct shash *meter_groups;
+    struct hmap *lbs;
+    char *svc_check_match;
+    struct ds match;
+    struct ds actions;
+};
+
+static void
+    od_lswitch_helper(
+            struct ovn_datapath *od, struct lswitch_flow_build_info *lsi)
+{
+    build_lswitch_flows_pre_acl_and_acl_od(od, lsi->lflows,
+                lsi->port_groups, lsi->meter_groups, lsi->lbs);
+    build_lswitch_forwarding_group_lflows_od(od, lsi->lflows);
+    build_lswitch_admission_control_od(od, lsi->lflows);
+    build_lswitch_input_port_sec_od(od, lsi->lflows);
+    build_lswitch_arp_nd_responder_od(od, lsi->lflows);
+    build_lswitch_dns_lookup_response_od(od, lsi->lflows);
+    build_lswitch_dhcp_response_od(od, lsi->lflows);
+    build_lswitch_destination_lookup_brodcast_multicast_od(
+        od, lsi->lflows, lsi->svc_check_match, &lsi->actions);
+    build_lswitch_output_port_sec_od(od, lsi->lflows);
+}
+
+static void
+    op_lswitch_helper(struct ovn_port *op, struct lswitch_flow_build_info *lsi)
+{
+        build_lswitch_input_port_sec_op(op,
+                lsi->lflows, &lsi->match, &lsi->actions);
+        build_lswitch_arp_nd_responder_op(op, lsi->lflows, &lsi->match);
+        build_lswitch_arp_nd_responder_known_op(
+                op, lsi->lflows, lsi->ports, &lsi->match, &lsi->actions);
+        build_lswitch_dhcp_response_op(op, lsi->lflows);
+        build_lswitch_external_ports_op(op, lsi->lflows);
+        build_lswitch_destination_lookup_and_unicast_op(
+                op, lsi->lflows, lsi->mcgroups, &lsi->match, &lsi->actions);
+        build_lswitch_output_port_sec_op(
+                op, lsi->lflows, &lsi->match, &lsi->actions);
+}
+
+static void
+    lb_lswitch_helper(struct ovn_lb *lb, struct lswitch_flow_build_info *lsi)
+{
+    build_lswitch_arp_nd_responder_lb(
+                lb, lsi->lflows, &lsi->match, &lsi->actions);
+}
+
+static void
+    igmp_lswitch_helper(
+            struct ovn_igmp_group *igmp_group,
+            struct lswitch_flow_build_info *lsi)
+{
+        build_lswitch_multicast_igmp_mld_igmp_group(
+                igmp_group, lsi->lflows, &lsi->match, &lsi->actions);
+}
 
 static void
 build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
@@ -6699,51 +6761,42 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
     /* This flow table structure is documented in ovn-northd(8), so please
      * update ovn-northd.8.xml if you change anything. */
 
-    struct ds match = DS_EMPTY_INITIALIZER;
-    struct ds actions = DS_EMPTY_INITIALIZER;
+    struct lswitch_flow_build_info lsi;
+
 
     struct ovn_datapath *od;
     struct ovn_port *op;
     struct ovn_lb *lb;
     struct ovn_igmp_group *igmp_group;
-
     char *svc_check_match = xasprintf("eth.dst == %s", svc_monitor_mac);
+
+
+    lsi.datapaths = datapaths;
+    lsi.ports = ports;
+    lsi.port_groups = port_groups;
+    lsi.lflows = lflows;
+    lsi.mcgroups = mcgroups;
+    lsi.igmp_groups = igmp_groups;
+    lsi.meter_groups = meter_groups;
+    lsi.lbs = lbs;
+    lsi.svc_check_match = svc_check_match;
+    lsi.match = (struct ds) DS_EMPTY_INITIALIZER;
+    lsi.actions = (struct ds) DS_EMPTY_INITIALIZER;
+
     HMAP_FOR_EACH (od, key_node, datapaths) {
-        build_lswitch_flows_pre_acl_and_acl_od(od, lflows,
-                    port_groups, meter_groups, lbs);
-        build_lswitch_forwarding_group_lflows_od(od, lflows);
-        build_lswitch_admission_control_od(od, lflows);
-        build_lswitch_input_port_sec_od(od, lflows);
-        build_lswitch_arp_nd_responder_od(od, lflows);
-        build_lswitch_dns_lookup_response_od(od, lflows);
-        build_lswitch_dhcp_response_od(od, lflows);
-        build_lswitch_destination_lookup_brodcast_multicast_od(
-            od, lflows, svc_check_match, &actions);
-        build_lswitch_output_port_sec_od(od, lflows);
+        od_lswitch_helper(od, &lsi);
     }
-    free(svc_check_match);
 
     HMAP_FOR_EACH (op, key_node, ports) {
-        build_lswitch_input_port_sec_op(op, lflows, &match, &actions);
-        build_lswitch_arp_nd_responder_op(op, lflows, &match);
-        build_lswitch_arp_nd_responder_known_op(
-                op, lflows, ports, &match, &actions);
-        build_lswitch_dhcp_response_op(op, lflows);
-        build_lswitch_external_ports_op(op, lflows);
-        build_lswitch_destination_lookup_and_unicast_op(
-                op, lflows, mcgroups, &match, &actions);
-        build_lswitch_output_port_sec_op(
-                op, lflows, &match, &actions);
+        op_lswitch_helper(op, &lsi);
     }
 
     HMAP_FOR_EACH (lb, hmap_node, lbs) {
-        build_lswitch_arp_nd_responder_lb(
-                lb, lflows, &match, &actions);
+        lb_lswitch_helper(lb, &lsi);
     }
 
     HMAP_FOR_EACH (igmp_group, hmap_node, igmp_groups) {
-        build_lswitch_multicast_igmp_mld_igmp_group(
-                igmp_group, lflows, &match, &actions);
+        igmp_lswitch_helper(igmp_group, &lsi);
     }
 
     /* Ingress table 19: Destination lookup for unknown MACs (priority 0).
@@ -6762,8 +6815,10 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
         }
     }
 
-    ds_destroy(&match);
-    ds_destroy(&actions);
+    free(svc_check_match);
+
+    ds_destroy(&lsi.match);
+    ds_destroy(&lsi.actions);
 }
 
 static void
