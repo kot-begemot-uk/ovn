@@ -150,6 +150,8 @@ parallel_hmap_next(
 
 #define seize_fire() ovn_seize_fire()
 
+#define add_worker_pool(start) ovn_add_worker_pool(start)
+
 #define fast_hmap_size_for(hmap, size) ovn_fast_hmap_size_for(hmap, size)
 
 #define fast_hmap_init(hmap, size) ovn_fast_hmap_init(hmap, size)
