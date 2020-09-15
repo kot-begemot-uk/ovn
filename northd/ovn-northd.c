@@ -6752,6 +6752,15 @@ static void
 }
 
 static void
+op_lrouter_helper(
+        struct ovn_port *op, struct lswitch_flow_build_info *lri);
+
+static void
+od_lrouter_helper(
+        struct ovn_datapath *od, struct lswitch_flow_build_info *lri);
+
+
+static void
 build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
                     struct hmap *port_groups, struct hmap *lflows,
                     struct hmap *mcgroups, struct hmap *igmp_groups,
@@ -6785,10 +6794,12 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
 
     HMAP_FOR_EACH (od, key_node, datapaths) {
         od_lswitch_helper(od, &lsi);
+        od_lrouter_helper(od, &lsi);
     }
 
     HMAP_FOR_EACH (op, key_node, ports) {
         op_lswitch_helper(op, &lsi);
+        op_lrouter_helper(op, &lsi);
     }
 
     HMAP_FOR_EACH (lb, hmap_node, lbs) {
@@ -8872,7 +8883,7 @@ build_lrouter_flows_delivery_op(
  * to build_lroute_flows
  */
 static void
-od_build_lrouter_helper(
+od_lrouter_helper(
         struct ovn_datapath *od, struct lswitch_flow_build_info *lri)
 {
     build_lrouter_flows_ingress_table_0_od(od, lri->lflows);
@@ -8899,7 +8910,7 @@ od_build_lrouter_helper(
 }
 
 static void
-op_build_lrouter_helper(
+op_lrouter_helper(
         struct ovn_port *op, struct lswitch_flow_build_info *lri)
 {
     build_lrouter_flows_ingress_table_0_op(op,
@@ -8919,40 +8930,6 @@ op_build_lrouter_helper(
             op, lri->lflows, lri->ports, &lri->match, &lri->actions);
     build_lrouter_flows_delivery_op(
             op, lri->lflows, &lri->match, &lri->actions);
-}
-
-static void
-build_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
-                    struct hmap *lflows, struct shash *meter_groups,
-                    struct hmap *lbs)
-{
-    /* This flow table structure is documented in ovn-northd(8), so please
-     * update ovn-northd.8.xml if you change anything. */
-
-    struct lswitch_flow_build_info lri;
-
-
-    struct ovn_datapath *od;
-    struct ovn_port *op;
-
-    lri.datapaths = datapaths;
-    lri.ports = ports;
-    lri.lflows = lflows;
-    lri.meter_groups = meter_groups;
-    lri.lbs = lbs;
-    lri.match = (struct ds) DS_EMPTY_INITIALIZER;
-    lri.actions = (struct ds) DS_EMPTY_INITIALIZER;
-
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        od_build_lrouter_helper(od, &lri);
-    }
-
-    HMAP_FOR_EACH (op, key_node, ports) {
-        op_build_lrouter_helper(op, &lri);
-    }
-    
-    ds_destroy(&lri.match);
-    ds_destroy(&lri.actions);
 }
 
 static void
@@ -11390,7 +11367,6 @@ build_lflows(struct northd_context *ctx, struct hmap *datapaths,
 
     build_lswitch_flows(datapaths, ports, port_groups, &lflows, mcgroups,
                         igmp_groups, meter_groups, lbs);
-    build_lrouter_flows(datapaths, ports, &lflows, meter_groups, lbs);
 
     /* Push changes to the Logical_Flow table to database. */
     const struct sbrec_logical_flow *sbflow, *next_sbflow;
