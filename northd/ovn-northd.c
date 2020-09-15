@@ -48,6 +48,7 @@
 #include "unixctl.h"
 #include "util.h"
 #include "uuid.h"
+#include "fasthmap.h"
 #include "openvswitch/vlog.h"
 
 VLOG_DEFINE_THIS_MODULE(ovn_northd);
@@ -4114,7 +4115,7 @@ ovn_lflow_add_at(struct hmap *lflow_map, struct ovn_datapath *od,
     ovn_lflow_init(lflow, od, stage, priority,
                    xstrdup(match), xstrdup(actions),
                    ovn_lflow_hint(stage_hint), where);
-    hmap_insert(lflow_map, &lflow->hmap_node, ovn_lflow_hash(lflow));
+    hmap_insert_fast(lflow_map, &lflow->hmap_node, ovn_lflow_hash(lflow));
 }
 
 /* Adds a row with the specified contents to the Logical_Flow table. */
@@ -6759,6 +6760,105 @@ static void
 od_lrouter_helper(
         struct ovn_datapath *od, struct lswitch_flow_build_info *lri);
 
+struct lswitch_thread_pool {
+    struct worker_pool *pool;
+};
+
+static void *build_lswitch_flows_thread(void *arg) {
+    struct worker_control *control = (struct worker_control *) arg;
+    struct lswitch_thread_pool *workload;
+    struct lswitch_flow_build_info *lsi;
+
+    struct ovn_datapath *od;
+    struct ovn_port *op;
+    struct ovn_lb *lb;
+    struct ovn_igmp_group *igmp_group;
+    int bnum;
+
+    while (!seize_fire()) {
+        sem_wait(&control->fire);
+        workload = (struct lswitch_thread_pool *) control->workload;
+        lsi = (struct lswitch_flow_build_info *) control->data;
+        if (lsi && workload) {
+            for (bnum = control->id;
+                    bnum <= lsi->datapaths->mask;
+                    bnum += workload->pool->size)
+            {
+                HMAP_FOR_EACH_IN_PARALLEL (
+                        od, key_node, bnum, lsi->datapaths) {
+                    if (seize_fire()) {
+                        return NULL;
+                    }
+                    od_lswitch_helper(od, lsi);
+                    od_lrouter_helper(od, lsi);
+                }
+            }
+            for (bnum = control->id;
+                    bnum <= lsi->ports->mask;
+                    bnum += workload->pool->size)
+            {
+                HMAP_FOR_EACH_IN_PARALLEL (
+                        op, key_node, bnum, lsi->ports) {
+                    if (seize_fire()) {
+                        return NULL;
+                    }
+                    op_lswitch_helper(op, lsi);
+                    op_lrouter_helper(op, lsi);
+                }
+            }
+            for (bnum = control->id;
+                    bnum <= lsi->igmp_groups->mask;
+                    bnum += workload->pool->size)
+            {
+                HMAP_FOR_EACH_IN_PARALLEL (
+                        igmp_group, hmap_node, bnum, lsi->igmp_groups) {
+                    if (seize_fire()) {
+                        return NULL;
+                    }
+                    igmp_lswitch_helper(igmp_group, lsi);
+                }
+            }
+            for (bnum = control->id;
+                    bnum <= lsi->lbs->mask;
+                    bnum += workload->pool->size)
+            {
+                HMAP_FOR_EACH_IN_PARALLEL (
+                        lb, hmap_node, bnum, lsi->lbs) {
+                    if (seize_fire()) {
+                        return NULL;
+                    }
+                    lb_lswitch_helper(lb, lsi);
+                }
+            }
+            atomic_store_relaxed(&control->finished, true);
+            atomic_thread_fence(memory_order_release);
+        }
+        sem_post(control->done);
+     }
+    return NULL;
+}
+
+static struct lswitch_thread_pool *lswitch_pool = NULL;
+
+static void init_lswitch_thread_pool(void)
+{
+    int index;
+
+    if (!lswitch_pool) {
+        lswitch_pool =
+            xmalloc(sizeof(struct lswitch_thread_pool));
+        lswitch_pool->pool =
+            add_worker_pool(build_lswitch_flows_thread);
+ 
+        for (index = 0; index < lswitch_pool->pool->size; index++) {
+            lswitch_pool->pool->controls[index].workload =
+                lswitch_pool;
+        }
+    }
+}
+
+#define OD_CUTOFF 1
+#define OP_CUTOFF 1
 
 static void
 build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
@@ -6770,7 +6870,6 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
     /* This flow table structure is documented in ovn-northd(8), so please
      * update ovn-northd.8.xml if you change anything. */
 
-    struct lswitch_flow_build_info lsi;
 
 
     struct ovn_datapath *od;
@@ -6779,36 +6878,82 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
     struct ovn_igmp_group *igmp_group;
     char *svc_check_match = xasprintf("eth.dst == %s", svc_monitor_mac);
 
+    if (hmap_count(datapaths) > OD_CUTOFF || hmap_count(ports) > OP_CUTOFF) {
+        struct hmap *lflow_segs;
+        struct lswitch_flow_build_info *lsiv;
+        int index;
+        init_lswitch_thread_pool();
 
-    lsi.datapaths = datapaths;
-    lsi.ports = ports;
-    lsi.port_groups = port_groups;
-    lsi.lflows = lflows;
-    lsi.mcgroups = mcgroups;
-    lsi.igmp_groups = igmp_groups;
-    lsi.meter_groups = meter_groups;
-    lsi.lbs = lbs;
-    lsi.svc_check_match = svc_check_match;
-    lsi.match = (struct ds) DS_EMPTY_INITIALIZER;
-    lsi.actions = (struct ds) DS_EMPTY_INITIALIZER;
+        lsiv = xmalloc(
+            sizeof(struct lswitch_flow_build_info) * lswitch_pool->pool->size);
+        lflow_segs = xmalloc(
+            sizeof(struct hmap) * lswitch_pool->pool->size);
 
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        od_lswitch_helper(od, &lsi);
-        od_lrouter_helper(od, &lsi);
+        for (index = 0; index < lswitch_pool->pool->size; index++) {
+
+            fast_hmap_init(&lflow_segs[index], lflows->mask);
+
+            lsiv[index].datapaths = datapaths;
+            lsiv[index].ports = ports;
+            lsiv[index].port_groups = port_groups;
+            lsiv[index].lflows = &lflow_segs[index];
+            lsiv[index].mcgroups = mcgroups;
+            lsiv[index].igmp_groups = igmp_groups;
+            lsiv[index].meter_groups = meter_groups;
+            lsiv[index].lbs = lbs;
+            lsiv[index].svc_check_match = svc_check_match;
+            lsiv[index].match = (struct ds) DS_EMPTY_INITIALIZER;
+            lsiv[index].actions = (struct ds) DS_EMPTY_INITIALIZER;
+
+
+            lswitch_pool->pool->controls[index].data = &lsiv[index];
+        }
+        run_pool_hash(lswitch_pool->pool, lflows, lflow_segs);
+
+        for (index = 0; index < lswitch_pool->pool->size; index++) {
+            ds_destroy(&lsiv[index].match);
+            ds_destroy(&lsiv[index].actions);
+        }
+
+        free(lflow_segs);
+        free(lsiv);
+    } else {
+        struct lswitch_flow_build_info lsi;
+
+        lsi.datapaths = datapaths;
+        lsi.ports = ports;
+        lsi.port_groups = port_groups;
+        lsi.lflows = lflows;
+        lsi.mcgroups = mcgroups;
+        lsi.igmp_groups = igmp_groups;
+        lsi.meter_groups = meter_groups;
+        lsi.lbs = lbs;
+        lsi.svc_check_match = svc_check_match;
+        lsi.match = (struct ds) DS_EMPTY_INITIALIZER;
+        lsi.actions = (struct ds) DS_EMPTY_INITIALIZER;
+
+        HMAP_FOR_EACH (od, key_node, datapaths) {
+            od_lswitch_helper(od, &lsi);
+            od_lrouter_helper(od, &lsi);
+        }
+
+        HMAP_FOR_EACH (op, key_node, ports) {
+            op_lswitch_helper(op, &lsi);
+            op_lrouter_helper(op, &lsi);
+        }
+
+        HMAP_FOR_EACH (lb, hmap_node, lbs) {
+            lb_lswitch_helper(lb, &lsi);
+        }
+
+        HMAP_FOR_EACH (igmp_group, hmap_node, igmp_groups) {
+            igmp_lswitch_helper(igmp_group, &lsi);
+        }
+        ds_destroy(&lsi.match);
+        ds_destroy(&lsi.actions);
     }
+    free(svc_check_match);
 
-    HMAP_FOR_EACH (op, key_node, ports) {
-        op_lswitch_helper(op, &lsi);
-        op_lrouter_helper(op, &lsi);
-    }
-
-    HMAP_FOR_EACH (lb, hmap_node, lbs) {
-        lb_lswitch_helper(lb, &lsi);
-    }
-
-    HMAP_FOR_EACH (igmp_group, hmap_node, igmp_groups) {
-        igmp_lswitch_helper(igmp_group, &lsi);
-    }
 
     /* Ingress table 19: Destination lookup for unknown MACs (priority 0).
      * This cannot be parallelised because has_unknown is modified in
@@ -6826,10 +6971,6 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
         }
     }
 
-    free(svc_check_match);
-
-    ds_destroy(&lsi.match);
-    ds_destroy(&lsi.actions);
 }
 
 static void
@@ -7362,6 +7503,8 @@ build_lswitch_multicast_igmp_mld_igmp_group(
 
 }
 
+static struct ovs_mutex mcgroups_mutex = OVS_MUTEX_INITIALIZER;
+
 static void
 build_lswitch_destination_lookup_and_unicast_op(
                     struct ovn_port *op, struct hmap *lflows,
@@ -7398,7 +7541,9 @@ build_lswitch_destination_lookup_and_unicast_op(
                                         &op->nbsp->header_);
             } else if (!strcmp(op->nbsp->addresses[i], "unknown")) {
                 if (lsp_is_enabled(op->nbsp)) {
+                    ovs_mutex_lock(&mcgroups_mutex);
                     ovn_multicast_add(mcgroups, &mc_unknown, op);
+                    ovs_mutex_unlock(&mcgroups_mutex);
                     op->od->has_unknown = true;
                 }
             } else if (is_dynamic_lsp_address(op->nbsp->addresses[i])) {
@@ -11354,6 +11499,8 @@ build_lrouter_flows_delivery_op(
 
 }
 
+static ssize_t max_seen_lflow_size = 128;
+
 /* Updates the Logical_Flow and Multicast_Group tables in the OVN_SB database,
  * constructing their contents based on the OVN_NB database. */
 static void
@@ -11363,10 +11510,16 @@ build_lflows(struct northd_context *ctx, struct hmap *datapaths,
              struct shash *meter_groups,
              struct hmap *lbs)
 {
-    struct hmap lflows = HMAP_INITIALIZER(&lflows);
+    struct hmap lflows;
+
+    fast_hmap_size_for(&lflows, max_seen_lflow_size);
 
     build_lswitch_flows(datapaths, ports, port_groups, &lflows, mcgroups,
                         igmp_groups, meter_groups, lbs);
+
+    if (hmap_count(&lflows) > max_seen_lflow_size) {
+        max_seen_lflow_size = hmap_count(&lflows);
+    }
 
     /* Push changes to the Logical_Flow table to database. */
     const struct sbrec_logical_flow *sbflow, *next_sbflow;
