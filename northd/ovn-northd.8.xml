@@ -318,7 +318,8 @@
       <code>Pre-stateful</code> to send IP packets to the connection tracker
       before eventually advancing to ingress table <code>ACLs</code>. If
       special ports such as route ports or localnet ports can't use ct(), a
-      priority-110 flow is added to skip over stateful ACLs.
+      priority-110 flow is added to skip over stateful ACLs. IPv6 Neighbor
+      Discovery and MLD traffic also skips stateful ACLs.
     </p>
 
     <p>
@@ -337,23 +338,46 @@
       This table prepares flows for possible stateful load balancing processing
       in ingress table <code>LB</code> and <code>Stateful</code>.  It contains
       a priority-0 flow that simply moves traffic to the next table. Moreover
-      it contains a priority-110 flow to move IPv6 Neighbor Discovery traffic
-      to the next table. If load balancing rules with virtual IP addresses
-      (and ports) are configured in <code>OVN_Northbound</code> database for a
-      logical switch datapath, a priority-100 flow is added for each configured
-      virtual IP address <var>VIP</var>. For IPv4 <var>VIPs</var>, the match is
-      <code>ip &amp;&amp; ip4.dst == <var>VIP</var></code>. For IPv6
-      <var>VIPs</var>, the match is <code>ip &amp;&amp;
-      ip6.dst == <var>VIP</var></code>. The flow sets an action
+      it contains a priority-110 flow to move IPv6 Neighbor Discovery and MLD
+      traffic to the next table. If load balancing rules with virtual IP
+      addresses (and ports) are configured in <code>OVN_Northbound</code>
+      database for alogical switch datapath, a priority-100 flow is added
+      with the match <code>ip</code> to match on IP packets and sets the action
       <code>reg0[0] = 1; next;</code> to act as a hint for table
       <code>Pre-stateful</code> to send IP packets to the connection tracker
-      for packet de-fragmentation before eventually advancing to ingress table
-      <code>LB</code>.
+      for packet de-fragmentation before eventually advancing to ingress
+      table <code>LB</code>.
       If controller_event has been enabled and load balancing rules with
       empty backends have been added in <code>OVN_Northbound</code>, a 130 flow
       is added to trigger ovn-controller events whenever the chassis receives a
       packet for that particular VIP. If <code>event-elb</code> meter has been
       previously created, it will be associated to the empty_lb logical flow
+    </p>
+
+    <p>
+      Prior to <code>OVN 20.09</code> we were setting the
+      <code>reg0[0] = 1</code> only if the IP destination matches the load
+      balancer VIP. However this had few issues cases where a logical switch
+      doesn't have any ACLs with <code>allow-related</code> action.
+      To understand the issue lets a take a TCP load balancer -
+      <code>10.0.0.10:80=10.0.0.3:80</code>. If a logical port - p1 with
+      IP - 10.0.0.5 opens a TCP connection with the VIP - 10.0.0.10, then the
+      packet in the ingress pipeline of 'p1' is sent to the p1's conntrack zone
+      id and the packet is load balanced to the backend - 10.0.0.3. For the
+      reply packet from the backend lport, it is not sent to the conntrack of
+      backend lport's zone id. This is fine as long as the packet is valid.
+      Suppose the backend lport sends an invalid TCP packet (like incorrect
+      sequence number), the packet gets delivered to the lport 'p1' without
+      unDNATing the packet to the VIP - 10.0.0.10. And this causes the
+      connection to be reset by the lport p1's VIF.
+    </p>
+
+    <p>
+      We can't fix this issue by adding a logical flow to drop ct.inv packets
+      in the egress pipeline since it will drop all other connections not
+      destined to the load balancers. To fix this issue, we send all the
+      packets to the conntrack in the ingress pipeline if a load balancer is
+      configured. We can now add a lflow to drop ct.inv packets.
     </p>
 
     <p>
@@ -386,7 +410,86 @@
       <code>ct_next;</code> action.
     </p>
 
-    <h3>Ingress table 6: <code>from-lport</code> ACLs</h3>
+    <h3>Ingress Table 6: <code>from-lport</code> ACL hints</h3>
+
+    <p>
+      This table consists of logical flows that set hints
+      (<code>reg0</code> bits) to be used in the next stage, in the ACL
+      processing table. Multiple hints can be set for the same packet.
+      The possible hints are:
+    </p>
+    <ul>
+      <li>
+        <code>reg0[7]</code>: the packet might match an
+        <code>allow-related</code> ACL and might have to commit the
+        connection to conntrack.
+      </li>
+      <li>
+        <code>reg0[8]</code>: the packet might match an
+        <code>allow-related</code> ACL but there will be no need to commit
+        the connection to conntrack because it already exists.
+      </li>
+      <li>
+        <code>reg0[9]</code>: the packet might match a
+        <code>drop/reject</code>.
+      </li>
+      <li>
+        <code>reg0[10]</code>: the packet might match a
+        <code>drop/reject</code> ACL but the connection was previously
+        allowed so it might have to be committed again with
+        <code>ct_label=1/1</code>.
+      </li>
+    </ul>
+
+    <p>
+      The table contains the following flows:
+    </p>
+    <ul>
+      <li>
+        A priority-7 flow that matches on packets that initiate a new session.
+        This flow sets <code>reg0[7]</code> and <code>reg0[9]</code> and
+        then advances to the next table.
+      </li>
+      <li>
+        A priority-6 flow that matches on packets that are in the request
+        direction of an already existing session that has been marked
+        as blocked. This flow sets <code>reg0[7]</code> and
+        <code>reg0[9]</code> and then advances to the next table.
+      </li>
+      <li>
+        A priority-5 flow that matches untracked packets. This flow sets
+        <code>reg0[8]</code> and <code>reg0[9]</code> and then advances to
+        the next table.
+      </li>
+      <li>
+        A priority-4 flow that matches on packets that are in the request
+        direction of an already existing session that has not been marked
+        as blocked. This flow sets <code>reg0[8]</code> and
+        <code>reg0[10]</code> and then advances to the next table.
+      </li>
+      <li>
+        A priority-3 flow that matches on packets that are in not part of
+        established sessions. This flow sets <code>reg0[9]</code> and then
+        advances to the next table.
+      </li>
+      <li>
+        A priority-2 flow that matches on packets that are part of an
+        established session that has been marked as blocked.
+        This flow sets <code>reg0[9]</code> and then advances to the next
+        table.
+      </li>
+      <li>
+        A priority-1 flow that matches on packets that are part of an
+        established session that has not been marked as blocked.
+        This flow sets <code>reg0[10]</code> and then advances to the next
+        table.
+      </li>
+      <li>
+        A priority-0 flow to advance to the next table.
+      </li>
+    </ul>
+
+    <h3>Ingress table 7: <code>from-lport</code> ACLs</h3>
 
     <p>
       Logical flows in this table closely reproduce those in the
@@ -430,8 +533,8 @@
     <p>
       This table also contains a priority 0 flow with action
       <code>next;</code>, so that ACLs allow packets by default.  If the
-      logical datapath has a statetful ACL, the following flows will
-      also be added:
+      logical datapath has a stateful ACL or a load balancer with VIP
+      configured, the following flows will also be added:
     </p>
 
     <ul>
@@ -478,7 +581,7 @@
 
       <li>
         A priority-65535 flow that allows IPv6 Neighbor solicitation,
-        Neighbor discover, Router solicitation and Router advertisement
+        Neighbor discover, Router solicitation, Router advertisement and MLD
         packets.
       </li>
 
@@ -494,7 +597,7 @@
       </li>
     </ul>
 
-    <h3>Ingress Table 7: <code>from-lport</code> QoS Marking</h3>
+    <h3>Ingress Table 8: <code>from-lport</code> QoS Marking</h3>
 
     <p>
       Logical flows in this table closely reproduce those in the
@@ -516,7 +619,7 @@
       </li>
     </ul>
 
-    <h3>Ingress Table 8: <code>from-lport</code> QoS Meter</h3>
+    <h3>Ingress Table 9: <code>from-lport</code> QoS Meter</h3>
 
     <p>
       Logical flows in this table closely reproduce those in the
@@ -538,7 +641,7 @@
       </li>
     </ul>
 
-    <h3>Ingress Table 9: LB</h3>
+    <h3>Ingress Table 10: LB</h3>
 
     <p>
       It contains a priority-0 flow that simply moves traffic to the next
@@ -564,7 +667,7 @@
       connection.)
     </p>
 
-    <h3>Ingress Table 10: Stateful</h3>
+    <h3>Ingress Table 11: Stateful</h3>
 
     <ul>
       <li>
@@ -612,7 +715,7 @@
       </li>
     </ul>
 
-    <h3>Ingress Table 11: Pre-Hairpin</h3>
+    <h3>Ingress Table 12: Pre-Hairpin</h3>
     <ul>
       <li>
         For all configured load balancer VIPs a priority-2 flow that
@@ -632,7 +735,7 @@
       </li>
     </ul>
 
-    <h3>Ingress Table 12: Hairpin</h3>
+    <h3>Ingress Table 13: Hairpin</h3>
     <ul>
       <li>
         A priority-1 flow that hairpins traffic matched by non-default
@@ -645,7 +748,7 @@
       </li>
     </ul>
 
-    <h3>Ingress Table 13: ARP/ND responder</h3>
+    <h3>Ingress Table 14: ARP/ND responder</h3>
 
     <p>
       This table implements ARP/ND responder in a logical switch for known
@@ -935,7 +1038,7 @@ output;
       </li>
     </ul>
 
-    <h3>Ingress Table 14: DHCP option processing</h3>
+    <h3>Ingress Table 15: DHCP option processing</h3>
 
     <p>
       This table adds the DHCPv4 options to a DHCPv4 packet from the
@@ -992,11 +1095,11 @@ next;
       </li>
 
       <li>
-        A priority-0 flow that matches all packets to advances to table 15.
+        A priority-0 flow that matches all packets to advances to table 16.
       </li>
     </ul>
 
-    <h3>Ingress Table 15: DHCP responses</h3>
+    <h3>Ingress Table 16: DHCP responses</h3>
 
     <p>
       This table implements DHCP responder for the DHCP replies generated by
@@ -1073,11 +1176,11 @@ output;
       </li>
 
       <li>
-        A priority-0 flow that matches all packets to advances to table 16.
+        A priority-0 flow that matches all packets to advances to table 17.
       </li>
     </ul>
 
-    <h3>Ingress Table 16 DNS Lookup</h3>
+    <h3>Ingress Table 17 DNS Lookup</h3>
 
     <p>
       This table looks up and resolves the DNS names to the corresponding
@@ -1106,7 +1209,7 @@ reg0[4] = dns_lookup(); next;
       </li>
     </ul>
 
-    <h3>Ingress Table 17 DNS Responses</h3>
+    <h3>Ingress Table 18 DNS Responses</h3>
 
     <p>
       This table implements DNS responder for the DNS replies generated by
@@ -1141,7 +1244,7 @@ output;
       </li>
     </ul>
 
-    <h3>Ingress table 18 External ports</h3>
+    <h3>Ingress table 19 External ports</h3>
 
     <p>
       Traffic from the <code>external</code> logical ports enter the ingress
@@ -1180,11 +1283,11 @@ output;
       </li>
 
       <li>
-        A priority-0 flow that matches all packets to advances to table 19.
+        A priority-0 flow that matches all packets to advances to table 20.
       </li>
     </ul>
 
-    <h3>Ingress Table 19 Destination Lookup</h3>
+    <h3>Ingress Table 20 Destination Lookup</h3>
 
     <p>
       This table implements switching behavior.  It contains these logical
@@ -1417,7 +1520,12 @@ output;
       This is similar to ingress table <code>LB</code>.
     </p>
 
-    <h3>Egress Table 4: <code>to-lport</code> ACLs</h3>
+    <h3>Egress Table 4: <code>from-lport</code> ACL hints</h3>
+    <p>
+      This is similar to ingress table <code>ACL hints</code>.
+    </p>
+
+    <h3>Egress Table 5: <code>to-lport</code> ACLs</h3>
 
     <p>
       This is similar to ingress table <code>ACLs</code> except for
@@ -1432,14 +1540,14 @@ output;
         A priority 34000 logical flow is added for each logical port which
         has DHCPv4 options defined to allow the DHCPv4 reply packet and which has
         DHCPv6 options defined to allow the DHCPv6 reply packet from the
-        <code>Ingress Table 15: DHCP responses</code>.
+        <code>Ingress Table 16: DHCP responses</code>.
       </li>
 
       <li>
         A priority 34000 logical flow is added for each logical switch datapath
         configured with DNS records with the match <code>udp.dst = 53</code>
         to allow the DNS reply packet from the
-        <code>Ingress Table 17: DNS responses</code>.
+        <code>Ingress Table 18: DNS responses</code>.
       </li>
 
       <li>
@@ -1454,28 +1562,28 @@ output;
       </li>
     </ul>
 
-    <h3>Egress Table 5: <code>to-lport</code> QoS Marking</h3>
+    <h3>Egress Table 6: <code>to-lport</code> QoS Marking</h3>
 
     <p>
       This is similar to ingress table <code>QoS marking</code> except
       they apply to <code>to-lport</code> QoS rules.
     </p>
 
-    <h3>Egress Table 6: <code>to-lport</code> QoS Meter</h3>
+    <h3>Egress Table 7: <code>to-lport</code> QoS Meter</h3>
 
     <p>
       This is similar to ingress table <code>QoS meter</code> except
       they apply to <code>to-lport</code> QoS rules.
     </p>
 
-    <h3>Egress Table 7: Stateful</h3>
+    <h3>Egress Table 8: Stateful</h3>
 
     <p>
       This is similar to ingress table <code>Stateful</code> except that
       there are no rules added for load balancing new connections.
     </p>
 
-    <h3>Egress Table 8: Egress Port Security - IP</h3>
+    <h3>Egress Table 9: Egress Port Security - IP</h3>
 
     <p>
       This is similar to the port security logic in table
@@ -1485,7 +1593,7 @@ output;
       <code>ip4.src</code> and <code>ip6.src</code>
     </p>
 
-    <h3>Egress Table 9: Egress Port Security - L2</h3>
+    <h3>Egress Table 10: Egress Port Security - L2</h3>
 
     <p>
       This is similar to the ingress port security logic in ingress table
