@@ -5815,7 +5815,7 @@ rm -f 2.expected
 
 # Set tftp server option (IPv4 address) for ls1
 echo "------ Set tftp server (IPv4 address) --------"
-ovn-nbctl dhcp-options-set-options $d1 server_id=10.0.0.1 \
+ovn-nbctl --wait=hv dhcp-options-set-options $d1 server_id=10.0.0.1 \
 server_mac=ff:10:00:00:00:01 lease_time=3600 router=10.0.0.1 \
 tftp_server=10.10.10.10
 echo "----------------------------------------------"
@@ -5846,7 +5846,7 @@ rm -f 2.expected
 
 # Set tftp server option (Hostname) for ls1
 echo "------ Set tftp server (hostname) --------"
-ovn-nbctl dhcp-options-set-options $d1 server_id=10.0.0.1 \
+ovn-nbctl --wait=hv dhcp-options-set-options $d1 server_id=10.0.0.1 \
 server_mac=ff:10:00:00:00:01 lease_time=3600 router=10.0.0.1 \
 tftp_server=\"test_tftp_server\"
 echo "------------------------------------------"
@@ -5877,7 +5877,7 @@ rm -f 2.expected
 
 # Set domain search list option for ls1
 echo "------ Set domain search list --------"
-ovn-nbctl dhcp-options-set-options $d1 server_id=10.0.0.1 \
+ovn-nbctl --wait=hv dhcp-options-set-options $d1 server_id=10.0.0.1 \
 server_mac=ff:10:00:00:00:01 lease_time=3600 router=10.0.0.1 \
 domain_search_list=\"test1.com,test2.com\"
 echo "------------------------------------------"
@@ -7472,6 +7472,24 @@ ovn-nbctl --wait=sb lsp-add sw11 p103 -- lsp-set-addresses p103 "22:33:44:55:66:
 AT_CHECK([ovn-nbctl get Logical-Switch-Port p103 dynamic_addresses], [0],
     ["22:33:44:55:66:77 172.16.1.250"
 ])
+
+ovn-nbctl ls-add sw12
+for i in $(seq 0 1); do
+    for j in $(seq 1 99); do
+        idx=$((i*100+j))
+        ovn-nbctl lsp-add sw12 sw12-p${idx} -- \
+        lsp-set-addresses sw12-p${idx} "00:00:00:00:$i:$j dynamic"
+    done
+done
+ovn-nbctl --wait=sb set Logical-Switch sw12 other_config:subnet=192.10.2.0/24
+AT_CHECK([ovn-nbctl list Logical-Switch-Port | grep -q 192.10.2.127], [0])
+AT_CHECK([ovn-nbctl list Logical-Switch-Port | grep -q 192.10.2.128], [0])
+AT_CHECK([ovn-nbctl list Logical-Switch-Port | grep -q 192.10.2.180], [0])
+
+ovn-nbctl --wait=sb set Logical-Switch sw12 other_config:subnet=192.10.2.0/25
+AT_CHECK([ovn-nbctl list Logical-Switch-Port | grep -q 192.10.2.127], [1])
+AT_CHECK([ovn-nbctl list Logical-Switch-Port | grep -q 192.10.2.128], [1])
+AT_CHECK([ovn-nbctl list Logical-Switch-Port | grep -q 192.10.2.180], [1])
 
 as ovn-sb
 OVS_APP_EXIT_AND_WAIT([ovsdb-server])
@@ -16650,6 +16668,7 @@ ovn_start
 #   - subnet 30.0.0.0/8
 #   - 1 port bound on hv1 (sw3-p1)
 #   - 1 port bound on hv2 (sw3-p2)
+#   - 1 localnet port (sw3-ln)
 
 reset_pcap_file() {
     local iface=$1
@@ -16776,6 +16795,9 @@ ovn-nbctl lsp-add sw2 sw2-p1
 ovn-nbctl lsp-add sw2 sw2-p2
 ovn-nbctl lsp-add sw3 sw3-p1
 ovn-nbctl lsp-add sw3 sw3-p2
+ovn-nbctl lsp-add sw3 sw3-ln                    \
+    -- lsp-set-type sw3-ln localnet             \
+    -- lsp-set-options sw3-ln network_name=phys
 
 ovn-nbctl lr-add rtr
 ovn-nbctl lrp-add rtr rtr-sw1 00:00:00:00:01:00 10.0.0.254/24
@@ -16820,6 +16842,7 @@ ovs-vsctl -- add-port br-int hv1-vif4 -- \
     options:tx_pcap=hv1/vif4-tx.pcap \
     options:rxq_pcap=hv1/vif4-rx.pcap \
     ofport-request=1
+ovs-vsctl set open . external-ids:ovn-bridge-mappings=phys:br-phys
 
 sim_add hv2
 as hv2
@@ -16845,6 +16868,7 @@ ovs-vsctl -- add-port br-int hv2-vif4 -- \
     options:tx_pcap=hv2/vif4-tx.pcap \
     options:rxq_pcap=hv2/vif4-rx.pcap \
     ofport-request=1
+ovs-vsctl set open . external-ids:ovn-bridge-mappings=phys:br-phys
 
 OVN_POPULATE_ARP
 
@@ -17128,6 +17152,18 @@ store_ip_multicast_pkt \
     $(ip_to_hex 10 0 0 42) $(ip_to_hex 239 0 1 68) 1e 20 ca70 11 \
     e518e518000a3b3a0000 expected_switched
 
+# TODO: IGMP Relay duplicates IP multicast packets in some conditions, for
+# more details see TODO.rst, section "IP Multicast Relay". Once that issue is
+# fixed the duplicated packets should not appear anymore.
+store_ip_multicast_pkt \
+    000000000100 01005e000144 \
+    $(ip_to_hex 10 0 0 42) $(ip_to_hex 239 0 1 68) 1e 1f cb70 11 \
+    e518e518000a3b3a0000 expected_routed_sw1
+store_ip_multicast_pkt \
+    000000000200 01005e000144 \
+    $(ip_to_hex 10 0 0 42) $(ip_to_hex 239 0 1 68) 1e 1f cb70 11 \
+    e518e518000a3b3a0000 expected_routed_sw2
+
 OVN_CHECK_PACKETS([hv1/vif1-tx.pcap], [expected_routed_sw1])
 OVN_CHECK_PACKETS([hv2/vif3-tx.pcap], [expected_routed_sw2])
 OVN_CHECK_PACKETS([hv1/vif4-tx.pcap], [expected_switched])
@@ -17275,6 +17311,7 @@ ovn_start
 #   - subnet 30::/64
 #   - 1 port bound on hv1 (sw3-p1)
 #   - 1 port bound on hv2 (sw3-p2)
+#   - 1 localnet port (sw3-ln)
 
 reset_pcap_file() {
     local iface=$1
@@ -17400,6 +17437,9 @@ ovn-nbctl lsp-add sw2 sw2-p1
 ovn-nbctl lsp-add sw2 sw2-p2
 ovn-nbctl lsp-add sw3 sw3-p1
 ovn-nbctl lsp-add sw3 sw3-p2
+ovn-nbctl lsp-add sw3 sw3-ln                    \
+    -- lsp-set-type sw3-ln localnet             \
+    -- lsp-set-options sw3-ln network_name=phys
 
 ovn-nbctl lr-add rtr
 ovn-nbctl lrp-add rtr rtr-sw1 00:00:00:00:01:00 10::fe/64
@@ -17459,6 +17499,7 @@ ovs-vsctl -- add-port br-int hv1-vif4 -- \
     options:tx_pcap=hv1/vif4-tx.pcap \
     options:rxq_pcap=hv1/vif4-rx.pcap \
     ofport-request=1
+ovs-vsctl set open . external-ids:ovn-bridge-mappings=phys:br-phys
 
 sim_add hv2
 as hv2
@@ -17484,6 +17525,7 @@ ovs-vsctl -- add-port br-int hv2-vif4 -- \
     options:tx_pcap=hv2/vif4-tx.pcap \
     options:rxq_pcap=hv2/vif4-rx.pcap \
     ofport-request=1
+ovs-vsctl set open . external-ids:ovn-bridge-mappings=phys:br-phys
 
 OVN_POPULATE_ARP
 
@@ -17793,6 +17835,22 @@ store_ip_multicast_pkt \
     000e 02 11 \
     93407a69000e1b5e61736461640a \
     expected_switched
+
+# TODO: MLD Relay duplicates IP multicast packets in some conditions, for
+# more details see TODO.rst, section "IP Multicast Relay". Once that issue is
+# fixed the duplicated packets should not appear anymore.
+store_ip_multicast_pkt \
+    000000000100 333300000001 \
+    10000000000000000000000000000042 ff0adeadbeef00000000000000000001 \
+    000e 01 11 \
+    93407a69000e1b5e61736461640a \
+    expected_routed_sw1
+store_ip_multicast_pkt \
+    000000000200 333300000001 \
+    10000000000000000000000000000042 ff0adeadbeef00000000000000000001 \
+    000e 01 11 \
+    93407a69000e1b5e61736461640a \
+    expected_routed_sw2
 
 OVN_CHECK_PACKETS([hv1/vif1-tx.pcap], [expected_routed_sw1])
 OVN_CHECK_PACKETS([hv2/vif3-tx.pcap], [expected_routed_sw2])
@@ -22203,6 +22261,114 @@ ovn-nbctl acl-del ls1 to-lport 1001 \
 
 # Packet should be received
 test_ip 2 f00000000002 f00000000001 $sip $dip 1
+OVN_CHECK_PACKETS([hv1/vif1-tx.pcap], [1.expected])
+
+OVN_CLEANUP([hv1])
+AT_CLEANUP
+
+# This test cases tests a scenario of ACL confliction with address set update.
+# It is to cover a corner case when flows are re-processed in the I-P
+# iteration, combined with the scenario of conflicting ACLs.
+AT_SETUP([ovn -- conflict ACLs with address set])
+ovn_start
+
+ovn-nbctl ls-add ls1
+
+ovn-nbctl lsp-add ls1 lsp1 \
+-- lsp-set-addresses lsp1 "f0:00:00:00:00:01 10.0.0.1"
+
+ovn-nbctl lsp-add ls1 lsp2 \
+-- lsp-set-addresses lsp2 "f0:00:00:00:00:02 10.0.0.2"
+
+net_add n1
+sim_add hv1
+
+as hv1
+ovs-vsctl add-br br-phys
+ovn_attach n1 br-phys 192.168.0.1
+ovs-vsctl -- add-port br-int hv1-vif1 -- \
+    set interface hv1-vif1 external-ids:iface-id=lsp1 \
+    options:tx_pcap=hv1/vif1-tx.pcap \
+    options:rxq_pcap=hv1/vif1-rx.pcap \
+    ofport-request=1
+
+ovs-vsctl -- add-port br-int hv1-vif2 -- \
+    set interface hv1-vif2 external-ids:iface-id=lsp2 \
+    options:tx_pcap=hv1/vif2-tx.pcap \
+    options:rxq_pcap=hv1/vif2-rx.pcap \
+    ofport-request=2
+
+# Default drop
+ovn-nbctl acl-add ls1 to-lport 1000 \
+'outport == "lsp1" && ip4' drop
+
+# test_ip INPORT SRC_MAC DST_MAC SRC_IP DST_IP OUTPORT...
+#
+# This shell function causes an ip packet to be received on INPORT.
+# The packet's content has Ethernet destination DST and source SRC
+# (each exactly 12 hex digits) and Ethernet type ETHTYPE (4 hex digits).
+# The OUTPORTs (zero or more) list the VIFs on which the packet should
+# be received.  INPORT and the OUTPORTs are specified as logical switch
+# port numbers, e.g. 11 for vif11.
+test_ip() {
+    # This packet has bad checksums but logical L3 routing doesn't check.
+    local inport=$1 src_mac=$2 dst_mac=$3 src_ip=$4 dst_ip=$5
+    local packet=${dst_mac}${src_mac}08004500001c0000000040110000${src_ip}\
+${dst_ip}0035111100080000
+    shift; shift; shift; shift; shift
+    as hv1 ovs-appctl netdev-dummy/receive hv1-vif$inport $packet
+    for outport; do
+        echo $packet >> $outport.expected
+    done
+}
+
+ip_to_hex() {
+    printf "%02x%02x%02x%02x" "$@"
+}
+
+reset_pcap_file() {
+    local iface=$1
+    local pcap_file=$2
+    ovs-vsctl -- set Interface $iface options:tx_pcap=dummy-tx.pcap \
+options:rxq_pcap=dummy-rx.pcap
+    rm -f ${pcap_file}*.pcap
+    ovs-vsctl -- set Interface $iface options:tx_pcap=${pcap_file}-tx.pcap \
+options:rxq_pcap=${pcap_file}-rx.pcap
+}
+
+# Create an address set
+ovn-nbctl create Address_Set name=as1 \
+addresses=\"10.0.0.2\",\"10.0.0.3\"
+
+# Create overlapping ACLs resulting in conflict desired OVS flows
+# Add ACL1 uses the address set
+ovn-nbctl --wait=hv acl-add ls1 to-lport 1001 \
+'outport == "lsp1" && ip4 && ip4.src == $as1' allow
+
+# Add ACL2 which uses a single IP, which shouldn't take effect because
+# when it is added incrementally there is already a conflict one installed.
+ovn-nbctl --wait=hv acl-add ls1 to-lport 1001 \
+'outport == "lsp1" && ip4 && ip4.src == 10.0.0.2' drop
+
+
+sip=`ip_to_hex 10 0 0 2`
+dip=`ip_to_hex 10 0 0 1`
+test_ip 2 f00000000002 f00000000001 $sip $dip 1
+OVN_CHECK_PACKETS([hv1/vif1-tx.pcap], [1.expected])
+
+# Update the address set which causes flow reprocessing but the OVS flow
+# for allowing 10.0.0.2 should keep unchanged
+ovn-nbctl --wait=hv set Address_Set as1 addresses=\"10.0.0.2\"
+
+test_ip 2 f00000000002 f00000000001 $sip $dip 1
+OVN_CHECK_PACKETS([hv1/vif1-tx.pcap], [1.expected])
+
+# Delete the ACL1 that has "allow" action
+ovn-nbctl acl-del ls1 to-lport 1001 \
+'outport == "lsp1" && ip4 && ip4.src == $as1'
+
+# ACL2 should take effect and packet should be dropped
+test_ip 2 f00000000002 f00000000001 $sip $dip
 OVN_CHECK_PACKETS([hv1/vif1-tx.pcap], [1.expected])
 
 OVN_CLEANUP([hv1])
