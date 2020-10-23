@@ -573,11 +573,22 @@ enum {
     PREFIX_REQUEST,
     PREFIX_PENDING,
     PREFIX_DONE,
+    PREFIX_RENEW,
+    PREFIX_REBIND,
 };
 
 struct ipv6_prefixd_state {
     long long int next_announce;
+    long long int last_complete;
     long long int last_used;
+    /* IPv6 PD server info */
+    struct in6_addr server_addr;
+    struct eth_addr sa;
+    /* server_id_info */
+    struct {
+        uint8_t *data;
+        uint8_t len;
+    } uuid;
     struct in6_addr ipv6_addr;
     struct eth_addr ea;
     struct eth_addr cmac;
@@ -781,20 +792,26 @@ out:
 static void
 pinctrl_prefixd_state_handler(const struct flow *ip_flow,
                               struct in6_addr addr, unsigned aid,
+                              struct eth_addr sa, struct in6_addr server_addr,
                               char prefix_len, unsigned t1, unsigned t2,
-                              unsigned plife_time, unsigned vlife_time)
+                              unsigned plife_time, unsigned vlife_time,
+                              uint8_t *uuid, uint8_t uuid_len)
 {
     struct ipv6_prefixd_state *pfd;
 
     pfd = pinctrl_find_prefixd_state(ip_flow, aid);
     if (pfd) {
         pfd->state = PREFIX_PENDING;
-        pfd->plife_time = plife_time;
-        pfd->vlife_time = vlife_time;
+        pfd->server_addr = server_addr;
+        pfd->sa = sa;
+        pfd->uuid.data = uuid;
+        pfd->uuid.len = uuid_len;
+        pfd->plife_time = plife_time * 1000;
+        pfd->vlife_time = vlife_time * 1000;
         pfd->plen = prefix_len;
         pfd->prefix = addr;
-        pfd->t1 = t1;
-        pfd->t2 = t2;
+        pfd->t1 = t1 * 1000;
+        pfd->t2 = t2 * 1000;
         notify_pinctrl_main();
     }
 }
@@ -804,19 +821,21 @@ pinctrl_parse_dhcpv6_reply(struct dp_packet *pkt_in,
                            const struct flow *ip_flow)
     OVS_REQUIRES(pinctrl_mutex)
 {
+    struct eth_header *eth = dp_packet_eth(pkt_in);
+    struct ip6_hdr *in_ip = dp_packet_l3(pkt_in);
     struct udp_header *udp_in = dp_packet_l4(pkt_in);
     unsigned char *in_dhcpv6_data = (unsigned char *)(udp_in + 1);
     size_t dlen = MIN(ntohs(udp_in->udp_len), dp_packet_l4_size(pkt_in));
     unsigned t1 = 0, t2 = 0, vlife_time = 0, plife_time = 0;
-    uint8_t *end = (uint8_t *)udp_in + dlen;
-    uint8_t prefix_len = 0;
-    struct in6_addr ipv6;
+    uint8_t *end = (uint8_t *)udp_in + dlen, *uuid = NULL;
+    uint8_t prefix_len = 0, uuid_len = 0;
+    struct in6_addr ipv6 = in6addr_any;
     bool status = false;
     unsigned aid = 0;
 
-    memset(&ipv6, 0, sizeof (struct in6_addr));
     /* skip DHCPv6 common header */
     in_dhcpv6_data += 4;
+
     while (in_dhcpv6_data < end) {
         struct dhcpv6_opt_header *in_opt =
              (struct dhcpv6_opt_header *)in_dhcpv6_data;
@@ -867,14 +886,22 @@ pinctrl_parse_dhcpv6_reply(struct dp_packet *pkt_in,
             }
             break;
         }
+        case DHCPV6_OPT_SERVER_ID_CODE:
+            uuid_len = ntohs(in_opt->len);
+            uuid = xmalloc(uuid_len);
+            memcpy(uuid, in_opt + 1, uuid_len);
+            break;
         default:
             break;
         }
         in_dhcpv6_data += opt_len;
     }
     if (status) {
-        pinctrl_prefixd_state_handler(ip_flow, ipv6, aid, prefix_len,
-                                      t1, t2, plife_time, vlife_time);
+        pinctrl_prefixd_state_handler(ip_flow, ipv6, aid, eth->eth_src,
+                                      in_ip->ip6_src, prefix_len, t1, t2,
+                                      plife_time, vlife_time, uuid, uuid_len);
+    } else if (uuid) {
+        free(uuid);
     }
 }
 
@@ -904,27 +931,42 @@ pinctrl_handle_dhcp6_server(struct rconn *swconn, const struct flow *ip_flow,
 }
 
 static void
-compose_prefixd_solicit(struct dp_packet *b,
-                        struct ipv6_prefixd_state *pfd,
-                        const struct eth_addr eth_dst,
-                        const struct in6_addr *ipv6_dst)
+compose_prefixd_packet(struct dp_packet *b, struct ipv6_prefixd_state *pfd)
 {
-    eth_compose(b, eth_dst, pfd->ea, ETH_TYPE_IPV6, IPV6_HEADER_LEN);
+    struct in6_addr ipv6_dst;
+    struct eth_addr eth_dst;
 
     int payload = sizeof(struct dhcpv6_opt_server_id) +
                   sizeof(struct dhcpv6_opt_ia_na);
+    if (pfd->uuid.len) {
+        payload += pfd->uuid.len + sizeof(struct dhcpv6_opt_header);
+        ipv6_dst = pfd->server_addr;
+        eth_dst = pfd->sa;
+    } else {
+        eth_dst = (struct eth_addr) ETH_ADDR_C(33,33,00,01,00,02);
+        ipv6_parse("ff02::1:2", &ipv6_dst);
+    }
     if (ipv6_addr_is_set(&pfd->prefix)) {
         payload += sizeof(struct dhcpv6_opt_ia_prefix);
     }
+
+    eth_compose(b, eth_dst, pfd->ea, ETH_TYPE_IPV6, IPV6_HEADER_LEN);
+
     int len = UDP_HEADER_LEN + 4 + payload;
     struct udp_header *udp_h = compose_ipv6(b, IPPROTO_UDP, &pfd->ipv6_addr,
-                                            ipv6_dst, 0, 0, 255, len);
+                                            &ipv6_dst, 0, 0, 255, len);
     udp_h->udp_len = htons(len);
     udp_h->udp_csum = 0;
     packet_set_udp_port(b, htons(546), htons(547));
 
     unsigned char *dhcp_hdr = (unsigned char *)(udp_h + 1);
-    *dhcp_hdr = DHCPV6_MSG_TYPE_SOLICIT;
+    if (pfd->state == PREFIX_RENEW) {
+        *dhcp_hdr = DHCPV6_MSG_TYPE_RENEW;
+    } else if (pfd->state == PREFIX_REBIND) {
+        *dhcp_hdr = DHCPV6_MSG_TYPE_REBIND;
+    } else {
+        *dhcp_hdr = DHCPV6_MSG_TYPE_SOLICIT;
+    }
 
     struct dhcpv6_opt_server_id *opt_client_id =
         (struct dhcpv6_opt_server_id *)(dhcp_hdr + 4);
@@ -935,11 +977,21 @@ compose_prefixd_solicit(struct dp_packet *b,
     opt_client_id->hw_type = htons(DHCPV6_HW_TYPE_ETH);
     opt_client_id->mac = pfd->cmac;
 
+    unsigned char *ptr = (unsigned char *)(opt_client_id + 1);
+    if (pfd->uuid.len) {
+        struct dhcpv6_opt_header *in_opt = (struct dhcpv6_opt_header *)ptr;
+        in_opt->code = htons(DHCPV6_OPT_SERVER_ID_CODE);
+        in_opt->len = htons(pfd->uuid.len);
+
+        ptr += sizeof *in_opt;
+        memcpy(ptr, pfd->uuid.data, pfd->uuid.len);
+        ptr += pfd->uuid.len;
+    }
+
     if (!ipv6_addr_is_set(&pfd->prefix)) {
         pfd->aid = random_uint16();
     }
-    struct dhcpv6_opt_ia_na *ia_pd =
-            (struct dhcpv6_opt_ia_na *)(opt_client_id + 1);
+    struct dhcpv6_opt_ia_na *ia_pd = (struct dhcpv6_opt_ia_na *)ptr;
     ia_pd->opt.code = htons(DHCPV6_OPT_IA_PD);
     int opt_len = sizeof(struct dhcpv6_opt_ia_na) -
                   sizeof(struct dhcpv6_opt_header);
@@ -981,16 +1033,15 @@ ipv6_prefixd_send(struct rconn *swconn, struct ipv6_prefixd_state *pfd)
         return pfd->next_announce;
     }
 
+    if (pfd->state == PREFIX_DONE) {
+        goto out;
+    }
+
     uint64_t packet_stub[256 / 8];
     struct dp_packet packet;
 
-    struct eth_addr eth_dst;
-    eth_dst = (struct eth_addr) ETH_ADDR_C(33,33,00,01,00,02);
-    struct in6_addr ipv6_dst;
-    ipv6_parse("ff02::1:2", &ipv6_dst);
-
     dp_packet_use_stub(&packet, packet_stub, sizeof packet_stub);
-    compose_prefixd_solicit(&packet, pfd, eth_dst, &ipv6_dst);
+    compose_prefixd_packet(&packet, pfd);
 
     uint64_t ofpacts_stub[4096 / 8];
     struct ofpbuf ofpacts = OFPBUF_STUB_INITIALIZER(ofpacts_stub);
@@ -1019,8 +1070,9 @@ ipv6_prefixd_send(struct rconn *swconn, struct ipv6_prefixd_state *pfd)
     queue_msg(swconn, ofputil_encode_packet_out(&po, proto));
     dp_packet_uninit(&packet);
     ofpbuf_uninit(&ofpacts);
+
+out:
     pfd->next_announce = cur_time + random_range(IPV6_PREFIXD_TIMEOUT);
-    pfd->state = PREFIX_SOLICIT;
 
     return pfd->next_announce;
 }
@@ -1031,10 +1083,28 @@ static bool ipv6_prefixd_should_inject(void)
 
     SHASH_FOR_EACH (iter, &ipv6_prefixd) {
         struct ipv6_prefixd_state *pfd = iter->data;
+        long long int cur_time = time_msec();
+
         if (pfd->state == PREFIX_SOLICIT) {
             return true;
         }
-        if (pfd->state && pfd->next_announce < time_msec()) {
+        if (pfd->state == PREFIX_DONE &&
+            cur_time > pfd->last_complete + pfd->t1) {
+            pfd->state = PREFIX_RENEW;
+            return true;
+        }
+        if (pfd->state == PREFIX_RENEW &&
+            cur_time > pfd->last_complete + pfd->t2) {
+            pfd->state = PREFIX_REBIND;
+            if (pfd->uuid.len) {
+                free(pfd->uuid.data);
+                pfd->uuid.len = 0;
+            }
+            return true;
+        }
+        if (pfd->state == PREFIX_REBIND &&
+            cur_time > pfd->last_complete + pfd->vlife_time) {
+            pfd->state = PREFIX_SOLICIT;
             return true;
         }
     }
@@ -1120,7 +1190,8 @@ fill_ipv6_prefix_state(struct ovsdb_idl_txn *ovnsb_idl_txn,
             struct smap options;
 
             pfd->state = PREFIX_DONE;
-            pfd->next_announce = time_msec() + pfd->t1 * 1000;
+            pfd->last_complete = time_msec();
+            pfd->next_announce = pfd->last_complete + pfd->t1;
             ipv6_string_mapped(prefix_str, &pfd->prefix);
             smap_clone(&options, &pb->options);
             smap_add_format(&options, "ipv6_ra_pd_list", "%d:%s/%d",
@@ -1219,6 +1290,10 @@ prepare_ipv6_prefixd(struct ovsdb_idl_txn *ovnsb_idl_txn,
     SHASH_FOR_EACH_SAFE (iter, next, &ipv6_prefixd) {
         struct ipv6_prefixd_state *pfd = iter->data;
         if (pfd->last_used + IPV6_PREFIXD_STALE_TIMEOUT < time_msec()) {
+            if (pfd->uuid.len) {
+                free(pfd->uuid.data);
+                pfd->uuid.len = 0;
+            }
             free(pfd);
             shash_delete(&ipv6_prefixd, iter);
         }
@@ -1467,7 +1542,7 @@ static void
 pinctrl_handle_icmp(struct rconn *swconn, const struct flow *ip_flow,
                     struct dp_packet *pkt_in,
                     const struct match *md, struct ofpbuf *userdata,
-                    bool set_icmp_code)
+                    bool set_icmp_code, bool loopback)
 {
     /* This action only works for IP packets, and the switch should only send
      * us IP packets this way, but check here just to be sure. */
@@ -1488,8 +1563,8 @@ pinctrl_handle_icmp(struct rconn *swconn, const struct flow *ip_flow,
     packet.packet_type = htonl(PT_ETH);
 
     struct eth_header *eh = dp_packet_put_zeros(&packet, sizeof *eh);
-    eh->eth_dst = ip_flow->dl_dst;
-    eh->eth_src = ip_flow->dl_src;
+    eh->eth_dst = loopback ? ip_flow->dl_src : ip_flow->dl_dst;
+    eh->eth_src = loopback ? ip_flow->dl_dst : ip_flow->dl_src;
 
     if (get_dl_type(ip_flow) == htons(ETH_TYPE_IP)) {
         struct ip_header *in_ip = dp_packet_l3(pkt_in);
@@ -1511,8 +1586,9 @@ pinctrl_handle_icmp(struct rconn *swconn, const struct flow *ip_flow,
                                sizeof(struct icmp_header));
         nh->ip_proto = IPPROTO_ICMP;
         nh->ip_frag_off = htons(IP_DF);
-        packet_set_ipv4(&packet, ip_flow->nw_src, ip_flow->nw_dst,
-                        ip_flow->nw_tos, 255);
+        ovs_be32 nw_src = loopback ? ip_flow->nw_dst : ip_flow->nw_src;
+        ovs_be32 nw_dst = loopback ? ip_flow->nw_src : ip_flow->nw_dst;
+        packet_set_ipv4(&packet, nw_src, nw_dst, ip_flow->nw_tos, 255);
 
         uint8_t icmp_code =  1;
         if (set_icmp_code && in_ip->ip_proto == IPPROTO_UDP) {
@@ -1559,8 +1635,12 @@ pinctrl_handle_icmp(struct rconn *swconn, const struct flow *ip_flow,
         nh->ip6_vfc = 0x60;
         nh->ip6_nxt = IPPROTO_ICMPV6;
         nh->ip6_plen = htons(ICMP6_DATA_HEADER_LEN);
-        packet_set_ipv6(&packet, &ip_flow->ipv6_src, &ip_flow->ipv6_dst,
-                        ip_flow->nw_tos, ip_flow->ipv6_label, 255);
+        const struct in6_addr *ip6_src =
+            loopback ? &ip_flow->ipv6_dst : &ip_flow->ipv6_src;
+        const struct in6_addr *ip6_dst =
+            loopback ? &ip_flow->ipv6_src : &ip_flow->ipv6_dst;
+        packet_set_ipv6(&packet, ip6_src, ip6_dst, ip_flow->nw_tos,
+                        ip_flow->ipv6_label, 255);
 
         ih = dp_packet_put_zeros(&packet, sizeof *ih);
         dp_packet_set_l4(&packet, ih);
@@ -1617,7 +1697,8 @@ pinctrl_handle_icmp(struct rconn *swconn, const struct flow *ip_flow,
 static void
 pinctrl_handle_tcp_reset(struct rconn *swconn, const struct flow *ip_flow,
                          struct dp_packet *pkt_in,
-                         const struct match *md, struct ofpbuf *userdata)
+                         const struct match *md, struct ofpbuf *userdata,
+                         bool loopback)
 {
     /* This action only works for TCP segments, and the switch should only send
      * us TCP segments this way, but check here just to be sure. */
@@ -1632,14 +1713,23 @@ pinctrl_handle_tcp_reset(struct rconn *swconn, const struct flow *ip_flow,
 
     dp_packet_use_stub(&packet, packet_stub, sizeof packet_stub);
     packet.packet_type = htonl(PT_ETH);
+
+    struct eth_addr eth_src = loopback ? ip_flow->dl_dst : ip_flow->dl_src;
+    struct eth_addr eth_dst = loopback ? ip_flow->dl_src : ip_flow->dl_dst;
+
     if (get_dl_type(ip_flow) == htons(ETH_TYPE_IPV6)) {
-        pinctrl_compose_ipv6(&packet, ip_flow->dl_src, ip_flow->dl_dst,
-                             (struct in6_addr *)&ip_flow->ipv6_src,
-                             (struct in6_addr *)&ip_flow->ipv6_dst,
+        const struct in6_addr *ip6_src =
+            loopback ? &ip_flow->ipv6_dst : &ip_flow->ipv6_src;
+        const struct in6_addr *ip6_dst =
+            loopback ? &ip_flow->ipv6_src : &ip_flow->ipv6_dst;
+        pinctrl_compose_ipv6(&packet, eth_src, eth_dst,
+                             (struct in6_addr *) ip6_src,
+                             (struct in6_addr *) ip6_dst,
                              IPPROTO_TCP, 63, TCP_HEADER_LEN);
     } else {
-        pinctrl_compose_ipv4(&packet, ip_flow->dl_src, ip_flow->dl_dst,
-                             ip_flow->nw_src, ip_flow->nw_dst,
+        ovs_be32 nw_src = loopback ? ip_flow->nw_dst : ip_flow->nw_src;
+        ovs_be32 nw_dst = loopback ? ip_flow->nw_src : ip_flow->nw_dst;
+        pinctrl_compose_ipv4(&packet, eth_src, eth_dst, nw_src, nw_dst,
                              IPPROTO_TCP, 63, TCP_HEADER_LEN);
     }
 
@@ -1668,6 +1758,18 @@ pinctrl_handle_tcp_reset(struct rconn *swconn, const struct flow *ip_flow,
 
     set_actions_and_enqueue_msg(swconn, &packet, md, userdata);
     dp_packet_uninit(&packet);
+}
+
+static void
+pinctrl_handle_reject(struct rconn *swconn, const struct flow *ip_flow,
+                      struct dp_packet *pkt_in,
+                      const struct match *md, struct ofpbuf *userdata)
+{
+    if (ip_flow->nw_proto == IPPROTO_TCP) {
+        pinctrl_handle_tcp_reset(swconn, ip_flow, pkt_in, md, userdata, true);
+    } else {
+        pinctrl_handle_icmp(swconn, ip_flow, pkt_in, md, userdata, true, true);
+    }
 }
 
 static bool
@@ -2773,18 +2875,23 @@ process_packet_in(struct rconn *swconn, const struct ofp_header *msg)
 
     case ACTION_OPCODE_ICMP:
         pinctrl_handle_icmp(swconn, &headers, &packet, &pin.flow_metadata,
-                            &userdata, true);
+                            &userdata, true, false);
         break;
 
     case ACTION_OPCODE_ICMP4_ERROR:
     case ACTION_OPCODE_ICMP6_ERROR:
         pinctrl_handle_icmp(swconn, &headers, &packet, &pin.flow_metadata,
-                            &userdata, false);
+                            &userdata, false, false);
         break;
 
     case ACTION_OPCODE_TCP_RESET:
         pinctrl_handle_tcp_reset(swconn, &headers, &packet, &pin.flow_metadata,
-                                 &userdata);
+                                 &userdata, false);
+        break;
+
+    case ACTION_OPCODE_REJECT:
+        pinctrl_handle_reject(swconn, &headers, &packet, &pin.flow_metadata,
+                              &userdata);
         break;
 
     case ACTION_OPCODE_PUT_ICMP4_FRAG_MTU:

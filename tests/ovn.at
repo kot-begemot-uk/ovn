@@ -1593,6 +1593,14 @@ tcp_reset { };
     encodes as controller(userdata=00.00.00.0b.00.00.00.00)
     has prereqs tcp
 
+# reject
+reject { eth.dst = ff:ff:ff:ff:ff:ff; output; }; output;
+    encodes as controller(userdata=00.00.00.16.00.00.00.00.00.19.00.10.80.00.06.06.ff.ff.ff.ff.ff.ff.00.00.ff.ff.00.10.00.00.23.20.00.0e.ff.f8.40.00.00.00),resubmit(,64)
+
+reject { };
+    formats as reject { drop; };
+    encodes as controller(userdata=00.00.00.16.00.00.00.00)
+
 # trigger_event
 trigger_event(event = "empty_lb_backends", vip = "10.0.0.1:80", protocol = "tcp", load_balancer = "12345678-abcd-9876-fedc-11119f8e7d6c");
     encodes as controller(userdata=00.00.00.0f.00.00.00.00.00.00.00.00.00.01.00.0b.31.30.2e.30.2e.30.2e.31.3a.38.30.00.02.00.03.74.63.70.00.03.00.24.31.32.33.34.35.36.37.38.2d.61.62.63.64.2d.39.38.37.36.2d.66.65.64.63.2d.31.31.31.31.39.66.38.65.37.64.36.63)
@@ -4125,10 +4133,10 @@ for i in 1 2 3; do
         if test $j = 1; then
             ovn-nbctl lsp-set-addresses lp$i$j "f0:00:00:00:00:$i$j 192.168.0.$i$j" unknown
         elif test $j = 2; then
-            ovn-nbctl lsp-set-addresses lp$i$j "f0:00:00:00:00:$i$j 192.168.0.$i$j"
+            ovn-nbctl lsp-set-addresses lp$i$j "f0:00:00:00:00:$i$j 192.168.0.$i$j 4343::00$i$j"
             ovn-nbctl lsp-set-port-security lp$i$j f0:00:00:00:00:$i$j
         else
-            extra_addr="f0:00:00:00:0$i:$i$j fe80::ea2a:eaff:fe28:$i$j"
+            extra_addr="f0:00:00:00:0$i:$i$j fe80::ea2a:eaff:fe28:$i$j 4242::00$i$j"
             ovn-nbctl lsp-set-addresses lp$i$j "f0:00:00:00:00:$i$j 192.168.0.$i$j" "$extra_addr"
             ovn-nbctl lsp-set-port-security lp$i$j "f0:00:00:00:00:$i$j 192.168.0.$i$j" "$extra_addr"
         fi
@@ -4344,7 +4352,7 @@ for i in 1 2 3; do
 done
 
 # lp13 has extra port security with mac f0000000113 and ipv6 addr
-# fe80::ea2a:eaff:fe28:0012
+# fe80::ea2a:eaff:fe28:0012 and 4242::0013
 
 # ipv4 packet should be dropped for lp13 with mac f0000000113
 sip=`ip_to_hex 192 168 0 13`
@@ -4358,26 +4366,32 @@ sip=ee800000000000000000000000000000
 for i in 1 2 3; do
     tip=fe80000000000000ea2aeafffe2800${i}3
     test_ipv6 11 f00000000011 f00000000${i}${i}3 $sip $tip ${i}3
+    tip=424200000000000000000000000000${i}3
+    test_ipv6 11 f00000000011 f00000000${i}${i}3 $sip $tip ${i}3
 done
 
 
 # ipv6 packet should not be received by lp33 with mac f0000000333
-# and ip6.dst as fe80::ea2a:eaff:fe28:0023 as it is
-# configured with fe80::ea2a:eaff:fe28:0033
+# and ip6.dst as fe80::ea2a:eaff:fe28:0023 or 4242::0023 as it is
+# configured with fe80::ea2a:eaff:fe28:0033 and 4242::0033
 # lp11 can send ipv6 traffic as there is no port security
 
 sip=ee800000000000000000000000000000
 tip=fe80000000000000ea2aeafffe280023
 test_ipv6 11 f00000000011 f00000000333 $sip $tip
+tip=42420000000000000000000000000023
+test_ipv6 11 f00000000011 f00000000333 $sip $tip
 
 # ipv6 packet should be allowed for lp[123]3 with mac f0000000${i}${i}3
-# and ip6.src fe80::ea2a:eaff:fe28:0${i}${i}3 and ip6.src ::.
+# and ip6.src fe80::ea2a:eaff:fe28:0${i}${i}3, 4242::00${i}3 and ip6.src ::.
 # and should be dropped for any other ip6.src
 # lp21 can receive ipv6 traffic as there is no port security
 
 tip=ee800000000000000000000000000000
 for i in 1 2 3; do
     sip=fe80000000000000ea2aeafffe2800${i}3
+    test_ipv6 ${i}3 f00000000${i}${i}3 f00000000021 $sip $tip 21
+    sip=424200000000000000000000000000${i}3
     test_ipv6 ${i}3 f00000000${i}${i}3 f00000000021 $sip $tip 21
 
     # Test ICMPv6 MLD reports (v1 and v2) and NS for DAD
@@ -4396,9 +4410,7 @@ for i in 1 2 3; do
 done
 
 # configure lsp13 to send and received IPv4 packets with an address range
-ovn-nbctl lsp-set-port-security lp13 "f0:00:00:00:00:13 192.168.0.13 20.0.0.4/24 10.0.0.0/24"
-
-sleep 2
+ovn-nbctl --wait=hv lsp-set-port-security lp13 "f0:00:00:00:00:13 192.168.0.13 20.0.0.4/24 10.0.0.0/24 4242::/64"
 
 sip=`ip_to_hex 10 0 0 13`
 tip=`ip_to_hex 192 168 0 22`
@@ -4411,11 +4423,23 @@ tip=`ip_to_hex 192 168 0 23`
 # with dst ip 192.168.0.23 should be allowed
 test_ip 13 f00000000013 f00000000023 $sip $tip 23
 
+sip=42420000000000000000000000000014
+tip=42420000000000000000000000000023
+# IPv6 packet from lsp13 with src ip 4242::14 destined to lsp23
+# with dst ip 4242::23 should be received by lsp23
+test_ipv6 13 f00000000013 f00000000223 $sip $tip 23
+
 sip=`ip_to_hex 192 168 0 33`
 tip=`ip_to_hex 10 0 0 15`
 # IPv4 packet from lsp33 with src ip 192.168.0.33 destined to lsp13
 # with dst ip 10.0.0.15 should be received by lsp13
 test_ip 33 f00000000033 f00000000013 $sip $tip 13
+
+sip=42420000000000000000000000000033
+tip=42420000000000000000000000000013
+# IPv6 packet from lsp33 with src ip 4242::33 destined to lsp13
+# with dst ip 4242::13 should be received by lsp13
+test_ipv6 33 f00000000333 f00000000013 $sip $tip 13
 
 sip=`ip_to_hex 192 168 0 33`
 tip=`ip_to_hex 20 0 0 4`
@@ -4428,6 +4452,12 @@ tip=`ip_to_hex 20 0 0 5`
 # IPv4 packet from lsp33 with src ip 192.168.0.33 destined to lsp13
 # with dst ip 20.0.0.5 should not be received by lsp13
 test_ip 33 f00000000033 f00000000013 $sip $tip
+
+sip=42420000000000000000000000000033
+tip=42420000000000000000000000000005
+# IPv6 packet from lsp33 with src ip 4242::33 destined to lsp13
+# with dst ip 4242::5 should not be received by lsp13
+test_ipv6 33 f00000000333 f00000000013 $sip $tip 13
 
 sip=`ip_to_hex 192 168 0 33`
 tip=`ip_to_hex 20 0 0 255`
@@ -13723,6 +13753,220 @@ OVS_WAIT_UNTIL([test 4 = `as hv1 ovs-ofctl dump-flows br-int | \
 grep conjunction.*conjunction | wc -l`])
 OVS_WAIT_UNTIL([test 0 = `as hv1 ovs-ofctl dump-flows br-int | \
 grep conjunction.*conjunction.*conjunction | wc -l`])
+
+OVN_CLEANUP([hv1])
+AT_CLEANUP
+
+AT_SETUP([ovn -- Superseeding ACLs with conjunction])
+ovn_start
+
+ovn-nbctl ls-add ls1
+
+ovn-nbctl lsp-add ls1 ls1-lp1 \
+-- lsp-set-addresses ls1-lp1 "f0:00:00:00:00:01"
+
+ovn-nbctl lsp-add ls1 ls1-lp2 \
+-- lsp-set-addresses ls1-lp2 "f0:00:00:00:00:02"
+
+net_add n1
+sim_add hv1
+
+as hv1
+ovs-vsctl add-br br-phys
+ovn_attach n1 br-phys 192.168.0.1
+ovs-vsctl -- add-port br-int hv1-vif1 -- \
+    set interface hv1-vif1 external-ids:iface-id=ls1-lp1 \
+    options:tx_pcap=hv1/vif1-tx.pcap \
+    options:rxq_pcap=hv1/vif1-rx.pcap \
+    ofport-request=1
+
+ovs-vsctl -- add-port br-int hv1-vif2 -- \
+    set interface hv1-vif2 external-ids:iface-id=ls1-lp2 \
+    options:tx_pcap=hv1/vif2-tx.pcap \
+    options:rxq_pcap=hv1/vif2-rx.pcap \
+    ofport-request=2
+
+# test_ip INPORT SRC_MAC DST_MAC SRC_IP DST_IP OUTPORT...
+#
+# This shell function causes an ip packet to be received on INPORT.
+# The packet's content has Ethernet destination DST and source SRC
+# (each exactly 12 hex digits) and Ethernet type ETHTYPE (4 hex digits).
+# The OUTPORTs (zero or more) list the VIFs on which the packet should
+# be received.  INPORT and the OUTPORTs are specified as logical switch
+# port numbers, e.g. 11 for vif11.
+test_ip() {
+    # This packet has bad checksums but logical L3 routing doesn't check.
+    local inport=$1 src_mac=$2 dst_mac=$3 src_ip=$4 dst_ip=$5
+    local packet=${dst_mac}${src_mac}08004500001c0000000040110000${src_ip}\
+${dst_ip}0035111100080000
+    shift; shift; shift; shift; shift
+    as hv1 ovs-appctl netdev-dummy/receive hv1-vif1 $packet
+    for outport; do
+        echo $packet >> $outport.expected
+    done
+}
+
+ip_to_hex() {
+    printf "%02x%02x%02x%02x" "$@"
+}
+
+reset_pcap_file() {
+    local iface=$1
+    local pcap_file=$2
+    ovs-vsctl -- set Interface $iface options:tx_pcap=dummy-tx.pcap \
+options:rxq_pcap=dummy-rx.pcap
+    rm -f ${pcap_file}*.pcap
+    ovs-vsctl -- set Interface $iface options:tx_pcap=${pcap_file}-tx.pcap \
+options:rxq_pcap=${pcap_file}-rx.pcap
+}
+
+# Add a default deny ACL and an allow ACL for specific IP traffic.
+ovn-nbctl acl-add ls1 to-lport 2 'arp' allow
+ovn-nbctl acl-add ls1 to-lport 1 'ip4' drop
+ovn-nbctl acl-add ls1 to-lport 3 '(ip4.src==10.0.0.1 || ip4.src==10.0.0.2) && (ip4.dst == 10.0.0.3 || ip4.dst == 10.0.0.4)' allow
+ovn-nbctl acl-add ls1 to-lport 3 '(ip4.src==10.0.0.1 || ip4.src==10.0.0.42) && (ip4.dst == 10.0.0.3 || ip4.dst == 10.0.0.4)' allow
+ovn-nbctl --wait=hv sync
+
+# Traffic 10.0.0.1, 10.0.0.2 -> 10.0.0.3, 10.0.0.4 should be allowed.
+for src in `seq 1 2`; do
+    for dst in `seq 3 4`; do
+        sip=`ip_to_hex 10 0 0 $src`
+        dip=`ip_to_hex 10 0 0 $dst`
+
+        test_ip 1 f00000000001 f00000000002 $sip $dip 2
+    done
+done
+
+# Traffic 10.0.0.1, 10.0.0.2 -> 10.0.0.5 should be dropped.
+dip=`ip_to_hex 10 0 0 5`
+for src in `seq 1 2`; do
+    sip=`ip_to_hex 10 0 0 $src`
+
+    test_ip 1 f00000000001 f00000000002 $sip $dip
+done
+
+cat 2.expected > expout
+$PYTHON "$ovs_srcdir/utilities/ovs-pcap.in" hv1/vif2-tx.pcap > 2.packets
+AT_CHECK([cat 2.packets], [0], [expout])
+reset_pcap_file hv1-vif2 hv1/vif2
+rm -f 2.packets
+> 2.expected
+
+# Add two less restrictive allow ACLs for src IP 10.0.0.1.
+ovn-nbctl acl-add ls1 to-lport 3 'ip4.src==10.0.0.1 || ip4.src==10.0.0.1' allow
+ovn-nbctl acl-add ls1 to-lport 3 'ip4.src==10.0.0.1' allow
+ovn-nbctl --wait=hv sync
+
+# Check OVS flows, the less restrictive flows should have been installed.
+AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=45 | \
+    grep "priority=1003" | awk '{print $7 " " $8}' | sort], [0], [dnl
+priority=1003,conj_id=2,ip,metadata=0x1 actions=resubmit(,46)
+priority=1003,conj_id=3,ip,metadata=0x1 actions=resubmit(,46)
+priority=1003,ip,metadata=0x1,nw_dst=10.0.0.3 actions=conjunction(2,1/2),conjunction(3,1/2)
+priority=1003,ip,metadata=0x1,nw_dst=10.0.0.4 actions=conjunction(2,1/2),conjunction(3,1/2)
+priority=1003,ip,metadata=0x1,nw_src=10.0.0.1 actions=resubmit(,46)
+priority=1003,ip,metadata=0x1,nw_src=10.0.0.2 actions=conjunction(2,2/2)
+priority=1003,ip,metadata=0x1,nw_src=10.0.0.42 actions=conjunction(3,2/2)
+])
+
+# Traffic 10.0.0.1, 10.0.0.2 -> 10.0.0.3, 10.0.0.4 should be allowed.
+for src in `seq 1 2`; do
+    for dst in `seq 3 4`; do
+        sip=`ip_to_hex 10 0 0 $src`
+        dip=`ip_to_hex 10 0 0 $dst`
+
+        test_ip 1 f00000000001 f00000000002 $sip $dip 2
+    done
+done
+
+# Traffic 10.0.0.2 -> 10.0.0.5 should be dropped.
+sip=`ip_to_hex 10 0 0 2`
+dip=`ip_to_hex 10 0 0 5`
+test_ip 1 f00000000001 f00000000002 $sip $dip
+
+# Traffic 10.0.0.1 -> 10.0.0.5 should be allowed.
+sip=`ip_to_hex 10 0 0 1`
+dip=`ip_to_hex 10 0 0 5`
+test_ip 1 f00000000001 f00000000002 $sip $dip 2
+
+cat 2.expected > expout
+$PYTHON "$ovs_srcdir/utilities/ovs-pcap.in" hv1/vif2-tx.pcap > 2.packets
+AT_CHECK([cat 2.packets], [0], [expout])
+reset_pcap_file hv1-vif2 hv1/vif2
+rm -f 2.packets
+> 2.expected
+
+#sleep infinity
+
+# Remove the first less restrictive allow ACL.
+ovn-nbctl acl-del ls1 to-lport 3 'ip4.src==10.0.0.1 || ip4.src==10.0.0.1'
+ovn-nbctl --wait=hv sync
+
+# Check OVS flows, the second less restrictive allow ACL should have been installed.
+AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=45 | \
+    grep "priority=1003" | awk '{print $7 " " $8}' | sort], [0], [dnl
+priority=1003,conj_id=2,ip,metadata=0x1 actions=resubmit(,46)
+priority=1003,conj_id=3,ip,metadata=0x1 actions=resubmit(,46)
+priority=1003,ip,metadata=0x1,nw_dst=10.0.0.3 actions=conjunction(2,1/2),conjunction(3,1/2)
+priority=1003,ip,metadata=0x1,nw_dst=10.0.0.4 actions=conjunction(2,1/2),conjunction(3,1/2)
+priority=1003,ip,metadata=0x1,nw_src=10.0.0.1 actions=resubmit(,46)
+priority=1003,ip,metadata=0x1,nw_src=10.0.0.2 actions=conjunction(2,2/2)
+priority=1003,ip,metadata=0x1,nw_src=10.0.0.42 actions=conjunction(3,2/2)
+])
+
+# Remove the less restrictive allow ACL.
+ovn-nbctl acl-del ls1 to-lport 3 'ip4.src==10.0.0.1'
+ovn-nbctl --wait=hv sync
+
+# Check OVS flows, the 10.0.0.1 conjunction should have been reinstalled.
+AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=45 | \
+    grep "priority=1003" | awk '{print $7 " " $8}' | sort], [0], [dnl
+priority=1003,conj_id=2,ip,metadata=0x1 actions=resubmit(,46)
+priority=1003,conj_id=3,ip,metadata=0x1 actions=resubmit(,46)
+priority=1003,ip,metadata=0x1,nw_dst=10.0.0.3 actions=conjunction(2,1/2),conjunction(3,1/2)
+priority=1003,ip,metadata=0x1,nw_dst=10.0.0.4 actions=conjunction(2,1/2),conjunction(3,1/2)
+priority=1003,ip,metadata=0x1,nw_src=10.0.0.1 actions=conjunction(2,2/2),conjunction(3,2/2)
+priority=1003,ip,metadata=0x1,nw_src=10.0.0.2 actions=conjunction(2,2/2)
+priority=1003,ip,metadata=0x1,nw_src=10.0.0.42 actions=conjunction(3,2/2)
+])
+
+# Traffic 10.0.0.1, 10.0.0.2 -> 10.0.0.3, 10.0.0.4 should be allowed.
+for src in `seq 1 2`; do
+    for dst in `seq 3 4`; do
+        sip=`ip_to_hex 10 0 0 $src`
+        dip=`ip_to_hex 10 0 0 $dst`
+
+        test_ip 1 f00000000001 f00000000002 $sip $dip 2
+    done
+done
+
+# Traffic 10.0.0.1, 10.0.0.2 -> 10.0.0.5 should be dropped.
+dip=`ip_to_hex 10 0 0 5`
+for src in `seq 1 2`; do
+    sip=`ip_to_hex 10 0 0 $src`
+
+    test_ip 1 f00000000001 f00000000002 $sip $dip
+done
+
+cat 2.expected > expout
+$PYTHON "$ovs_srcdir/utilities/ovs-pcap.in" hv1/vif2-tx.pcap > 2.packets
+AT_CHECK([cat 2.packets], [0], [expout])
+
+# Re-add the less restrictive allow ACL for src IP 10.0.0.1
+ovn-nbctl acl-add ls1 to-lport 3 'ip4.src==10.0.0.1' allow
+ovn-nbctl --wait=hv sync
+
+# Check OVS flows, the less restrictive flows should have been installed.
+AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=45 | \
+   grep "priority=1003" | awk '{print $7 " " $8}' | sort], [0], [dnl
+priority=1003,conj_id=2,ip,metadata=0x1 actions=resubmit(,46)
+priority=1003,conj_id=3,ip,metadata=0x1 actions=resubmit(,46)
+priority=1003,ip,metadata=0x1,nw_dst=10.0.0.3 actions=conjunction(2,1/2),conjunction(3,1/2)
+priority=1003,ip,metadata=0x1,nw_dst=10.0.0.4 actions=conjunction(2,1/2),conjunction(3,1/2)
+priority=1003,ip,metadata=0x1,nw_src=10.0.0.1 actions=resubmit(,46)
+priority=1003,ip,metadata=0x1,nw_src=10.0.0.2 actions=conjunction(2,2/2)
+priority=1003,ip,metadata=0x1,nw_src=10.0.0.42 actions=conjunction(3,2/2)
+])
 
 OVN_CLEANUP([hv1])
 AT_CLEANUP

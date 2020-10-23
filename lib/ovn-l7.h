@@ -189,6 +189,9 @@ struct dhcp_opt6_header {
 #define DHCPV6_MSG_TYPE_ADVT        2
 #define DHCPV6_MSG_TYPE_REQUEST     3
 #define DHCPV6_MSG_TYPE_CONFIRM     4
+#define DHCPV6_MSG_TYPE_RENEW       5
+#define DHCPV6_MSG_TYPE_REBIND      6
+
 #define DHCPV6_MSG_TYPE_REPLY       7
 #define DHCPV6_MSG_TYPE_DECLINE     9
 #define DHCPV6_MSG_TYPE_INFO_REQ    11
@@ -423,6 +426,17 @@ ipv6_addr_is_routable_multicast(const struct in6_addr *ip) {
     default:
         return true;
     }
+}
+
+static inline bool
+ipv6_addr_is_host_zero(const struct in6_addr *prefix,
+                       const struct in6_addr *mask)
+{
+    /* host-bits-non-zero <=> (prefix ^ mask) & prefix. */
+    struct in6_addr tmp = ipv6_addr_bitxor(prefix, mask);
+
+    tmp = ipv6_addr_bitand(&tmp, prefix);
+    return ipv6_is_zero(&tmp);
 }
 
 #define IPV6_EXT_HEADER_LEN 8
