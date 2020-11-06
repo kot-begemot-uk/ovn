@@ -200,8 +200,10 @@ static void init_send_garps_rarps(void);
 static void destroy_send_garps_rarps(void);
 static void send_garp_rarp_wait(long long int send_garp_rarp_time);
 static void send_garp_rarp_prepare(
+    struct ovsdb_idl_txn *ovnsb_idl_txn,
     struct ovsdb_idl_index *sbrec_port_binding_by_datapath,
     struct ovsdb_idl_index *sbrec_port_binding_by_name,
+    struct ovsdb_idl_index *sbrec_mac_binding_by_lport_ip,
     const struct ovsrec_bridge *,
     const struct sbrec_chassis *,
     const struct hmap *local_datapaths,
@@ -465,6 +467,7 @@ controller_event_run(struct ovsdb_idl_txn *ovnsb_idl_txn,
             sbrec_controller_event_set_seq_num(event, ++event_seq_num);
             sbrec_controller_event_set_event_info(event, &event_info);
             sbrec_controller_event_set_chassis(event, chassis);
+            smap_destroy(&event_info);
         }
     }
 
@@ -1868,6 +1871,7 @@ pinctrl_handle_put_dhcp_opts(
     }
     in_dhcp_ptr += sizeof magic_cookie;
 
+    bool ipxe_req = false;
     const uint8_t *in_dhcp_msg_type = NULL;
     ovs_be32 request_ip = in_dhcp_data->ciaddr;
     while (in_dhcp_ptr < end) {
@@ -1899,6 +1903,9 @@ pinctrl_handle_put_dhcp_opts(
             if (in_dhcp_opt->len == 4) {
                 request_ip = get_unaligned_be32(DHCP_OPT_PAYLOAD(in_dhcp_opt));
             }
+            break;
+        case DHCP_OPT_ETHERBOOT:
+            ipxe_req = true;
             break;
         default:
             break;
@@ -2018,6 +2025,32 @@ pinctrl_handle_put_dhcp_opts(
      *| 4 Bytes padding | 1 Byte (option end 0xFF ) | 4 Bytes padding|
      * --------------------------------------------------------------
      */
+    struct dhcp_opt_header *in_dhcp_opt =
+        (struct dhcp_opt_header *)reply_dhcp_opts_ptr->data;
+    if (in_dhcp_opt->code == DHCP_OPT_BOOTFILE_CODE) {
+        unsigned char *ptr = (unsigned char *)in_dhcp_opt;
+        int len = sizeof *in_dhcp_opt + in_dhcp_opt->len;
+        struct dhcp_opt_header *next_dhcp_opt =
+            (struct dhcp_opt_header *)(ptr + len);
+
+        if (next_dhcp_opt->code == DHCP_OPT_BOOTFILE_ALT_CODE) {
+            if (!ipxe_req) {
+                ofpbuf_pull(reply_dhcp_opts_ptr, len);
+                next_dhcp_opt->code = DHCP_OPT_BOOTFILE_CODE;
+            } else {
+                char *buf = xmalloc(len);
+
+                memcpy(buf, in_dhcp_opt, len);
+                ofpbuf_pull(reply_dhcp_opts_ptr,
+                            sizeof *in_dhcp_opt + next_dhcp_opt->len);
+                memcpy(reply_dhcp_opts_ptr->data, buf, len);
+                free(buf);
+            }
+        }
+    } else if (in_dhcp_opt->code == DHCP_OPT_BOOTFILE_ALT_CODE) {
+        in_dhcp_opt->code = DHCP_OPT_BOOTFILE_CODE;
+    }
+
     uint16_t new_l4_size = UDP_HEADER_LEN + DHCP_HEADER_LEN + 16;
     if (msg_type != DHCP_MSG_NAK) {
         new_l4_size += reply_dhcp_opts_ptr->size;
@@ -3115,8 +3148,9 @@ pinctrl_run(struct ovsdb_idl_txn *ovnsb_idl_txn,
                          sbrec_mac_binding_by_lport_ip);
     run_put_vport_bindings(ovnsb_idl_txn, sbrec_datapath_binding_by_key,
                            sbrec_port_binding_by_key, chassis);
-    send_garp_rarp_prepare(sbrec_port_binding_by_datapath,
-                           sbrec_port_binding_by_name, br_int, chassis,
+    send_garp_rarp_prepare(ovnsb_idl_txn, sbrec_port_binding_by_datapath,
+                           sbrec_port_binding_by_name,
+                           sbrec_mac_binding_by_lport_ip, br_int, chassis,
                            local_datapaths, active_tunnels);
     prepare_ipv6_ras(local_datapaths);
     prepare_ipv6_prefixd(ovnsb_idl_txn, sbrec_port_binding_by_name,
@@ -3807,6 +3841,64 @@ mac_binding_lookup(struct ovsdb_idl_index *sbrec_mac_binding_by_lport_ip,
     return retval;
 }
 
+/* Update or add an IP-MAC binding for 'logical_port'. */
+static void
+mac_binding_add(struct ovsdb_idl_txn *ovnsb_idl_txn,
+                struct ovsdb_idl_index *sbrec_mac_binding_by_lport_ip,
+                const char *logical_port,
+                const struct sbrec_datapath_binding *dp,
+                struct eth_addr ea, const char *ip)
+{
+    /* Convert ethernet argument to string form for database. */
+    char mac_string[ETH_ADDR_STRLEN + 1];
+    snprintf(mac_string, sizeof mac_string, ETH_ADDR_FMT, ETH_ADDR_ARGS(ea));
+
+    const struct sbrec_mac_binding *b =
+        mac_binding_lookup(sbrec_mac_binding_by_lport_ip, logical_port, ip);
+    if (!b) {
+        b = sbrec_mac_binding_insert(ovnsb_idl_txn);
+        sbrec_mac_binding_set_logical_port(b, logical_port);
+        sbrec_mac_binding_set_ip(b, ip);
+        sbrec_mac_binding_set_mac(b, mac_string);
+        sbrec_mac_binding_set_datapath(b, dp);
+    } else if (strcmp(b->mac, mac_string)) {
+        sbrec_mac_binding_set_mac(b, mac_string);
+    }
+}
+
+/* Simulate the effect of a GARP on local datapaths, i.e., create MAC_Bindings
+ * on peer router datapaths.
+ */
+static void
+send_garp_locally(struct ovsdb_idl_txn *ovnsb_idl_txn,
+                  struct ovsdb_idl_index *sbrec_mac_binding_by_lport_ip,
+                  const struct hmap *local_datapaths,
+                  const struct sbrec_port_binding *in_pb,
+                  struct eth_addr ea, ovs_be32 ip)
+{
+    const struct local_datapath *ldp =
+        get_local_datapath(local_datapaths, in_pb->datapath->tunnel_key);
+
+    ovs_assert(ldp);
+    for (size_t i = 0; i < ldp->n_peer_ports; i++) {
+        const struct sbrec_port_binding *local = ldp->peer_ports[i].local;
+        const struct sbrec_port_binding *remote = ldp->peer_ports[i].remote;
+
+        /* Skip "ingress" port. */
+        if (local == in_pb) {
+            continue;
+        }
+
+        struct ds ip_s = DS_EMPTY_INITIALIZER;
+
+        ip_format_masked(ip, OVS_BE32_MAX, &ip_s);
+        mac_binding_add(ovnsb_idl_txn, sbrec_mac_binding_by_lport_ip,
+                        remote->logical_port, remote->datapath,
+                        ea, ds_cstr(&ip_s));
+        ds_destroy(&ip_s);
+    }
+}
+
 static void
 run_put_mac_binding(struct ovsdb_idl_txn *ovnsb_idl_txn,
                     struct ovsdb_idl_index *sbrec_datapath_binding_by_key,
@@ -3833,20 +3925,8 @@ run_put_mac_binding(struct ovsdb_idl_txn *ovnsb_idl_txn,
 
     struct ds ip_s = DS_EMPTY_INITIALIZER;
     ipv6_format_mapped(&pmb->ip_key, &ip_s);
-
-    /* Update or add an IP-MAC binding for this logical port. */
-    const struct sbrec_mac_binding *b =
-        mac_binding_lookup(sbrec_mac_binding_by_lport_ip, pb->logical_port,
-                           ds_cstr(&ip_s));
-    if (!b) {
-        b = sbrec_mac_binding_insert(ovnsb_idl_txn);
-        sbrec_mac_binding_set_logical_port(b, pb->logical_port);
-        sbrec_mac_binding_set_ip(b, ds_cstr(&ip_s));
-        sbrec_mac_binding_set_mac(b, mac_string);
-        sbrec_mac_binding_set_datapath(b, pb->datapath);
-    } else if (strcmp(b->mac, mac_string)) {
-        sbrec_mac_binding_set_mac(b, mac_string);
-    }
+    mac_binding_add(ovnsb_idl_txn, sbrec_mac_binding_by_lport_ip,
+                    pb->logical_port, pb->datapath, pmb->mac, ds_cstr(&ip_s));
     ds_destroy(&ip_s);
 }
 
@@ -3988,7 +4068,10 @@ add_garp_rarp(const char *name, const struct eth_addr ea, ovs_be32 ip,
 
 /* Add or update a vif for which GARPs need to be announced. */
 static void
-send_garp_rarp_update(const struct sbrec_port_binding *binding_rec,
+send_garp_rarp_update(struct ovsdb_idl_txn *ovnsb_idl_txn,
+                      struct ovsdb_idl_index *sbrec_mac_binding_by_lport_ip,
+                      const struct hmap *local_datapaths,
+                      const struct sbrec_port_binding *binding_rec,
                       struct shash *nat_addresses)
 {
     volatile struct garp_rarp_data *garp_rarp = NULL;
@@ -4014,6 +4097,11 @@ send_garp_rarp_update(const struct sbrec_port_binding *binding_rec,
                                   laddrs->ipv4_addrs[i].addr,
                                   binding_rec->datapath->tunnel_key,
                                   binding_rec->tunnel_key);
+                    send_garp_locally(ovnsb_idl_txn,
+                                      sbrec_mac_binding_by_lport_ip,
+                                      local_datapaths, binding_rec, laddrs->ea,
+                                      laddrs->ipv4_addrs[i].addr);
+
                 }
                 free(name);
             }
@@ -4049,6 +4137,10 @@ send_garp_rarp_update(const struct sbrec_port_binding *binding_rec,
                       laddrs.ea, ip,
                       binding_rec->datapath->tunnel_key,
                       binding_rec->tunnel_key);
+        if (ip) {
+            send_garp_locally(ovnsb_idl_txn, sbrec_mac_binding_by_lport_ip,
+                              local_datapaths, binding_rec, laddrs.ea, ip);
+        }
 
         destroy_lport_addresses(&laddrs);
         break;
@@ -5325,8 +5417,10 @@ send_garp_rarp_run(struct rconn *swconn, long long int *send_garp_rarp_time)
 /* Called by pinctrl_run(). Runs with in the main ovn-controller
  * thread context. */
 static void
-send_garp_rarp_prepare(struct ovsdb_idl_index *sbrec_port_binding_by_datapath,
+send_garp_rarp_prepare(struct ovsdb_idl_txn *ovnsb_idl_txn,
+                       struct ovsdb_idl_index *sbrec_port_binding_by_datapath,
                        struct ovsdb_idl_index *sbrec_port_binding_by_name,
+                       struct ovsdb_idl_index *sbrec_mac_binding_by_lport_ip,
                        const struct ovsrec_bridge *br_int,
                        const struct sbrec_chassis *chassis,
                        const struct hmap *local_datapaths,
@@ -5365,7 +5459,8 @@ send_garp_rarp_prepare(struct ovsdb_idl_index *sbrec_port_binding_by_datapath,
         const struct sbrec_port_binding *pb = lport_lookup_by_name(
             sbrec_port_binding_by_name, iface_id);
         if (pb) {
-            send_garp_rarp_update(pb, &nat_addresses);
+            send_garp_rarp_update(ovnsb_idl_txn, sbrec_mac_binding_by_lport_ip,
+                                  local_datapaths, pb, &nat_addresses);
         }
     }
 
@@ -5375,7 +5470,8 @@ send_garp_rarp_prepare(struct ovsdb_idl_index *sbrec_port_binding_by_datapath,
         const struct sbrec_port_binding *pb
             = lport_lookup_by_name(sbrec_port_binding_by_name, gw_port);
         if (pb) {
-            send_garp_rarp_update(pb, &nat_addresses);
+            send_garp_rarp_update(ovnsb_idl_txn, sbrec_mac_binding_by_lport_ip,
+                                  local_datapaths, pb, &nat_addresses);
         }
     }
 
@@ -5713,6 +5809,9 @@ pinctrl_handle_empty_lb_backends_opts(struct ofpbuf *userdata)
     if (!vip || !protocol || !load_balancer) {
         static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
         VLOG_WARN_RL(&rl, "missing lb parameters in userdata");
+        free(vip);
+        free(protocol);
+        free(load_balancer);
         return false;
     }
 

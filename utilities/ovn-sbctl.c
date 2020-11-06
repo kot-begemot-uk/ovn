@@ -706,37 +706,36 @@ pipeline_encode(const char *pl)
 }
 
 static int
-lflow_cmp(const void *lf1_, const void *lf2_)
+lflow_cmp(const void *a_, const void *b_)
 {
-    const struct sbrec_logical_flow *const *lf1p = lf1_;
-    const struct sbrec_logical_flow *const *lf2p = lf2_;
-    const struct sbrec_logical_flow *lf1 = *lf1p;
-    const struct sbrec_logical_flow *lf2 = *lf2p;
+    const struct sbrec_logical_flow *const *ap = a_;
+    const struct sbrec_logical_flow *const *bp = b_;
+    const struct sbrec_logical_flow *a = *ap;
+    const struct sbrec_logical_flow *b = *bp;
 
-    int pl1 = pipeline_encode(lf1->pipeline);
-    int pl2 = pipeline_encode(lf2->pipeline);
+    const struct sbrec_datapath_binding *adb = a->logical_datapath;
+    const struct sbrec_datapath_binding *bdb = b->logical_datapath;
+    const char *a_name = smap_get_def(&adb->external_ids, "name", "");
+    const char *b_name = smap_get_def(&bdb->external_ids, "name", "");
+    int cmp = strcmp(a_name, b_name);
+    if (cmp) {
+        return cmp;
+    }
 
-#define CMP(expr) \
-    do { \
-        int res; \
-        res = (expr); \
-        if (res) { \
-            return res; \
-        } \
-    } while (0)
+    cmp = uuid_compare_3way(&adb->header_.uuid, &bdb->header_.uuid);
+    if (cmp) {
+        return cmp;
+    }
 
-    CMP(uuid_compare_3way(&lf1->logical_datapath->header_.uuid,
-                          &lf2->logical_datapath->header_.uuid));
-    CMP(pl1 - pl2);
-    CMP(lf1->table_id > lf2->table_id ? 1 :
-            (lf1->table_id < lf2->table_id ? -1 : 0));
-    CMP(lf1->priority > lf2->priority ? -1 :
-            (lf1->priority < lf2->priority ? 1 : 0));
-    CMP(strcmp(lf1->match, lf2->match));
-
-#undef CMP
-
-    return 0;
+    int a_pipeline = pipeline_encode(a->pipeline);
+    int b_pipeline = pipeline_encode(b->pipeline);
+    return (a_pipeline > b_pipeline ? 1
+            : a_pipeline < b_pipeline ? -1
+            : a->table_id > b->table_id ? 1
+            : a->table_id < b->table_id ? -1
+            : a->priority > b->priority ? -1
+            : a->priority < b->priority ? 1
+            : strcmp(a->match, b->match));
 }
 
 static char *
@@ -1410,11 +1409,38 @@ static const struct ctl_table_class tables[SBREC_N_TABLES] = {
     [SBREC_TABLE_ADDRESS_SET].row_ids[0]
     = {&sbrec_address_set_col_name, NULL, NULL},
 
+    [SBREC_TABLE_PORT_GROUP].row_ids[0]
+    = {&sbrec_port_group_col_name, NULL, NULL},
+
     [SBREC_TABLE_HA_CHASSIS_GROUP].row_ids[0]
     = {&sbrec_ha_chassis_group_col_name, NULL, NULL},
 
     [SBREC_TABLE_HA_CHASSIS].row_ids[0]
     = {&sbrec_ha_chassis_col_chassis, NULL, NULL},
+
+    [SBREC_TABLE_METER].row_ids[0]
+    = {&sbrec_meter_col_name, NULL, NULL},
+
+    [SBREC_TABLE_SERVICE_MONITOR].row_ids[0]
+    = {&sbrec_service_monitor_col_logical_port, NULL, NULL},
+
+    [SBREC_TABLE_DHCP_OPTIONS].row_ids[0]
+    = {&sbrec_dhcp_options_col_name, NULL, NULL},
+
+    [SBREC_TABLE_DHCPV6_OPTIONS].row_ids[0]
+    = {&sbrec_dhcpv6_options_col_name, NULL, NULL},
+
+    [SBREC_TABLE_CONNECTION].row_ids[0]
+    = {&sbrec_connection_col_target, NULL, NULL},
+
+    [SBREC_TABLE_RBAC_ROLE].row_ids[0]
+    = {&sbrec_rbac_role_col_name, NULL, NULL},
+
+    [SBREC_TABLE_RBAC_PERMISSION].row_ids[0]
+    = {&sbrec_rbac_permission_col_table, NULL, NULL},
+
+    [SBREC_TABLE_GATEWAY_CHASSIS].row_ids[0]
+    = {&sbrec_gateway_chassis_col_name, NULL, NULL},
 };
 
 
