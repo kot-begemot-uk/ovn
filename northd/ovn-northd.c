@@ -11228,7 +11228,7 @@ build_lflows(struct northd_context *ctx, struct hmap *datapaths,
     finish = time_msec();
 
     if (hmap_count(&lflows)) {
-        VLOG_INFO("Time to compute lflows %lld, %f", finish - start, 1.0 * (finish - start)/hmap_count(&lflows));
+        VLOG_INFO("Time to compute lflows %ld, %lld, %f", hmap_count(&lflows), finish - start, 1.0 * (finish - start)/hmap_count(&lflows));
     }
 
     /* Push changes to the Logical_Flow table to database. */
