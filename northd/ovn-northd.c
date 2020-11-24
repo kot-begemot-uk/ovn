@@ -11220,10 +11220,16 @@ build_lflows(struct northd_context *ctx, struct hmap *datapaths,
              struct hmap *lbs)
 {
     struct hmap lflows = HMAP_INITIALIZER(&lflows);
+    long long finish, start = time_msec();
 
     build_lswitch_and_lrouter_flows(datapaths, ports,
                                     port_groups, &lflows, mcgroups,
                                     igmp_groups, meter_groups, lbs);
+    finish = time_msec();
+
+    if (hmap_count(&lflows)) {
+        VLOG_INFO("Time to compute lflows %lld, %f", finish - start, 1.0 * (finish - start)/hmap_count(&lflows));
+    }
 
     /* Push changes to the Logical_Flow table to database. */
     const struct sbrec_logical_flow *sbflow, *next_sbflow;
