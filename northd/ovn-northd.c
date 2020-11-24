@@ -11425,14 +11425,14 @@ build_lflows(struct northd_context *ctx, struct hmap *datapaths,
              struct hmap *lbs)
 {
     struct hmap lflows;
-    long long finish, start = time_msec();
+    long long finish, start = time_usec();
 
     fast_hmap_size_for(&lflows, max_seen_lflow_size);
 
     build_lswitch_and_lrouter_flows(datapaths, ports,
                                     port_groups, &lflows, mcgroups,
                                     igmp_groups, meter_groups, lbs);
-    finish = time_msec();
+    finish = time_usec();
 
     if (hmap_count(&lflows)) {
         VLOG_INFO("Time to compute lflows %ld, %lld, %f", hmap_count(&lflows), finish - start, 1.0 * (finish - start)/hmap_count(&lflows));
