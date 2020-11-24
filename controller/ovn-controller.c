@@ -64,6 +64,7 @@
 #include "timer.h"
 #include "stopwatch.h"
 #include "lib/inc-proc-eng.h"
+#include "hmapx.h"
 
 VLOG_DEFINE_THIS_MODULE(main);
 
@@ -84,6 +85,8 @@ static unixctl_cb_func debug_delay_nb_cfg_report;
 #define OFCTRL_DEFAULT_PROBE_INTERVAL_SEC 0
 
 #define CONTROLLER_LOOP_STOPWATCH_NAME "ovn-controller-flow-generation"
+
+#define OVS_NB_CFG_NAME "ovn-nb-cfg"
 
 static char *parse_options(int argc, char *argv[]);
 OVS_NO_RETURN static void usage(void);
@@ -532,20 +535,38 @@ update_sb_db(struct ovsdb_idl *ovs_idl, struct ovsdb_idl *ovnsb_idl,
 }
 
 static void
+add_pending_ct_zone_entry(struct shash *pending_ct_zones,
+                          enum ct_zone_pending_state state,
+                          int zone, bool add, const char *name)
+{
+    VLOG_DBG("%s ct zone %"PRId32" for '%s'",
+             add ? "assigning" : "removing", zone, name);
+
+    struct ct_zone_pending_entry *pending = xmalloc(sizeof *pending);
+    pending->state = state; /* Skip flushing zone. */
+    pending->zone = zone;
+    pending->add = add;
+    shash_add(pending_ct_zones, name, pending);
+}
+
+static void
 update_ct_zones(const struct sset *lports, const struct hmap *local_datapaths,
                 struct simap *ct_zones, unsigned long *ct_zone_bitmap,
-                struct shash *pending_ct_zones)
+                struct shash *pending_ct_zones, struct hmapx *updated_dps)
 {
     struct simap_node *ct_zone, *ct_zone_next;
     int scan_start = 1;
     const char *user;
     struct sset all_users = SSET_INITIALIZER(&all_users);
+    struct simap req_snat_zones = SIMAP_INITIALIZER(&req_snat_zones);
+    unsigned long unreq_snat_zones[BITMAP_N_LONGS(MAX_CT_ZONES)];
 
     SSET_FOR_EACH(user, lports) {
         sset_add(&all_users, user);
     }
 
     /* Local patched datapath (gateway routers) need zones assigned. */
+    struct shash all_lds = SHASH_INITIALIZER(&all_lds);
     const struct local_datapath *ld;
     HMAP_FOR_EACH (ld, hmap_node, local_datapaths) {
         /* XXX Add method to limit zone assignment to logical router
@@ -554,6 +575,13 @@ update_ct_zones(const struct sset *lports, const struct hmap *local_datapaths,
         char *snat = alloc_nat_zone_key(&ld->datapath->header_.uuid, "snat");
         sset_add(&all_users, dnat);
         sset_add(&all_users, snat);
+        shash_add(&all_lds, dnat, ld);
+        shash_add(&all_lds, snat, ld);
+
+        int req_snat_zone = datapath_snat_ct_zone(ld->datapath);
+        if (req_snat_zone >= 0) {
+            simap_put(&req_snat_zones, snat, req_snat_zone);
+        }
         free(dnat);
         free(snat);
     }
@@ -564,14 +592,60 @@ update_ct_zones(const struct sset *lports, const struct hmap *local_datapaths,
             VLOG_DBG("removing ct zone %"PRId32" for '%s'",
                      ct_zone->data, ct_zone->name);
 
-            struct ct_zone_pending_entry *pending = xmalloc(sizeof *pending);
-            pending->state = CT_ZONE_DB_QUEUED; /* Skip flushing zone. */
-            pending->zone = ct_zone->data;
-            pending->add = false;
-            shash_add(pending_ct_zones, ct_zone->name, pending);
+            add_pending_ct_zone_entry(pending_ct_zones, CT_ZONE_DB_QUEUED,
+                                      ct_zone->data, false, ct_zone->name);
 
             bitmap_set0(ct_zone_bitmap, ct_zone->data);
             simap_delete(ct_zones, ct_zone);
+        } else if (!simap_find(&req_snat_zones, ct_zone->name)) {
+            bitmap_set1(unreq_snat_zones, ct_zone->data);
+        }
+    }
+
+    /* Prioritize requested CT zones */
+    struct simap_node *snat_req_node;
+    SIMAP_FOR_EACH (snat_req_node, &req_snat_zones) {
+        struct simap_node *node = simap_find(ct_zones, snat_req_node->name);
+        if (node) {
+            if (node->data == snat_req_node->data) {
+                /* No change to this request, so no action needed */
+                continue;
+            } else {
+                /* Zone request has changed for this node. delete old entry */
+                bitmap_set0(ct_zone_bitmap, node->data);
+                simap_delete(ct_zones, node);
+            }
+        }
+
+        /* Determine if someone already had this zone auto-assigned.
+         * If so, then they need to give up their assignment since
+         * that zone is being explicitly requested now.
+         */
+        if (bitmap_is_set(unreq_snat_zones, snat_req_node->data)) {
+            struct simap_node *dup;
+            struct simap_node *next;
+            SIMAP_FOR_EACH_SAFE (dup, next, ct_zones) {
+                if (dup != snat_req_node && dup->data == snat_req_node->data) {
+                    simap_delete(ct_zones, dup);
+                    break;
+                }
+            }
+            /* Set this bit to 0 so that if multiple datapaths have requested
+             * this zone, we don't needlessly double-detect this condition.
+             */
+            bitmap_set0(unreq_snat_zones, snat_req_node->data);
+        }
+
+        add_pending_ct_zone_entry(pending_ct_zones, CT_ZONE_OF_QUEUED,
+                                  snat_req_node->data, true,
+                                  snat_req_node->name);
+
+        bitmap_set1(ct_zone_bitmap, snat_req_node->data);
+        simap_put(ct_zones, snat_req_node->name, snat_req_node->data);
+        struct shash_node *ld_node = shash_find(&all_lds, snat_req_node->name);
+        if (ld_node) {
+            struct local_datapath *dp = ld_node->data;
+            hmapx_add(updated_dps, (void *) dp->datapath);
         }
     }
 
@@ -592,23 +666,26 @@ update_ct_zones(const struct sset *lports, const struct hmap *local_datapaths,
         if (zone == MAX_CT_ZONES + 1) {
             static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 1);
             VLOG_WARN_RL(&rl, "exhausted all ct zones");
-            return;
+            break;
         }
         scan_start = zone + 1;
 
-        VLOG_DBG("assigning ct zone %"PRId32" to '%s'", zone, user);
-
-        struct ct_zone_pending_entry *pending = xmalloc(sizeof *pending);
-        pending->state = CT_ZONE_OF_QUEUED;
-        pending->zone = zone;
-        pending->add = true;
-        shash_add(pending_ct_zones, user, pending);
+        add_pending_ct_zone_entry(pending_ct_zones, CT_ZONE_OF_QUEUED,
+                                  zone, true, user);
 
         bitmap_set1(ct_zone_bitmap, zone);
         simap_put(ct_zones, user, zone);
+
+        struct shash_node *ld_node = shash_find(&all_lds, user);
+        if (ld_node) {
+            struct local_datapath *dp = ld_node->data;
+            hmapx_add(updated_dps, (void *) dp->datapath);
+        }
     }
 
+    simap_destroy(&req_snat_zones);
     sset_destroy(&all_users);
+    shash_destroy(&all_lds);
 }
 
 static void
@@ -733,6 +810,40 @@ get_nb_cfg(const struct sbrec_sb_global_table *sb_global_table)
     return sb ? sb->nb_cfg : 0;
 }
 
+/* Propagates the local cfg seqno, 'cur_cfg', to the chassis_private record
+ * and to the local OVS DB.
+ */
+static void
+store_nb_cfg(struct ovsdb_idl_txn *sb_txn, struct ovsdb_idl_txn *ovs_txn,
+             const struct sbrec_chassis_private *chassis,
+             const struct ovsrec_bridge *br_int,
+             unsigned int delay_nb_cfg_report,
+             int64_t cur_cfg)
+{
+    if (!cur_cfg) {
+        return;
+    }
+
+    if (sb_txn && chassis && cur_cfg != chassis->nb_cfg) {
+        sbrec_chassis_private_set_nb_cfg(chassis, cur_cfg);
+        sbrec_chassis_private_set_nb_cfg_timestamp(chassis, time_wall_msec());
+
+        if (delay_nb_cfg_report) {
+            VLOG_INFO("Sleep for %u sec", delay_nb_cfg_report);
+            xsleep(delay_nb_cfg_report);
+        }
+    }
+
+    if (ovs_txn && br_int &&
+            cur_cfg != smap_get_ullong(&br_int->external_ids,
+                                       OVS_NB_CFG_NAME, 0)) {
+        char *cur_cfg_str = xasprintf("%"PRId64, cur_cfg);
+        ovsrec_bridge_update_external_ids_setkey(br_int, OVS_NB_CFG_NAME,
+                                                 cur_cfg_str);
+        free(cur_cfg_str);
+    }
+}
+
 static const char *
 get_transport_zones(const struct ovsrec_open_vswitch_table *ovs_table)
 {
@@ -790,7 +901,8 @@ ctrl_register_ovs_idl(struct ovsdb_idl *ovs_idl)
     SB_NODE(logical_flow, "logical_flow") \
     SB_NODE(dhcp_options, "dhcp_options") \
     SB_NODE(dhcpv6_options, "dhcpv6_options") \
-    SB_NODE(dns, "dns")
+    SB_NODE(dns, "dns") \
+    SB_NODE(load_balancer, "load_balancer")
 
 enum sb_engine_node {
 #define SB_NODE(NAME, NAME_STR) SB_##NAME,
@@ -1039,6 +1151,9 @@ struct ed_type_runtime_data {
     bool tracked;
     bool local_lports_changed;
     struct hmap tracked_dp_bindings;
+
+    /* CT zone data. Contains datapaths that had updated CT zones */
+    struct hmapx ct_updated_datapaths;
 };
 
 /* struct ed_type_runtime_data has the below members for tracking the
@@ -1130,6 +1245,8 @@ en_runtime_data_init(struct engine_node *node OVS_UNUSED,
     /* Init the tracked data. */
     hmap_init(&data->tracked_dp_bindings);
 
+    hmapx_init(&data->ct_updated_datapaths);
+
     return data;
 }
 
@@ -1152,6 +1269,7 @@ en_runtime_data_cleanup(void *data)
     }
     hmap_destroy(&rt_data->local_datapaths);
     local_bindings_destroy(&rt_data->local_bindings);
+    hmapx_destroy(&rt_data->ct_updated_datapaths);
 }
 
 static void
@@ -1289,6 +1407,7 @@ en_runtime_data_run(struct engine_node *node, void *data)
         sset_init(&rt_data->egress_ifaces);
         smap_init(&rt_data->local_iface_ids);
         local_bindings_init(&rt_data->local_bindings);
+        hmapx_clear(&rt_data->ct_updated_datapaths);
     }
 
     struct binding_ctx_in b_ctx_in;
@@ -1417,7 +1536,7 @@ en_ct_zones_cleanup(void *data)
     struct ed_type_ct_zones *ct_zones_data = data;
 
     simap_destroy(&ct_zones_data->current);
-    shash_destroy(&ct_zones_data->pending);
+    shash_destroy_free_data(&ct_zones_data->pending);
 }
 
 static void
@@ -1427,9 +1546,11 @@ en_ct_zones_run(struct engine_node *node, void *data)
     struct ed_type_runtime_data *rt_data =
         engine_get_input_data("runtime_data", node);
 
+    hmapx_clear(&rt_data->ct_updated_datapaths);
     update_ct_zones(&rt_data->local_lports, &rt_data->local_datapaths,
                     &ct_zones_data->current, ct_zones_data->bitmap,
-                    &ct_zones_data->pending);
+                    &ct_zones_data->pending, &rt_data->ct_updated_datapaths);
+
 
     engine_set_node_state(node, EN_UPDATED);
 }
@@ -1639,6 +1760,7 @@ static void init_physical_ctx(struct engine_node *node,
     p_ctx->ct_zones = ct_zones;
     p_ctx->mff_ovn_geneve = ed_mff_ovn_geneve->mff_ovn_geneve;
     p_ctx->local_bindings = &rt_data->local_bindings;
+    p_ctx->ct_updated_datapaths = &rt_data->ct_updated_datapaths;
 }
 
 static void init_lflow_ctx(struct engine_node *node,
@@ -1682,6 +1804,10 @@ static void init_lflow_ctx(struct engine_node *node,
         (struct sbrec_multicast_group_table *)EN_OVSDB_GET(
             engine_get_input("SB_multicast_group", node));
 
+    struct sbrec_load_balancer_table *lb_table =
+        (struct sbrec_load_balancer_table *)EN_OVSDB_GET(
+            engine_get_input("SB_load_balancer", node));
+
     const char *chassis_id = chassis_get_id();
     const struct sbrec_chassis *chassis = NULL;
     struct ovsdb_idl_index *sbrec_chassis_by_name =
@@ -1713,6 +1839,7 @@ static void init_lflow_ctx(struct engine_node *node,
     l_ctx_in->logical_flow_table = logical_flow_table;
     l_ctx_in->mc_group_table = multicast_group_table;
     l_ctx_in->chassis = chassis;
+    l_ctx_in->lb_table = lb_table;
     l_ctx_in->local_datapaths = &rt_data->local_datapaths;
     l_ctx_in->addr_sets = addr_sets;
     l_ctx_in->port_groups = port_groups;
@@ -2066,6 +2193,8 @@ flow_output_physical_flow_changes_handler(struct engine_node *node, void *data)
     if (pfc_data->recompute_physical_flows) {
         /* This indicates that we need to recompute the physical flows. */
         physical_clear_unassoc_flows_with_db(&fo->flow_table);
+        physical_clear_dp_flows(&p_ctx, &rt_data->ct_updated_datapaths,
+                                &fo->flow_table);
         physical_run(&p_ctx, &fo->flow_table);
         return true;
     }
@@ -2131,10 +2260,70 @@ flow_output_runtime_data_handler(struct engine_node *node,
     return true;
 }
 
+static bool
+flow_output_sb_load_balancer_handler(struct engine_node *node, void *data)
+{
+    struct ed_type_runtime_data *rt_data =
+        engine_get_input_data("runtime_data", node);
+
+    struct ed_type_flow_output *fo = data;
+    struct lflow_ctx_in l_ctx_in;
+    struct lflow_ctx_out l_ctx_out;
+    init_lflow_ctx(node, rt_data, fo, &l_ctx_in, &l_ctx_out);
+
+    bool handled = lflow_handle_changed_lbs(&l_ctx_in, &l_ctx_out);
+
+    engine_set_node_state(node, EN_UPDATED);
+    return handled;
+}
+
 struct ovn_controller_exit_args {
     bool *exiting;
     bool *restart;
 };
+
+/* Returns false if the northd internal version stored in SB_Global
+ * and ovn-controller internal version don't match.
+ */
+static bool
+check_northd_version(struct ovsdb_idl *ovs_idl, struct ovsdb_idl *ovnsb_idl,
+                     const char *version)
+{
+    static bool version_mismatch;
+
+    const struct ovsrec_open_vswitch *cfg = ovsrec_open_vswitch_first(ovs_idl);
+    if (!cfg || !smap_get_bool(&cfg->external_ids, "ovn-match-northd-version",
+                               false)) {
+        version_mismatch = false;
+        return true;
+    }
+
+    const struct sbrec_sb_global *sb = sbrec_sb_global_first(ovnsb_idl);
+    if (!sb) {
+        version_mismatch = true;
+        return false;
+    }
+
+    const char *northd_version =
+        smap_get_def(&sb->options, "northd_internal_version", "");
+
+    if (strcmp(northd_version, version)) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 1);
+        VLOG_WARN_RL(&rl, "controller version - %s mismatch with northd "
+                     "version - %s", version, northd_version);
+        version_mismatch = true;
+        return false;
+    }
+
+    /* If there used to be a mismatch and ovn-northd got updated, force a
+     * full recompute.
+     */
+    if (version_mismatch) {
+        engine_set_force_recompute(true);
+    }
+    version_mismatch = false;
+    return true;
+}
 
 int
 main(int argc, char *argv[])
@@ -2327,9 +2516,12 @@ main(int argc, char *argv[])
     engine_add_input(&en_flow_output, &en_sb_dhcp_options, NULL);
     engine_add_input(&en_flow_output, &en_sb_dhcpv6_options, NULL);
     engine_add_input(&en_flow_output, &en_sb_dns, NULL);
+    engine_add_input(&en_flow_output, &en_sb_load_balancer,
+                     flow_output_sb_load_balancer_handler);
 
     engine_add_input(&en_ct_zones, &en_ovs_open_vswitch, NULL);
     engine_add_input(&en_ct_zones, &en_ovs_bridge, NULL);
+    engine_add_input(&en_ct_zones, &en_sb_datapath_binding, NULL);
     engine_add_input(&en_ct_zones, &en_runtime_data, NULL);
 
     engine_add_input(&en_runtime_data, &en_ofctrl_is_connected, NULL);
@@ -2428,6 +2620,9 @@ main(int argc, char *argv[])
         .enable_lflow_cache = true
     };
 
+    char *ovn_version = ovn_get_internal_version();
+    VLOG_INFO("OVN internal version is : [%s]", ovn_version);
+
     /* Main loop. */
     exiting = false;
     restart = false;
@@ -2481,23 +2676,29 @@ main(int argc, char *argv[])
 
         engine_set_context(&eng_ctx);
 
-        if (ovsdb_idl_has_ever_connected(ovnsb_idl_loop.idl)) {
+        bool northd_version_match =
+            check_northd_version(ovs_idl_loop.idl, ovnsb_idl_loop.idl,
+                                 ovn_version);
+
+        const struct ovsrec_bridge_table *bridge_table =
+            ovsrec_bridge_table_get(ovs_idl_loop.idl);
+        const struct ovsrec_open_vswitch_table *ovs_table =
+            ovsrec_open_vswitch_table_get(ovs_idl_loop.idl);
+        const struct ovsrec_bridge *br_int =
+            process_br_int(ovs_idl_txn, bridge_table, ovs_table);
+
+        if (ovsdb_idl_has_ever_connected(ovnsb_idl_loop.idl) &&
+            northd_version_match) {
             /* Contains the transport zones that this Chassis belongs to */
             struct sset transport_zones = SSET_INITIALIZER(&transport_zones);
             sset_from_delimited_string(&transport_zones,
                 get_transport_zones(ovsrec_open_vswitch_table_get(
                                     ovs_idl_loop.idl)), ",");
 
-            const struct ovsrec_bridge_table *bridge_table =
-                ovsrec_bridge_table_get(ovs_idl_loop.idl);
-            const struct ovsrec_open_vswitch_table *ovs_table =
-                ovsrec_open_vswitch_table_get(ovs_idl_loop.idl);
             const struct sbrec_chassis_table *chassis_table =
                 sbrec_chassis_table_get(ovnsb_idl_loop.idl);
             const struct sbrec_chassis_private_table *chassis_pvt_table =
                 sbrec_chassis_private_table_get(ovnsb_idl_loop.idl);
-            const struct ovsrec_bridge *br_int =
-                process_br_int(ovs_idl_txn, bridge_table, ovs_table);
             const char *chassis_id = get_ovs_chassis_id(ovs_table);
             const struct sbrec_chassis *chassis = NULL;
             const struct sbrec_chassis_private *chassis_private = NULL;
@@ -2632,19 +2833,8 @@ main(int argc, char *argv[])
                 engine_set_force_recompute(false);
             }
 
-            if (ovnsb_idl_txn && chassis_private) {
-                int64_t cur_cfg = ofctrl_get_cur_cfg();
-                if (cur_cfg && cur_cfg != chassis_private->nb_cfg) {
-                    sbrec_chassis_private_set_nb_cfg(chassis_private, cur_cfg);
-                    sbrec_chassis_private_set_nb_cfg_timestamp(
-                        chassis_private, time_wall_msec());
-                    if (delay_nb_cfg_report) {
-                        VLOG_INFO("Sleep for %u sec", delay_nb_cfg_report);
-                        xsleep(delay_nb_cfg_report);
-                    }
-                }
-            }
-
+            store_nb_cfg(ovnsb_idl_txn, ovs_idl_txn, chassis_private,
+                         br_int, delay_nb_cfg_report, ofctrl_get_cur_cfg());
 
             if (pending_pkt.conn) {
                 struct ed_type_addr_sets *as_data =
@@ -2676,6 +2866,13 @@ main(int argc, char *argv[])
                 ofctrl_wait();
                 pinctrl_wait(ovnsb_idl_txn);
             }
+        }
+
+        if (!northd_version_match && br_int) {
+            /* Set the integration bridge name to pinctrl so that the pinctrl
+             * thread can handle any packet-ins when we are not processing
+             * any DB updates due to version mismatch. */
+            pinctrl_set_br_int_name(br_int->name);
         }
 
         unixctl_server_run(unixctl);
@@ -2770,6 +2967,7 @@ loop_done:
         }
     }
 
+    free(ovn_version);
     unixctl_server_destroy(unixctl);
     lflow_destroy();
     ofctrl_destroy();
@@ -2822,6 +3020,7 @@ parse_options(int argc, char *argv[])
 
         case 'V':
             ovs_print_version(OFP15_VERSION, OFP15_VERSION);
+            printf("SB DB Schema %s\n", sbrec_get_db_version());
             exit(EXIT_SUCCESS);
 
         VLOG_OPTION_HANDLERS

@@ -48,6 +48,10 @@ struct ovn_extend_table;
  *    action.  Its first member must have type "struct ovnact" and name
  *    "ovnact".  The structure must have a fixed length, that is, it may not
  *    end with a flexible array member.
+ *
+ * These OVNACTS are used to generate the OVN internal version.   See
+ * ovn_get_internal_version() in lib/ovn-util.c.  If any OVNACT is updated,
+ * increment the OVN_INTERNAL_MINOR_VER macro in lib/ovn-util.c.
  */
 #define OVNACTS                                       \
     OVNACT(OUTPUT,            ovnact_null)            \
@@ -57,7 +61,8 @@ struct ovn_extend_table;
     OVNACT(EXCHANGE,          ovnact_move)            \
     OVNACT(DEC_TTL,           ovnact_null)            \
     OVNACT(CT_NEXT,           ovnact_ct_next)         \
-    OVNACT(CT_COMMIT,         ovnact_nest)            \
+    OVNACT(CT_COMMIT_V1,      ovnact_ct_commit_v1)    \
+    OVNACT(CT_COMMIT_V2,      ovnact_nest)            \
     OVNACT(CT_DNAT,           ovnact_ct_nat)          \
     OVNACT(CT_SNAT,           ovnact_ct_nat)          \
     OVNACT(CT_LB,             ovnact_ct_lb)           \
@@ -83,7 +88,7 @@ struct ovn_extend_table;
     OVNACT(PUT_DHCPV4_OPTS,   ovnact_put_opts)        \
     OVNACT(PUT_DHCPV6_OPTS,   ovnact_put_opts)        \
     OVNACT(SET_QUEUE,         ovnact_set_queue)       \
-    OVNACT(DNS_LOOKUP,        ovnact_dns_lookup)      \
+    OVNACT(DNS_LOOKUP,        ovnact_result)          \
     OVNACT(LOG,               ovnact_log)             \
     OVNACT(PUT_ND_RA_OPTS,    ovnact_put_opts)        \
     OVNACT(ND_NS,             ovnact_nest)            \
@@ -97,6 +102,9 @@ struct ovn_extend_table;
     OVNACT(DHCP6_REPLY,       ovnact_null)            \
     OVNACT(ICMP6_ERROR,       ovnact_nest)            \
     OVNACT(REJECT,            ovnact_nest)            \
+    OVNACT(CHK_LB_HAIRPIN,    ovnact_result)          \
+    OVNACT(CHK_LB_HAIRPIN_REPLY, ovnact_result)       \
+    OVNACT(CT_SNAT_TO_VIP,    ovnact_null)            \
 
 /* enum ovnact_type, with a member OVNACT_<ENUM> for each action. */
 enum OVS_PACKED_ENUM ovnact_type {
@@ -223,6 +231,13 @@ struct ovnact_ct_next {
     uint8_t ltable;                /* Logical table ID of next table. */
 };
 
+/* OVNACT_CT_COMMIT_V1. */
+struct ovnact_ct_commit_v1 {
+    struct ovnact ovnact;
+    uint32_t ct_mark, ct_mark_mask;
+    ovs_be128 ct_label, ct_label_mask;
+};
+
 /* OVNACT_CT_DNAT, OVNACT_CT_SNAT. */
 struct ovnact_ct_nat {
     struct ovnact ovnact;
@@ -338,8 +353,8 @@ struct ovnact_set_queue {
     uint16_t queue_id;
 };
 
-/* OVNACT_DNS_LOOKUP. */
-struct ovnact_dns_lookup {
+/* OVNACT_DNS_LOOKUP, OVNACT_CHK_LB_HAIRPIN, OVNACT_CHK_LB_HAIRPIN_REPLY. */
+struct ovnact_result {
     struct ovnact ovnact;
     struct expr_field dst;      /* 1-bit destination field. */
 };
@@ -727,6 +742,12 @@ struct ovnact_encode_params {
                                    resubmit. */
     uint8_t mac_lookup_ptable;  /* OpenFlow table for
                                    'lookup_arp'/'lookup_nd' to resubmit. */
+    uint8_t lb_hairpin_ptable;  /* OpenFlow table for
+                                 * 'chk_lb_hairpin' to resubmit. */
+    uint8_t lb_hairpin_reply_ptable;  /* OpenFlow table for
+                                       * 'chk_lb_hairpin_reply' to resubmit. */
+    uint8_t ct_snat_vip_ptable;  /* OpenFlow table for
+                                  * 'ct_snat_to_vip' to resubmit. */
 };
 
 void ovnacts_encode(const struct ovnact[], size_t ovnacts_len,

@@ -192,6 +192,7 @@ create_gen_opts(struct hmap *dhcp_opts, struct hmap *dhcpv6_opts,
     dhcp_opt_add(dhcp_opts, "tcp_keepalive_interval", 38, "uint32");
     dhcp_opt_add(dhcp_opts, "domain_search_list", 119, "domains");
     dhcp_opt_add(dhcp_opts, "bootfile_name_alt", 254, "str");
+    dhcp_opt_add(dhcp_opts, "broadcast_address", 28, "ipv4");
 
     /* DHCPv6 options. */
     hmap_init(dhcpv6_opts);
@@ -918,7 +919,7 @@ test_tree_shape_exhaustively(struct expr *expr, struct shash *symtab,
         } else if (operation >= OP_SIMPLIFY) {
             modified = expr_simplify(expr_clone(expr));
             modified = expr_evaluate_condition(
-                expr_clone(modified), tree_shape_is_chassis_resident_cb,
+                modified, tree_shape_is_chassis_resident_cb,
                 NULL, NULL);
             ovs_assert(expr_honors_invariants(modified));
 
@@ -1342,6 +1343,9 @@ test_parse_actions(struct ovs_cmdl_context *ctx OVS_UNUSED)
                 .output_ptable = OFTABLE_SAVE_INPORT,
                 .mac_bind_ptable = OFTABLE_MAC_BINDING,
                 .mac_lookup_ptable = OFTABLE_MAC_LOOKUP,
+                .lb_hairpin_ptable = OFTABLE_CHK_LB_HAIRPIN,
+                .lb_hairpin_reply_ptable = OFTABLE_CHK_LB_HAIRPIN_REPLY,
+                .ct_snat_vip_ptable = OFTABLE_CT_SNAT_FOR_VIP,
             };
             struct ofpbuf ofpacts;
             ofpbuf_init(&ofpacts, 0);

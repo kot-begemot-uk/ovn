@@ -6,6 +6,15 @@ Post-v20.09.0
      removed.  See ovn-nb(5) for advice on how to update your config if needed.
    - Add IPv4 iPXE support introducing "bootfile_name_alt" option to ovn dhcp
      server.
+   - Support other_config:vlan-passthru=true to allow VLAN tagged incoming
+     traffic.
+   - Propagate currently processed SB_Global.nb_cfg in ovn-controller to the
+     local OVS DB integration bridge external_ids:ovn-nb-cfg.
+   - Support version pinning between ovn-northd and ovn-controller as an
+     option. If the option is enabled and the versions don't match,
+     ovn-controller will not process any DB changes.
+   - Add "fair" column in Meter table to allow multiple ACL logs to use the
+     same Meter while being rate-limited independently.
 
 OVN v20.09.0 - 28 Sep 2020
 --------------------------

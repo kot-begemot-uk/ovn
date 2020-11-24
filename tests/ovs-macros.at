@@ -37,9 +37,31 @@ m4_divert_push([PREPARE_TESTS])
 # directory.
 ovs_init() {
     ovs_base=`pwd`
-    trap '. "$ovs_base/cleanup"' 0
+    trap ovs_on_exit 0
     : > cleanup
     ovs_setenv
+}
+
+# Catch testsuite error condition and cleanup test environment by tearing down
+# all interfaces and processes spawned.
+# User has an option to leave the test environment in error state so that system
+# can be poked around to get more information. User can enable this option by setting
+# environment variable OVS_PAUSE_TEST=1. User needs to press CTRL-D to resume the
+# cleanup operation.
+ovs_pause() {
+    echo "====================================================="
+    echo "Set following environment variable to use various ovs utilities"
+    echo "export OVS_RUNDIR=$ovs_base"
+    echo "Press ENTER to continue: "
+    read
+}
+
+ovs_on_exit () {
+    if [ ! -z "${OVS_PAUSE_TEST}" ] && [ -z $at_verbose ]; then
+        trap '' INT
+        ovs_pause
+    fi
+    . "$ovs_base/cleanup"
 }
 
 # With no parameter or an empty parameter, sets the OVS_*DIR
@@ -211,13 +233,13 @@ ovs_wait () {
     if ovs_wait_cond; then echo "$1: wait succeeded quickly" >&AS_MESSAGE_LOG_FD; return 0; fi
 
     # Then wait up to OVS_CTL_TIMEOUT seconds.
-    local d
-    for d in `seq 1 "$OVS_CTL_TIMEOUT"`; do
+    local timer
+    for timer in `seq 1 "$OVS_CTL_TIMEOUT"`; do
         sleep 1
-        if ovs_wait_cond; then echo "$1: wait succeeded after $d seconds" >&AS_MESSAGE_LOG_FD; return 0; fi
+        if ovs_wait_cond; then echo "$1: wait succeeded after $timer seconds" >&AS_MESSAGE_LOG_FD; return 0; fi
     done
 
-    echo "$1: wait failed after $d seconds" >&AS_MESSAGE_LOG_FD
+    echo "$1: wait failed after $timer seconds" >&AS_MESSAGE_LOG_FD
     ovs_wait_failed
     AT_FAIL_IF([:])
 }

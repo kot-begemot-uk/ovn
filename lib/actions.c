@@ -628,15 +628,74 @@ ovnact_ct_next_free(struct ovnact_ct_next *a OVS_UNUSED)
 }
 
 static void
+parse_ct_commit_v1_arg(struct action_context *ctx,
+                       struct ovnact_ct_commit_v1 *cc)
+{
+    if (lexer_match_id(ctx->lexer, "ct_mark")) {
+        if (!lexer_force_match(ctx->lexer, LEX_T_EQUALS)) {
+            return;
+        }
+        if (ctx->lexer->token.type == LEX_T_INTEGER) {
+            cc->ct_mark = ntohll(ctx->lexer->token.value.integer);
+            cc->ct_mark_mask = UINT32_MAX;
+        } else if (ctx->lexer->token.type == LEX_T_MASKED_INTEGER) {
+            cc->ct_mark = ntohll(ctx->lexer->token.value.integer);
+            cc->ct_mark_mask = ntohll(ctx->lexer->token.mask.integer);
+        } else {
+            lexer_syntax_error(ctx->lexer, "expecting integer");
+            return;
+        }
+        lexer_get(ctx->lexer);
+    } else if (lexer_match_id(ctx->lexer, "ct_label")) {
+        if (!lexer_force_match(ctx->lexer, LEX_T_EQUALS)) {
+            return;
+        }
+        if (ctx->lexer->token.type == LEX_T_INTEGER) {
+            cc->ct_label = ctx->lexer->token.value.be128_int;
+            cc->ct_label_mask = OVS_BE128_MAX;
+        } else if (ctx->lexer->token.type == LEX_T_MASKED_INTEGER) {
+            cc->ct_label = ctx->lexer->token.value.be128_int;
+            cc->ct_label_mask = ctx->lexer->token.mask.be128_int;
+        } else {
+            lexer_syntax_error(ctx->lexer, "expecting integer");
+            return;
+        }
+        lexer_get(ctx->lexer);
+    } else {
+        lexer_syntax_error(ctx->lexer, NULL);
+    }
+}
+
+static void
+parse_CT_COMMIT_V1(struct action_context *ctx)
+{
+    add_prerequisite(ctx, "ip");
+
+    struct ovnact_ct_commit_v1 *ct_commit =
+        ovnact_put_CT_COMMIT_V1(ctx->ovnacts);
+    if (lexer_match(ctx->lexer, LEX_T_LPAREN)) {
+        while (!lexer_match(ctx->lexer, LEX_T_RPAREN)) {
+            parse_ct_commit_v1_arg(ctx, ct_commit);
+            if (ctx->lexer->error) {
+                return;
+            }
+            lexer_match(ctx->lexer, LEX_T_COMMA);
+        }
+    }
+}
+
+static void
 parse_CT_COMMIT(struct action_context *ctx)
 {
     if (ctx->lexer->token.type == LEX_T_LCURLY) {
-        parse_nested_action(ctx, OVNACT_CT_COMMIT, "ip",
+        parse_nested_action(ctx, OVNACT_CT_COMMIT_V2, "ip",
                             WR_CT_COMMIT);
+    } else if (ctx->lexer->token.type == LEX_T_LPAREN) {
+        parse_CT_COMMIT_V1(ctx);
     } else {
         /* Add an empty nested action to allow for "ct_commit;" syntax */
         add_prerequisite(ctx, "ip");
-        struct ovnact_nest *on = ovnact_put(ctx->ovnacts, OVNACT_CT_COMMIT,
+        struct ovnact_nest *on = ovnact_put(ctx->ovnacts, OVNACT_CT_COMMIT_V2,
                                             OVNACT_ALIGN(sizeof *on));
         on->nested_len = 0;
         on->nested = NULL;
@@ -644,7 +703,73 @@ parse_CT_COMMIT(struct action_context *ctx)
 }
 
 static void
-format_CT_COMMIT(const struct ovnact_nest *on, struct ds *s)
+format_CT_COMMIT_V1(const struct ovnact_ct_commit_v1 *cc, struct ds *s)
+{
+    ds_put_cstr(s, "ct_commit(");
+    if (cc->ct_mark_mask) {
+        ds_put_format(s, "ct_mark=%#"PRIx32, cc->ct_mark);
+        if (cc->ct_mark_mask != UINT32_MAX) {
+            ds_put_format(s, "/%#"PRIx32, cc->ct_mark_mask);
+        }
+    }
+    if (!ovs_be128_is_zero(cc->ct_label_mask)) {
+        if (ds_last(s) != '(') {
+            ds_put_cstr(s, ", ");
+        }
+
+        ds_put_format(s, "ct_label=");
+        ds_put_hex(s, &cc->ct_label, sizeof cc->ct_label);
+        if (!ovs_be128_equals(cc->ct_label_mask, OVS_BE128_MAX)) {
+            ds_put_char(s, '/');
+            ds_put_hex(s, &cc->ct_label_mask, sizeof cc->ct_label_mask);
+        }
+    }
+    if (!ds_chomp(s, '(')) {
+        ds_put_char(s, ')');
+    }
+    ds_put_char(s, ';');
+}
+
+static void
+encode_CT_COMMIT_V1(const struct ovnact_ct_commit_v1 *cc,
+                    const struct ovnact_encode_params *ep OVS_UNUSED,
+                    struct ofpbuf *ofpacts)
+{
+    struct ofpact_conntrack *ct = ofpact_put_CT(ofpacts);
+    ct->flags = NX_CT_F_COMMIT;
+    ct->recirc_table = NX_CT_RECIRC_NONE;
+    ct->zone_src.field = mf_from_id(MFF_LOG_CT_ZONE);
+    ct->zone_src.ofs = 0;
+    ct->zone_src.n_bits = 16;
+
+    size_t set_field_offset = ofpacts->size;
+    ofpbuf_pull(ofpacts, set_field_offset);
+
+    if (cc->ct_mark_mask) {
+        const ovs_be32 value = htonl(cc->ct_mark);
+        const ovs_be32 mask = htonl(cc->ct_mark_mask);
+        ofpact_put_set_field(ofpacts, mf_from_id(MFF_CT_MARK), &value, &mask);
+    }
+
+    if (!ovs_be128_is_zero(cc->ct_label_mask)) {
+        ofpact_put_set_field(ofpacts, mf_from_id(MFF_CT_LABEL), &cc->ct_label,
+                             &cc->ct_label_mask);
+    }
+
+    ofpacts->header = ofpbuf_push_uninit(ofpacts, set_field_offset);
+    ct = ofpacts->header;
+    ofpact_finish(ofpacts, &ct->ofpact);
+}
+
+static void
+ovnact_ct_commit_v1_free(struct ovnact_ct_commit_v1 *cc OVS_UNUSED)
+{
+}
+
+
+
+static void
+format_CT_COMMIT_V2(const struct ovnact_nest *on, struct ds *s)
 {
     if (on->nested_len) {
         format_nested_action(on, "ct_commit", s);
@@ -654,9 +779,9 @@ format_CT_COMMIT(const struct ovnact_nest *on, struct ds *s)
 }
 
 static void
-encode_CT_COMMIT(const struct ovnact_nest *on,
-                 const struct ovnact_encode_params *ep OVS_UNUSED,
-                 struct ofpbuf *ofpacts)
+encode_CT_COMMIT_V2(const struct ovnact_nest *on,
+                    const struct ovnact_encode_params *ep OVS_UNUSED,
+                    struct ofpbuf *ofpacts)
 {
     struct ofpact_conntrack *ct = ofpact_put_CT(ofpacts);
     ct->flags = NX_CT_F_COMMIT;
@@ -1188,6 +1313,7 @@ parse_select_action(struct action_context *ctx, struct expr_field *res_field)
     }
     if (n_dsts <= 1) {
         lexer_syntax_error(ctx->lexer, "expecting at least 2 group members");
+        free(dsts);
         return;
     }
 
@@ -2655,13 +2781,14 @@ ovnact_set_queue_free(struct ovnact_set_queue *a OVS_UNUSED)
 }
 
 static void
-parse_dns_lookup(struct action_context *ctx, const struct expr_field *dst,
-                 struct ovnact_dns_lookup *dl)
+parse_ovnact_result(struct action_context *ctx, const char *name,
+                    const char *prereq, const struct expr_field *dst,
+                    struct ovnact_result *res)
 {
-    lexer_get(ctx->lexer); /* Skip dns_lookup. */
+    lexer_get(ctx->lexer); /* Skip action name. */
     lexer_get(ctx->lexer); /* Skip '('. */
     if (!lexer_match(ctx->lexer, LEX_T_RPAREN)) {
-        lexer_error(ctx->lexer, "dns_lookup doesn't take any parameters");
+        lexer_error(ctx->lexer, "%s doesn't take any parameters", name);
         return;
     }
     /* Validate that the destination is a 1-bit, modifiable field. */
@@ -2671,19 +2798,29 @@ parse_dns_lookup(struct action_context *ctx, const struct expr_field *dst,
         free(error);
         return;
     }
-    dl->dst = *dst;
-    add_prerequisite(ctx, "udp");
+    res->dst = *dst;
+
+    if (prereq) {
+        add_prerequisite(ctx, prereq);
+    }
 }
 
 static void
-format_DNS_LOOKUP(const struct ovnact_dns_lookup *dl, struct ds *s)
+parse_dns_lookup(struct action_context *ctx, const struct expr_field *dst,
+                 struct ovnact_result *dl)
+{
+    parse_ovnact_result(ctx, "dns_lookup", "udp", dst, dl);
+}
+
+static void
+format_DNS_LOOKUP(const struct ovnact_result *dl, struct ds *s)
 {
     expr_field_format(&dl->dst, s);
     ds_put_cstr(s, " = dns_lookup();");
 }
 
 static void
-encode_DNS_LOOKUP(const struct ovnact_dns_lookup *dl,
+encode_DNS_LOOKUP(const struct ovnact_result *dl,
                   const struct ovnact_encode_params *ep OVS_UNUSED,
                   struct ofpbuf *ofpacts)
 {
@@ -2700,7 +2837,7 @@ encode_DNS_LOOKUP(const struct ovnact_dns_lookup *dl,
 
 
 static void
-ovnact_dns_lookup_free(struct ovnact_dns_lookup *dl OVS_UNUSED)
+ovnact_result_free(struct ovnact_result *dl OVS_UNUSED)
 {
 }
 
@@ -3344,14 +3481,16 @@ parse_fwd_group_action(struct action_context *ctx)
             if (!lexer_force_match(ctx->lexer, LEX_T_EQUALS)) {
                 return;
             }
-            if (ctx->lexer->token.type != LEX_T_STRING) {
-                lexer_syntax_error(ctx->lexer,
-                                   "expecting true/false");
-                return;
-            }
-            if (!strcmp(ctx->lexer->token.s, "true")) {
+            if (lexer_match_string(ctx->lexer, "true") ||
+                lexer_match_id(ctx->lexer, "true")) {
                 liveness = true;
-                lexer_get(ctx->lexer);
+            } else if (lexer_match_string(ctx->lexer, "false") ||
+                       lexer_match_id(ctx->lexer, "false")) {
+                liveness = false;
+            } else {
+                lexer_syntax_error(ctx->lexer,
+                                   "expecting true or false");
+                return;
             }
             lexer_force_match(ctx->lexer, LEX_T_COMMA);
         }
@@ -3364,6 +3503,9 @@ parse_fwd_group_action(struct action_context *ctx)
                     lexer_syntax_error(ctx->lexer,
                                        "expecting logical switch port");
                     if (child_port_list) {
+                        for (int i = 0; i < n_child_ports; i++) {
+                            free(child_port_list[i]);
+                        }
                         free(child_port_list);
                     }
                     return;
@@ -3433,6 +3575,7 @@ encode_FWD_GROUP(const struct ovnact_fwd_group *fwd_group,
 
         /* Find the tunnel key of the logical port */
         if (!ep->lookup_port(ep->aux, port_name, &port_tunnel_key)) {
+            ds_destroy(&ds);
             return;
         }
         ds_put_format(&ds, ",bucket=");
@@ -3440,6 +3583,7 @@ encode_FWD_GROUP(const struct ovnact_fwd_group *fwd_group,
         if (fwd_group->liveness) {
             /* Find the openflow port number of the tunnel port */
             if (!ep->tunnel_ofport(ep->aux, port_name, &ofport)) {
+                ds_destroy(&ds);
                 return;
             }
 
@@ -3469,7 +3613,87 @@ encode_FWD_GROUP(const struct ovnact_fwd_group *fwd_group,
 static void
 ovnact_fwd_group_free(struct ovnact_fwd_group *fwd_group)
 {
+    for (int i = 0; i < fwd_group->n_child_ports; i++) {
+        free(fwd_group->child_ports[i]);
+    }
     free(fwd_group->child_ports);
+}
+
+static void
+parse_chk_lb_hairpin(struct action_context *ctx, const struct expr_field *dst,
+                     struct ovnact_result *res)
+{
+    parse_ovnact_result(ctx, "chk_lb_hairpin", NULL, dst, res);
+}
+
+static void
+parse_chk_lb_hairpin_reply(struct action_context *ctx,
+                           const struct expr_field *dst,
+                           struct ovnact_result *res)
+{
+    parse_ovnact_result(ctx, "chk_lb_hairpin_reply", NULL, dst, res);
+}
+
+
+static void
+format_CHK_LB_HAIRPIN(const struct ovnact_result *res, struct ds *s)
+{
+    expr_field_format(&res->dst, s);
+    ds_put_cstr(s, " = chk_lb_hairpin();");
+}
+
+static void
+format_CHK_LB_HAIRPIN_REPLY(const struct ovnact_result *res, struct ds *s)
+{
+    expr_field_format(&res->dst, s);
+    ds_put_cstr(s, " = chk_lb_hairpin_reply();");
+}
+
+static void
+encode_chk_lb_hairpin__(const struct ovnact_result *res,
+                        uint8_t hairpin_table,
+                        struct ofpbuf *ofpacts)
+{
+    struct mf_subfield dst = expr_resolve_field(&res->dst);
+    ovs_assert(dst.field);
+    put_load(0, MFF_LOG_FLAGS, MLF_LOOKUP_LB_HAIRPIN_BIT, 1, ofpacts);
+    emit_resubmit(ofpacts, hairpin_table);
+
+    struct ofpact_reg_move *orm = ofpact_put_REG_MOVE(ofpacts);
+    orm->dst = dst;
+    orm->src.field = mf_from_id(MFF_LOG_FLAGS);
+    orm->src.ofs = MLF_LOOKUP_LB_HAIRPIN_BIT;
+    orm->src.n_bits = 1;
+}
+
+static void
+encode_CHK_LB_HAIRPIN(const struct ovnact_result *res,
+                      const struct ovnact_encode_params *ep,
+                      struct ofpbuf *ofpacts)
+{
+    encode_chk_lb_hairpin__(res, ep->lb_hairpin_ptable, ofpacts);
+}
+
+static void
+encode_CHK_LB_HAIRPIN_REPLY(const struct ovnact_result *res,
+                            const struct ovnact_encode_params *ep,
+                            struct ofpbuf *ofpacts)
+{
+    encode_chk_lb_hairpin__(res, ep->lb_hairpin_reply_ptable, ofpacts);
+}
+
+static void
+format_CT_SNAT_TO_VIP(const struct ovnact_null *null OVS_UNUSED, struct ds *s)
+{
+    ds_put_cstr(s, "ct_snat_to_vip;");
+}
+
+static void
+encode_CT_SNAT_TO_VIP(const struct ovnact_null *null OVS_UNUSED,
+                      const struct ovnact_encode_params *ep,
+                      struct ofpbuf *ofpacts)
+{
+    emit_resubmit(ofpacts, ep->ct_snat_vip_ptable);
 }
 
 /* Parses an assignment or exchange or put_dhcp_opts action. */
@@ -3524,6 +3748,14 @@ parse_set_action(struct action_context *ctx)
                 && lexer_lookahead(ctx->lexer) == LEX_T_LPAREN) {
             parse_lookup_mac_bind_ip(ctx, &lhs, 128,
                                      ovnact_put_LOOKUP_ND_IP(ctx->ovnacts));
+        } else if (!strcmp(ctx->lexer->token.s, "chk_lb_hairpin")
+                   && lexer_lookahead(ctx->lexer) == LEX_T_LPAREN) {
+            parse_chk_lb_hairpin(ctx, &lhs,
+                                 ovnact_put_CHK_LB_HAIRPIN(ctx->ovnacts));
+        } else if (!strcmp(ctx->lexer->token.s, "chk_lb_hairpin_reply")
+                   && lexer_lookahead(ctx->lexer) == LEX_T_LPAREN) {
+            parse_chk_lb_hairpin_reply(
+                ctx, &lhs, ovnact_put_CHK_LB_HAIRPIN_REPLY(ctx->ovnacts));
         } else {
             parse_assignment_action(ctx, false, &lhs);
         }
@@ -3610,6 +3842,8 @@ parse_action(struct action_context *ctx)
         ovnact_put_DHCP6_REPLY(ctx->ovnacts);
     } else if (lexer_match_id(ctx->lexer, "reject")) {
         parse_REJECT(ctx);
+    } else if (lexer_match_id(ctx->lexer, "ct_snat_to_vip")) {
+        ovnact_put_CT_SNAT_TO_VIP(ctx->ovnacts);
     } else {
         lexer_syntax_error(ctx->lexer, "expecting action");
     }

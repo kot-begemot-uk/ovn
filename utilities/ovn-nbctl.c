@@ -617,6 +617,7 @@ QoS commands:\n\
   qos-list SWITCH           print QoS rules for SWITCH\n\
 \n\
 Meter commands:\n\
+  [--fair]\n\
   meter-add NAME ACTION RATE UNIT [BURST]\n\
                             add a meter\n\
   meter-del [NAME]          remove meters\n\
@@ -1683,6 +1684,7 @@ nbctl_lsp_set_addresses(struct ctl_context *ctx)
         error = lsp_contains_duplicates(ls, lsp, ctx->argv[i]);
         if (error) {
             ctl_error(ctx, "%s", error);
+            free(error);
             return;
         }
     }
@@ -2693,7 +2695,12 @@ nbctl_meter_list(struct ctl_context *ctx)
 
     for (size_t i = 0; i < n_meters; i++) {
         meter = meters[i];
-        ds_put_format(&ctx->output, "%s: bands:\n", meter->name);
+        ds_put_format(&ctx->output, "%s:", meter->name);
+        if (meter->fair) {
+            ds_put_format(&ctx->output, " (%s)",
+                          *meter->fair ? "fair" : "shared");
+        }
+        ds_put_format(&ctx->output, " bands:\n");
 
         for (size_t j = 0; j < meter->n_bands; j++) {
             const struct nbrec_meter_band *band = meter->bands[j];
@@ -2770,6 +2777,12 @@ nbctl_meter_add(struct ctl_context *ctx)
     nbrec_meter_set_name(meter, name);
     nbrec_meter_set_unit(meter, unit);
     nbrec_meter_set_bands(meter, &band, 1);
+
+    /* Fair option */
+    bool fair = shash_find(&ctx->options, "--fair") != NULL;
+    if (fair) {
+        nbrec_meter_set_fair(meter, &fair, 1);
+    }
 }
 
 static void
@@ -3559,7 +3572,7 @@ normalize_ipv6_prefix_str(const char *orig_prefix)
         free(error);
         return NULL;
     }
-    return normalize_ipv6_prefix(ipv6, plen);
+    return normalize_ipv6_prefix(&ipv6, plen);
 }
 
 /* The caller must free the returned string. */
@@ -3596,7 +3609,7 @@ normalize_ipv6_addr_str(const char *orig_addr)
         return NULL;
     }
 
-    return normalize_ipv6_prefix(ipv6, 128);
+    return normalize_ipv6_prefix(&ipv6, 128);
 }
 
 /* Similar to normalize_prefix_str but must be an un-masked address.
@@ -3688,6 +3701,7 @@ nbctl_lr_policy_add(struct ctl_context *ctx)
         } else {
             ctl_error(ctx, "No value specified for the option : %s", key);
             free(key);
+            free(next_hop);
             return;
         }
         free(key);
@@ -3756,6 +3770,7 @@ nbctl_lr_policy_del(struct ctl_context *ctx)
                 if (!shash_find(&ctx->options, "--if-exists")) {
                     ctl_error(ctx, "Logical router policy uuid is not found.");
                 }
+                free(new_policies);
                 return;
             }
 
@@ -4310,7 +4325,7 @@ nbctl_lr_nat_add(struct ctl_context *ctx)
 
     if (strcmp(nat_type, "dnat_and_snat") && stateless) {
         ctl_error(ctx, "stateless is not applicable to dnat or snat types");
-        return;
+        goto cleanup;
     }
 
     int is_snat = !strcmp("snat", nat_type);
@@ -4600,8 +4615,11 @@ nbctl_lr_nat_set_ext_ips(struct ctl_context *ctx)
             } else {
                 nbrec_nat_set_allowed_ext_ips(nat, addr_set);
             }
+            free(nat_ip);
+            free(old_ip);
             return;
         }
+        free(old_ip);
     }
 
     if (!nat_found) {
@@ -6357,7 +6375,7 @@ do_nbctl(const char *args, struct ctl_command *commands, size_t n_commands,
             NBREC_NB_GLOBAL_FOR_EACH (nb, idl) {
                 int64_t cur_cfg = (wait_type == NBCTL_WAIT_SB
                                    ? nb->sb_cfg
-                                   : nb->hv_cfg);
+                                   : MIN(nb->sb_cfg, nb->hv_cfg));
                 if (cur_cfg >= next_cfg) {
                     if (print_wait_time) {
                         printf("Time spent on processing nb_cfg %"PRId64":\n",
@@ -6464,7 +6482,7 @@ static const struct ctl_command_syntax nbctl_commands[] = {
 
     /* meter commands. */
     { "meter-add", 4, 5, "NAME ACTION RATE UNIT [BURST]", NULL,
-      nbctl_meter_add, NULL, "", RW },
+      nbctl_meter_add, NULL, "--fair", RW },
     { "meter-del", 0, 1, "[NAME]", NULL, nbctl_meter_del, NULL, "", RW },
     { "meter-list", 0, 0, "", NULL, nbctl_meter_list, NULL, "", RO },
 

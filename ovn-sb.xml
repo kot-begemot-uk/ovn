@@ -2068,29 +2068,32 @@
               The <var>string</var> should reference a
               <ref column="name" table="Meter"/> entry from the
               <ref table="Meter"/> table.  The only meter
-              <ref column="action" table="meter"/> that is appriopriate
+              <ref column="action" table="meter"/> that is appropriate
               is <code>drop</code>.
             </dd>
           </dl>
         </dd>
 
-        <dt><code>fwd_group(<var>P</var>);</code></dt>
+        <dt><code>fwd_group(liveness=<var>bool</var>, childports=<var>port</var>, ...);</code></dt>
         <dd>
           <p>
-            <b>Parameters</b>: liveness, list of child ports <var>P</var>.
+            <b>Parameters</b>: optional <code>liveness</code>, either
+            <code>true</code> or <code>false</code>, defaulting to false;
+            <code>childports</code>, a comma-delimited list of strings denoting
+            logical ports to load balance across.
           </p>
 
           <p>
-            It load balances traffic to one or more child ports in a
-            logical switch. <code>ovn-controller</code> translates the
-            <code>fwd_group</code> into openflow group with one bucket
-            for each child port. If liveness is set to true, it also
-            integrates the bucket selection with BFD status on the tunnel
+            Load balance traffic to one or more child ports in a logical
+            switch. <code>ovn-controller</code> translates the
+            <code>fwd_group</code> into an OpenFlow group with one bucket for
+            each child port. If <code>liveness=true</code> is specified, it
+            also integrates the bucket selection with BFD status on the tunnel
             interface corresponding to child port.
           </p>
 
-          <p><b>Example:</b> <code>fwd_group(liveness=true, childports=p1,p2
-            </code></p>
+          <p><b>Example:</b> <code>fwd_group(liveness=true, childports="p1",
+          "p2");</code></p>
         </dd>
       </dl>
 
@@ -2325,6 +2328,43 @@ tcp.flags = RST;
             Delegation Router and managed IPv6 Prefix delegation state machine
           </p>
         </dd>
+
+        <dt><code><var>R</var> = chk_lb_hairpin();</code></dt>
+        <dd>
+          <p>
+            This action checks if the packet under consideration was destined
+            to a load balancer VIP and it is hairpinned, i.e., after load
+            balancing the destination IP matches the source IP. If it is so,
+            then the 1-bit destination register <var>R</var> is set to 1.
+          </p>
+        </dd>
+
+        <dt><code><var>R</var> = chk_lb_hairpin_reply();</code></dt>
+        <dd>
+          <p>
+            This action checks if the packet under consideration is from
+            one of the backend IP of a load balancer VIP and the destination IP
+            is the load balancer VIP. If it is so, then the 1-bit destination
+            register <var>R</var> is set to 1.
+          </p>
+        </dd>
+
+        <dt><code><var>R</var> = ct_snat_to_vip;</code></dt>
+        <dd>
+          <p>
+            This action sends the packet through the SNAT zone to change the
+            source IP address of the packet to the load balancer VIP if the
+            original destination IP was load balancer VIP and commits the
+            connection. This action applies successfully only for the
+            hairpinned traffic i.e if the action <code>chk_lb_hairpin</code>
+            returned success. This action doesn't take any arguments and it
+            determines the SNAT IP internally.
+
+            The packet is not automatically sent to the next table. The caller
+            has to execute the <code>next;</code> action explicitly after this
+            action to advance the packet to the next stage.
+          </p>
+        </dd>
       </dl>
     </column>
 
@@ -2495,6 +2535,12 @@ tcp.flags = RST;
       The <code>Tunnel Encapsulation</code> section in
       <code>ovn-architecture</code>(7) describes how tunnel keys are
       constructed for each supported encapsulation.
+    </column>
+
+    <column name="load_balancers">
+      <p>
+        Load balancers associated with the datapath.
+      </p>
     </column>
 
     <group title="OVN_Northbound Relationship">
@@ -4119,6 +4165,45 @@ tcp.flags = RST;
         </p>
       </column>
     </group>
+
+    <group title="Common Columns">
+      <column name="external_ids">
+        See <em>External IDs</em> at the beginning of this document.
+      </column>
+    </group>
+  </table>
+
+  <table name="Load_Balancer">
+    <p>
+      Each row represents a load balancer.
+    </p>
+
+    <column name="name">
+      A name for the load balancer.  This name has no special meaning or
+      purpose other than to provide convenience for human interaction with
+      the ovn-nb database.
+    </column>
+
+    <column name="vips">
+      A map of virtual IP addresses (and an optional port number with
+      <code>:</code> as a separator) associated with this load balancer and
+      their corresponding endpoint IP addresses (and optional port numbers
+      with <code>:</code> as separators) separated by commas.
+    </column>
+
+    <column name="protocol">
+      <p>
+        Valid protocols are <code>tcp</code>, <code>udp</code>, or
+        <code>sctp</code>.  This column is useful when a port number is
+        provided as part of the <code>vips</code> column.  If this column is
+        empty and a port number is provided as part of <code>vips</code>
+        column, OVN assumes the protocol to be <code>tcp</code>.
+      </p>
+    </column>
+
+    <column name="datapaths">
+      Datapaths to which this load balancer applies to.
+    </column>
 
     <group title="Common Columns">
       <column name="external_ids">

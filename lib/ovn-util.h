@@ -107,6 +107,7 @@ uint32_t ovn_logical_flow_hash(const struct uuid *logical_datapath,
                                uint16_t priority,
                                const char *match, const char *actions);
 bool datapath_is_switch(const struct sbrec_datapath_binding *);
+int datapath_snat_ct_zone(const struct sbrec_datapath_binding *ldp);
 void ovn_conn_show(struct unixctl_conn *conn, int argc OVS_UNUSED,
                    const char *argv[] OVS_UNUSED, void *idl_);
 
@@ -144,21 +145,12 @@ get_sb_port_group_name(const char *nb_pg_name, int64_t dp_tunnel_key,
 char *ovn_chassis_redirect_name(const char *port_name);
 void ovn_set_pidfile(const char *name);
 
-/* An IPv4 or IPv6 address */
-struct v46_ip {
-    int family;
-    union {
-        ovs_be32 ipv4;
-        struct in6_addr ipv6;
-    };
-};
-bool ip46_parse_cidr(const char *str, struct v46_ip *prefix,
+bool ip46_parse_cidr(const char *str, struct in6_addr *prefix,
                      unsigned int *plen);
-bool ip46_equals(const struct v46_ip *addr1, const struct v46_ip *addr2);
 
 char *normalize_ipv4_prefix(ovs_be32 ipv4, unsigned int plen);
-char *normalize_ipv6_prefix(struct in6_addr ipv6, unsigned int plen);
-char *normalize_v46_prefix(const struct v46_ip *prefix, unsigned int plen);
+char *normalize_ipv6_prefix(const struct in6_addr *ipv6, unsigned int plen);
+char *normalize_v46_prefix(const struct in6_addr *prefix, unsigned int plen);
 
 /* Temporary util function until ovs library has smap_get_unit. */
 unsigned int ovn_smap_get_uint(const struct smap *smap, const char *key,
@@ -229,5 +221,9 @@ char *str_tolower(const char *orig);
 
 bool ip_address_and_port_from_lb_key(const char *key, char **ip_address,
                                      uint16_t *port, int *addr_family);
+
+/* Returns the internal OVN version. The caller must free the returned
+ * value. */
+char *ovn_get_internal_version(void);
 
 #endif
