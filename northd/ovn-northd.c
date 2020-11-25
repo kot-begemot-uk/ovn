@@ -11221,15 +11221,14 @@ build_lflows(struct northd_context *ctx, struct hmap *datapaths,
 {
     struct hmap lflows = HMAP_INITIALIZER(&lflows);
     long long finish, start = time_usec();
+    ssize_t flow_count;
 
     build_lswitch_and_lrouter_flows(datapaths, ports,
                                     port_groups, &lflows, mcgroups,
                                     igmp_groups, meter_groups, lbs);
+    flow_count = hmap_count(&lflows);
     finish = time_usec();
 
-    if (hmap_count(&lflows)) {
-        VLOG_INFO("Time to compute lflows %ld, %lld, %f", hmap_count(&lflows), finish - start, 1.0 * (finish - start)/hmap_count(&lflows));
-    }
 
     /* Push changes to the Logical_Flow table to database. */
     const struct sbrec_logical_flow *sbflow, *next_sbflow;
@@ -11253,6 +11252,9 @@ build_lflows(struct northd_context *ctx, struct hmap *datapaths,
         } else {
             sbrec_logical_flow_delete(sbflow);
         }
+    }
+    if (flow_count) {
+        VLOG_INFO("Time to compute lflows %ld, %lld, %f", flow_count, finish - start, 1.0 * (finish - start)/flow_count);
     }
     struct ovn_lflow *lflow, *next_lflow;
     HMAP_FOR_EACH_SAFE (lflow, next_lflow, hmap_node, &lflows) {
