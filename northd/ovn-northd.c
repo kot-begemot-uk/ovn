@@ -11227,7 +11227,6 @@ build_lflows(struct northd_context *ctx, struct hmap *datapaths,
                                     port_groups, &lflows, mcgroups,
                                     igmp_groups, meter_groups, lbs);
     flow_count = hmap_count(&lflows);
-    finish = time_usec();
 
 
     /* Push changes to the Logical_Flow table to database. */
@@ -11253,6 +11252,7 @@ build_lflows(struct northd_context *ctx, struct hmap *datapaths,
             sbrec_logical_flow_delete(sbflow);
         }
     }
+    finish = time_usec();
     if (flow_count) {
         VLOG_INFO("Time to compute lflows %ld, %lld, %f", flow_count, finish - start, 1.0 * (finish - start)/flow_count);
     }
