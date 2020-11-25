@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#ifndef OVN_FASTHMAP_H 1
+#ifndef OVN_FASTHMAP_H
 #include "openvswitch/hmap.h"
 
 #ifdef OVS_HAS_PARALLEL_HMAP_MACROS

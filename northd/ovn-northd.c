@@ -11426,7 +11426,7 @@ struct reconcile_info {
     struct northd_context *ctx;
     struct hmap *lflows;
     struct hmap *datapaths;
-    struct ovs_list results;
+    struct ovs_list *results;
 };
 
 struct lflow_reconciliation_pool {
@@ -11454,7 +11454,7 @@ static void *reconciliation_thread(void *arg) {
                 if (!od || ovn_datapath_is_stale(od)) {
                     res->sbflow = sbflow;
                     res->lflow = NULL;
-                    ovs_list_push_back(&ri->results, &res->list_node);
+                    ovs_list_push_back(ri->results, &res->list_node);
                     continue;
                 }
 
@@ -11472,7 +11472,7 @@ static void *reconciliation_thread(void *arg) {
                     res->sbflow = sbflow;
                     res->lflow = NULL;
                 }
-                ovs_list_push_back(&ri->results, &res->list_node);
+                ovs_list_push_back(ri->results, &res->list_node);
             }
             atomic_store_relaxed(&control->finished, true);
             atomic_thread_fence(memory_order_release);
@@ -11542,6 +11542,9 @@ build_lflows(struct northd_context *ctx, struct hmap *datapaths,
 {
     struct hmap lflows;
     const struct sbrec_logical_flow *sbflow;
+    long long finish, start = time_usec();
+    ssize_t flow_count;
+
 
     fast_hmap_size_for(&lflows, max_seen_lflow_size);
 
@@ -11549,6 +11552,7 @@ build_lflows(struct northd_context *ctx, struct hmap *datapaths,
                                     port_groups, &lflows, mcgroups,
                                     igmp_groups, meter_groups, lbs);
 
+    flow_count = hmap_count(&lflows);
     if (hmap_count(&lflows) > max_seen_lflow_size) {
         max_seen_lflow_size = hmap_count(&lflows);
     }
@@ -11580,14 +11584,14 @@ build_lflows(struct northd_context *ctx, struct hmap *datapaths,
         }
     } else {
         struct reconcile_info *ri;
-        struct ovs_list *combined_result = NULL;
-        struct ovs_list **results = NULL;
+        struct ovs_list combined_result = OVS_LIST_INITIALIZER(&combined_result);
+        struct ovs_list *results = NULL;
         int index;
         init_reconciliation_pool();
 
         ri = xmalloc(sizeof(struct reconcile_info) *
                 reconcile_pool->pool->size);
-        results = xmalloc(sizeof(struct ovs_list *) *
+        results = xmalloc(sizeof(struct ovs_list) *
                 reconcile_pool->pool->size);
 
         for (index = 0;
@@ -11596,8 +11600,8 @@ build_lflows(struct northd_context *ctx, struct hmap *datapaths,
             ri[index].lflows = &lflows;
             ri[index].datapaths = datapaths;
             ri[index].ctx = ctx;
-            ovs_list_init(&ri[index].results);
-            results[index] = &ri[index].results;
+            ovs_list_init(&results[index]);
+            ri[index].results = &results[index];
             reconcile_pool->pool->controls[index].data = &ri[index];
         }
 
@@ -11607,7 +11611,7 @@ build_lflows(struct northd_context *ctx, struct hmap *datapaths,
             results);
 
         struct sbrec_result *res;
-        LIST_FOR_EACH_POP (res, list_node, combined_result) {
+        LIST_FOR_EACH_POP (res, list_node, &combined_result) {
             if (hmap_safe_remove(&lflows, &res->lflow->hmap_node, res->lflow_hash)) {
                 ovn_lflow_destroy(NULL, res->lflow);
             } else {
@@ -11618,6 +11622,10 @@ build_lflows(struct northd_context *ctx, struct hmap *datapaths,
         free(results);
         free(ri);
 
+    }
+    finish = time_usec();
+    if (flow_count) {
+        VLOG_INFO("Time to compute lflows %ld, %lld, %f", flow_count, finish - start, 1.0 * (finish - start)/flow_count);
     }
     struct ovn_lflow *lflow, *next_lflow;
     HMAP_FOR_EACH_SAFE (lflow, next_lflow, hmap_node, &lflows) {

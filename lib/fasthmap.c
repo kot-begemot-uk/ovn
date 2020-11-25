@@ -31,6 +31,8 @@
 #include "ovs-thread.h"
 #include "ovs-numa.h"
 
+#ifndef OVS_HAS_PARALLEL_HMAP_MACROS
+
 VLOG_DEFINE_THIS_MODULE(fasthmap);
 
 
@@ -279,3 +281,5 @@ void ovn_run_pool_hash(
 {
     ovn_run_pool_callback(pool, result, result_frags, merge_hash_results);
 }
+
+#endif
