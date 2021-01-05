@@ -1,5 +1,9 @@
-Post-v20.09.0
----------------------
+Post-v20.12.0
+-------------------------
+  - Support ECMP multiple nexthops for reroute router policies.
+
+OVN v20.12.0 - xx xxx xxxx
+--------------------------
    - The "datapath" argument to ovn-trace is now optional, since the
      datapath can be inferred from the inport (which is required).
    - The obsolete "redirect-chassis" way to configure gateways has been
@@ -15,6 +19,11 @@ Post-v20.09.0
      ovn-controller will not process any DB changes.
    - Add "fair" column in Meter table to allow multiple ACL logs to use the
      same Meter while being rate-limited independently.
+   - New configuration option for northd 'options:use_logical_dp_groups=true'
+     to enable combining of logical flows by logical datapath.  This should
+     significantly decrease size of a Southbound DB.  However, in some cases,
+     it could have performance penalty for ovn-controller.  Disabled by
+     default.
 
 OVN v20.09.0 - 28 Sep 2020
 --------------------------

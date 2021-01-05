@@ -41,8 +41,7 @@ SYSTEM_KMOD_TESTSUITE_AT = \
 SYSTEM_USERSPACE_TESTSUITE_AT = \
 	tests/system-userspace-testsuite.at \
 	tests/system-ovn.at \
-	tests/system-userspace-macros.at \
-	tests/system-userspace-packet-type-aware.at
+	tests/system-userspace-macros.at
 
 SYSTEM_TESTSUITE_AT = \
 	tests/system-common-macros.at \
@@ -53,6 +52,7 @@ check_SCRIPTS += tests/atlocal
 
 TESTSUITE = $(srcdir)/tests/testsuite
 TESTSUITE_PATCH = $(srcdir)/tests/testsuite.patch
+TESTSUITE_DIR = $(abs_top_builddir)/tests/testsuite.dir
 SYSTEM_KMOD_TESTSUITE = $(srcdir)/tests/system-kmod-testsuite
 SYSTEM_USERSPACE_TESTSUITE = $(srcdir)/tests/system-userspace-testsuite
 DISTCLEANFILES += tests/atconfig tests/atlocal
@@ -63,7 +63,9 @@ export ovs_srcdir
 
 check-local:
 	set $(SHELL) '$(TESTSUITE)' -C tests AUTOTEST_PATH=$(AUTOTEST_PATH); \
-	"$$@" $(TESTSUITEFLAGS) || (test X'$(RECHECK)' = Xyes && "$$@" --recheck)
+	"$$@" $(TESTSUITEFLAGS) || \
+	(test -z "$$(find $(TESTSUITE_DIR) -name 'asan.*')" && \
+	 test X'$(RECHECK)' = Xyes && "$$@" --recheck)
 
 # Python Coverage support.
 # Requires coverage.py http://nedbatchelder.com/code/coverage/.
@@ -101,6 +103,7 @@ check-lcov: all $(check_DATA) clean-lcov
 
 valgrind_wrappers = \
 	tests/valgrind/ovn-controller \
+	tests/valgrind/ovn-controller-vtep \
 	tests/valgrind/ovn-nbctl \
 	tests/valgrind/ovn-northd \
 	tests/valgrind/ovn-sbctl \

@@ -3011,6 +3011,23 @@ notify_pinctrl_main(void)
     seq_change(pinctrl_main_seq);
 }
 
+static void
+pinctrl_rconn_setup(struct rconn *swconn, const char *br_int_name)
+    OVS_REQUIRES(pinctrl_mutex)
+{
+    if (br_int_name) {
+        char *target = xasprintf("unix:%s/%s.mgmt", ovs_rundir(), br_int_name);
+
+        if (strcmp(target, rconn_get_target(swconn))) {
+            VLOG_INFO("%s: connecting to switch", target);
+            rconn_connect(swconn, target, target);
+        }
+        free(target);
+    } else {
+        rconn_disconnect(swconn);
+    }
+}
+
 /* pinctrl_handler pthread function. */
 static void *
 pinctrl_handler(void *arg_)
@@ -3022,7 +3039,6 @@ pinctrl_handler(void *arg_)
      * rconn_get_connection_seqno(rconn), 'swconn' has reconnected. */
     unsigned int conn_seq_no = 0;
 
-    char *br_int_name = NULL;
     uint64_t new_seq;
 
     /* Next IPV6 RA in seconds. */
@@ -3037,27 +3053,8 @@ pinctrl_handler(void *arg_)
     swconn = rconn_create(5, 0, DSCP_DEFAULT, 1 << OFP15_VERSION);
 
     while (!latch_is_set(&pctrl->pinctrl_thread_exit)) {
-        if (pctrl->br_int_name) {
-            if (!br_int_name || strcmp(br_int_name, pctrl->br_int_name)) {
-                free(br_int_name);
-                br_int_name = xstrdup(pctrl->br_int_name);
-            }
-        }
-
-        if (br_int_name) {
-            char *target;
-
-            target = xasprintf("unix:%s/%s.mgmt", ovs_rundir(), br_int_name);
-            if (strcmp(target, rconn_get_target(swconn))) {
-                VLOG_INFO("%s: connecting to switch", target);
-                rconn_connect(swconn, target, target);
-            }
-            free(target);
-        } else {
-            rconn_disconnect(swconn);
-        }
-
         ovs_mutex_lock(&pinctrl_mutex);
+        pinctrl_rconn_setup(swconn, pctrl->br_int_name);
         ip_mcast_snoop_run();
         ovs_mutex_unlock(&pinctrl_mutex);
 
@@ -3113,19 +3110,17 @@ pinctrl_handler(void *arg_)
         poll_block();
     }
 
-    free(br_int_name);
     rconn_destroy(swconn);
     return NULL;
 }
 
 static void
 pinctrl_set_br_int_name_(char *br_int_name)
+    OVS_REQUIRES(pinctrl_mutex)
 {
     if (br_int_name && (!pinctrl.br_int_name || strcmp(pinctrl.br_int_name,
                                                        br_int_name))) {
-        if (pinctrl.br_int_name) {
-            free(pinctrl.br_int_name);
-        }
+        free(pinctrl.br_int_name);
         pinctrl.br_int_name = xstrdup(br_int_name);
         /* Notify pinctrl_handler that integration bridge is
          * set/changed. */
@@ -3859,13 +3854,15 @@ mac_binding_lookup(struct ovsdb_idl_index *sbrec_mac_binding_by_lport_ip,
     return retval;
 }
 
-/* Update or add an IP-MAC binding for 'logical_port'. */
+/* Update or add an IP-MAC binding for 'logical_port'.
+ * Caller should make sure that 'ovnsb_idl_txn' is valid. */
 static void
 mac_binding_add(struct ovsdb_idl_txn *ovnsb_idl_txn,
                 struct ovsdb_idl_index *sbrec_mac_binding_by_lport_ip,
                 const char *logical_port,
                 const struct sbrec_datapath_binding *dp,
-                struct eth_addr ea, const char *ip)
+                struct eth_addr ea, const char *ip,
+                bool update_only)
 {
     /* Convert ethernet argument to string form for database. */
     char mac_string[ETH_ADDR_STRLEN + 1];
@@ -3874,6 +3871,9 @@ mac_binding_add(struct ovsdb_idl_txn *ovnsb_idl_txn,
     const struct sbrec_mac_binding *b =
         mac_binding_lookup(sbrec_mac_binding_by_lport_ip, logical_port, ip);
     if (!b) {
+        if (update_only) {
+            return;
+        }
         b = sbrec_mac_binding_insert(ovnsb_idl_txn);
         sbrec_mac_binding_set_logical_port(b, logical_port);
         sbrec_mac_binding_set_ip(b, ip);
@@ -3894,6 +3894,10 @@ send_garp_locally(struct ovsdb_idl_txn *ovnsb_idl_txn,
                   const struct sbrec_port_binding *in_pb,
                   struct eth_addr ea, ovs_be32 ip)
 {
+    if (!ovnsb_idl_txn) {
+        return;
+    }
+
     const struct local_datapath *ldp =
         get_local_datapath(local_datapaths, in_pb->datapath->tunnel_key);
 
@@ -3907,12 +3911,16 @@ send_garp_locally(struct ovsdb_idl_txn *ovnsb_idl_txn,
             continue;
         }
 
+        bool update_only = !smap_get_bool(&remote->datapath->external_ids,
+                                          "always_learn_from_arp_request",
+                                          true);
+
         struct ds ip_s = DS_EMPTY_INITIALIZER;
 
         ip_format_masked(ip, OVS_BE32_MAX, &ip_s);
         mac_binding_add(ovnsb_idl_txn, sbrec_mac_binding_by_lport_ip,
                         remote->logical_port, remote->datapath,
-                        ea, ds_cstr(&ip_s));
+                        ea, ds_cstr(&ip_s), update_only);
         ds_destroy(&ip_s);
     }
 }
@@ -3944,7 +3952,8 @@ run_put_mac_binding(struct ovsdb_idl_txn *ovnsb_idl_txn,
     struct ds ip_s = DS_EMPTY_INITIALIZER;
     ipv6_format_mapped(&pmb->ip_key, &ip_s);
     mac_binding_add(ovnsb_idl_txn, sbrec_mac_binding_by_lport_ip,
-                    pb->logical_port, pb->datapath, pmb->mac, ds_cstr(&ip_s));
+                    pb->logical_port, pb->datapath, pmb->mac, ds_cstr(&ip_s),
+                    false);
     ds_destroy(&ip_s);
 }
 

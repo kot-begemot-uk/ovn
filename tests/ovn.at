@@ -1334,9 +1334,9 @@ reg0[15] = put_dhcp_opts(offerip=10.0.0.4,router=10.0.0.1,netmask=255.255.255.0,
 reg0[15] = put_dhcp_opts(offerip=10.0.0.4,router=10.0.0.1,netmask=255.255.255.0,mtu=1400,ip_forward_enable=1,default_ttl=121,dns_server={8.8.8.8,7.7.7.7},classless_static_route={30.0.0.0/24,10.0.0.4,40.0.0.0/16,10.0.0.6,0.0.0.0/0,10.0.0.1},ethernet_encap=1,router_discovery=0,tftp_server="tftp_server_test");
     formats as reg0[15] = put_dhcp_opts(offerip = 10.0.0.4, router = 10.0.0.1, netmask = 255.255.255.0, mtu = 1400, ip_forward_enable = 1, default_ttl = 121, dns_server = {8.8.8.8, 7.7.7.7}, classless_static_route = {30.0.0.0/24, 10.0.0.4, 40.0.0.0/16, 10.0.0.6, 0.0.0.0/0, 10.0.0.1}, ethernet_encap = 1, router_discovery = 0, tftp_server = "tftp_server_test");
     encodes as controller(userdata=00.00.00.02.00.00.00.00.00.01.de.10.00.00.00.6f.0a.00.00.04.03.04.0a.00.00.01.01.04.ff.ff.ff.00.1a.02.05.78.13.01.01.17.01.79.06.08.08.08.08.08.07.07.07.07.79.14.18.1e.00.00.0a.00.00.04.10.28.00.0a.00.00.06.00.0a.00.00.01.24.01.01.1f.01.00.42.10.74.66.74.70.5f.73.65.72.76.65.72.5f.74.65.73.74,pause)
-reg2[5] = put_dhcp_opts(offerip=10.0.0.4,router=10.0.0.1,netmask=255.255.254.0,mtu=1400,domain_name="ovn.org",wpad="https://example.org",bootfile_name="https://127.0.0.1/boot.ipxe",path_prefix="/tftpboot",domain_search_list="ovn.org,abc.ovn.org");
-    formats as reg2[5] = put_dhcp_opts(offerip = 10.0.0.4, router = 10.0.0.1, netmask = 255.255.254.0, mtu = 1400, domain_name = "ovn.org", wpad = "https://example.org", bootfile_name = "https://127.0.0.1/boot.ipxe", path_prefix = "/tftpboot", domain_search_list = "ovn.org,abc.ovn.org");
-    encodes as controller(userdata=00.00.00.02.00.00.00.00.00.01.de.10.00.00.00.25.0a.00.00.04.43.1b.68.74.74.70.73.3a.2f.2f.31.32.37.2e.30.2e.30.2e.31.2f.62.6f.6f.74.2e.69.70.78.65.03.04.0a.00.00.01.01.04.ff.ff.fe.00.1a.02.05.78.0f.07.6f.76.6e.2e.6f.72.67.fc.13.68.74.74.70.73.3a.2f.2f.65.78.61.6d.70.6c.65.2e.6f.72.67.d2.09.2f.74.66.74.70.62.6f.6f.74.77.0f.03.6f.76.6e.03.6f.72.67.00.03.61.62.63.c0.00,pause)
+reg2[5] = put_dhcp_opts(offerip=10.0.0.4,router=10.0.0.1,netmask=255.255.254.0,mtu=1400,domain_name="ovn.org",wpad="https://example.org",bootfile_name="https://127.0.0.1/boot.ipxe",path_prefix="/tftpboot",domain_search_list="ovn.org,abc.ovn.org",netbios_name_server={10.0.0.7,10.0.0.8},netbios_node_type=2);
+    formats as reg2[5] = put_dhcp_opts(offerip = 10.0.0.4, router = 10.0.0.1, netmask = 255.255.254.0, mtu = 1400, domain_name = "ovn.org", wpad = "https://example.org", bootfile_name = "https://127.0.0.1/boot.ipxe", path_prefix = "/tftpboot", domain_search_list = "ovn.org,abc.ovn.org", netbios_name_server = {10.0.0.7, 10.0.0.8}, netbios_node_type = 2);
+    encodes as controller(userdata=00.00.00.02.00.00.00.00.00.01.de.10.00.00.00.25.0a.00.00.04.43.1b.68.74.74.70.73.3a.2f.2f.31.32.37.2e.30.2e.30.2e.31.2f.62.6f.6f.74.2e.69.70.78.65.03.04.0a.00.00.01.01.04.ff.ff.fe.00.1a.02.05.78.0f.07.6f.76.6e.2e.6f.72.67.fc.13.68.74.74.70.73.3a.2f.2f.65.78.61.6d.70.6c.65.2e.6f.72.67.d2.09.2f.74.66.74.70.62.6f.6f.74.77.0f.03.6f.76.6e.03.6f.72.67.00.03.61.62.63.c0.00.2c.08.0a.00.00.07.0a.00.00.08.2e.01.02,pause)
 reg2[5] = put_dhcp_opts(offerip=10.0.0.4,router=10.0.0.1,netmask=255.255.254.0,mtu=1400,domain_name="ovn.org",wpad="https://example.org",bootfile_name="https://127.0.0.1/boot.ipxe",path_prefix="/tftpboot",domain_search_list="ovn.org,abc.ovn.org,def.ovn.org,ovn.test,def.ovn.test,test.org,abc.com");
     formats as reg2[5] = put_dhcp_opts(offerip = 10.0.0.4, router = 10.0.0.1, netmask = 255.255.254.0, mtu = 1400, domain_name = "ovn.org", wpad = "https://example.org", bootfile_name = "https://127.0.0.1/boot.ipxe", path_prefix = "/tftpboot", domain_search_list = "ovn.org,abc.ovn.org,def.ovn.org,ovn.test,def.ovn.test,test.org,abc.com");
     encodes as controller(userdata=00.00.00.02.00.00.00.00.00.01.de.10.00.00.00.25.0a.00.00.04.43.1b.68.74.74.70.73.3a.2f.2f.31.32.37.2e.30.2e.30.2e.31.2f.62.6f.6f.74.2e.69.70.78.65.03.04.0a.00.00.01.01.04.ff.ff.fe.00.1a.02.05.78.0f.07.6f.76.6e.2e.6f.72.67.fc.13.68.74.74.70.73.3a.2f.2f.65.78.61.6d.70.6c.65.2e.6f.72.67.d2.09.2f.74.66.74.70.62.6f.6f.74.77.35.03.6f.76.6e.03.6f.72.67.00.03.61.62.63.c0.00.03.64.65.66.c0.00.03.6f.76.6e.04.74.65.73.74.00.03.64.65.66.c0.15.04.74.65.73.74.c0.04.03.61.62.63.03.63.6f.6d.00,pause)
@@ -13819,16 +13819,16 @@ ovn-nbctl acl-add ls1 to-lport 3 'ip4.src==10.0.0.1' allow
 ovn-nbctl --wait=hv sync
 
 # Check OVS flows, the less restrictive flows should have been installed.
-AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=45 | \
-    grep "priority=1003" | awk '{print $7 " " $8}' | \
+AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=45 | ofctl_strip_all | \
+    grep "priority=1003" | \
     sed 's/conjunction([[^)]]*)/conjunction()/g' | sort], [0], [dnl
-priority=1003,conj_id=2,ip,metadata=0x1 actions=resubmit(,46)
-priority=1003,conj_id=3,ip,metadata=0x1 actions=resubmit(,46)
-priority=1003,ip,metadata=0x1,nw_dst=10.0.0.3 actions=conjunction(),conjunction()
-priority=1003,ip,metadata=0x1,nw_dst=10.0.0.4 actions=conjunction(),conjunction()
-priority=1003,ip,metadata=0x1,nw_src=10.0.0.1 actions=resubmit(,46)
-priority=1003,ip,metadata=0x1,nw_src=10.0.0.2 actions=conjunction()
-priority=1003,ip,metadata=0x1,nw_src=10.0.0.42 actions=conjunction()
+ table=45, priority=1003,conj_id=2,ip,metadata=0x1 actions=resubmit(,46)
+ table=45, priority=1003,conj_id=3,ip,metadata=0x1 actions=resubmit(,46)
+ table=45, priority=1003,ip,metadata=0x1,nw_dst=10.0.0.3 actions=conjunction(),conjunction()
+ table=45, priority=1003,ip,metadata=0x1,nw_dst=10.0.0.4 actions=conjunction(),conjunction()
+ table=45, priority=1003,ip,metadata=0x1,nw_src=10.0.0.1 actions=resubmit(,46)
+ table=45, priority=1003,ip,metadata=0x1,nw_src=10.0.0.2 actions=conjunction()
+ table=45, priority=1003,ip,metadata=0x1,nw_src=10.0.0.42 actions=conjunction()
 ])
 
 # Traffic 10.0.0.1, 10.0.0.2 -> 10.0.0.3, 10.0.0.4 should be allowed.
@@ -13865,16 +13865,16 @@ ovn-nbctl acl-del ls1 to-lport 3 'ip4.src==10.0.0.1 || ip4.src==10.0.0.1'
 ovn-nbctl --wait=hv sync
 
 # Check OVS flows, the second less restrictive allow ACL should have been installed.
-AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=45 | \
-    grep "priority=1003" | awk '{print $7 " " $8}' | \
+AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=45 | ofctl_strip_all | \
+    grep "priority=1003" | \
     sed 's/conjunction([[^)]]*)/conjunction()/g' | sort], [0], [dnl
-priority=1003,conj_id=2,ip,metadata=0x1 actions=resubmit(,46)
-priority=1003,conj_id=3,ip,metadata=0x1 actions=resubmit(,46)
-priority=1003,ip,metadata=0x1,nw_dst=10.0.0.3 actions=conjunction(),conjunction()
-priority=1003,ip,metadata=0x1,nw_dst=10.0.0.4 actions=conjunction(),conjunction()
-priority=1003,ip,metadata=0x1,nw_src=10.0.0.1 actions=resubmit(,46)
-priority=1003,ip,metadata=0x1,nw_src=10.0.0.2 actions=conjunction()
-priority=1003,ip,metadata=0x1,nw_src=10.0.0.42 actions=conjunction()
+ table=45, priority=1003,conj_id=2,ip,metadata=0x1 actions=resubmit(,46)
+ table=45, priority=1003,conj_id=3,ip,metadata=0x1 actions=resubmit(,46)
+ table=45, priority=1003,ip,metadata=0x1,nw_dst=10.0.0.3 actions=conjunction(),conjunction()
+ table=45, priority=1003,ip,metadata=0x1,nw_dst=10.0.0.4 actions=conjunction(),conjunction()
+ table=45, priority=1003,ip,metadata=0x1,nw_src=10.0.0.1 actions=resubmit(,46)
+ table=45, priority=1003,ip,metadata=0x1,nw_src=10.0.0.2 actions=conjunction()
+ table=45, priority=1003,ip,metadata=0x1,nw_src=10.0.0.42 actions=conjunction()
 ])
 
 # Remove the less restrictive allow ACL.
@@ -13882,16 +13882,16 @@ ovn-nbctl acl-del ls1 to-lport 3 'ip4.src==10.0.0.1'
 ovn-nbctl --wait=hv sync
 
 # Check OVS flows, the 10.0.0.1 conjunction should have been reinstalled.
-AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=45 | \
-    grep "priority=1003" | awk '{print $7 " " $8}' | \
+AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=45 | ofctl_strip_all | \
+    grep "priority=1003" | \
     sed 's/conjunction([[^)]]*)/conjunction()/g' | sort], [0], [dnl
-priority=1003,conj_id=2,ip,metadata=0x1 actions=resubmit(,46)
-priority=1003,conj_id=3,ip,metadata=0x1 actions=resubmit(,46)
-priority=1003,ip,metadata=0x1,nw_dst=10.0.0.3 actions=conjunction(),conjunction()
-priority=1003,ip,metadata=0x1,nw_dst=10.0.0.4 actions=conjunction(),conjunction()
-priority=1003,ip,metadata=0x1,nw_src=10.0.0.1 actions=conjunction(),conjunction()
-priority=1003,ip,metadata=0x1,nw_src=10.0.0.2 actions=conjunction()
-priority=1003,ip,metadata=0x1,nw_src=10.0.0.42 actions=conjunction()
+ table=45, priority=1003,conj_id=2,ip,metadata=0x1 actions=resubmit(,46)
+ table=45, priority=1003,conj_id=3,ip,metadata=0x1 actions=resubmit(,46)
+ table=45, priority=1003,ip,metadata=0x1,nw_dst=10.0.0.3 actions=conjunction(),conjunction()
+ table=45, priority=1003,ip,metadata=0x1,nw_dst=10.0.0.4 actions=conjunction(),conjunction()
+ table=45, priority=1003,ip,metadata=0x1,nw_src=10.0.0.1 actions=conjunction(),conjunction()
+ table=45, priority=1003,ip,metadata=0x1,nw_src=10.0.0.2 actions=conjunction()
+ table=45, priority=1003,ip,metadata=0x1,nw_src=10.0.0.42 actions=conjunction()
 ])
 
 # Traffic 10.0.0.1, 10.0.0.2 -> 10.0.0.3, 10.0.0.4 should be allowed.
@@ -13921,16 +13921,16 @@ ovn-nbctl acl-add ls1 to-lport 3 'ip4.src==10.0.0.1' allow
 ovn-nbctl --wait=hv sync
 
 # Check OVS flows, the less restrictive flows should have been installed.
-AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=45 | \
-   grep "priority=1003" | awk '{print $7 " " $8}' | \
+AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=45 | ofctl_strip_all | \
+   grep "priority=1003" | \
    sed 's/conjunction([[^)]]*)/conjunction()/g' | sort], [0], [dnl
-priority=1003,conj_id=2,ip,metadata=0x1 actions=resubmit(,46)
-priority=1003,conj_id=3,ip,metadata=0x1 actions=resubmit(,46)
-priority=1003,ip,metadata=0x1,nw_dst=10.0.0.3 actions=conjunction(),conjunction()
-priority=1003,ip,metadata=0x1,nw_dst=10.0.0.4 actions=conjunction(),conjunction()
-priority=1003,ip,metadata=0x1,nw_src=10.0.0.1 actions=resubmit(,46)
-priority=1003,ip,metadata=0x1,nw_src=10.0.0.2 actions=conjunction()
-priority=1003,ip,metadata=0x1,nw_src=10.0.0.42 actions=conjunction()
+ table=45, priority=1003,conj_id=2,ip,metadata=0x1 actions=resubmit(,46)
+ table=45, priority=1003,conj_id=3,ip,metadata=0x1 actions=resubmit(,46)
+ table=45, priority=1003,ip,metadata=0x1,nw_dst=10.0.0.3 actions=conjunction(),conjunction()
+ table=45, priority=1003,ip,metadata=0x1,nw_dst=10.0.0.4 actions=conjunction(),conjunction()
+ table=45, priority=1003,ip,metadata=0x1,nw_src=10.0.0.1 actions=resubmit(,46)
+ table=45, priority=1003,ip,metadata=0x1,nw_src=10.0.0.2 actions=conjunction()
+ table=45, priority=1003,ip,metadata=0x1,nw_src=10.0.0.42 actions=conjunction()
 ])
 
 OVN_CLEANUP([hv1])
@@ -15962,6 +15962,33 @@ fffffffffffff0000000010108060001080006040001f00000000101ac1804c8000000000000ac18
 fffffffffffff0000000010108060001080006040001f00000000101ac1804dd000000000000ac1804dd
 ])
 
+# Now make sure that always_learn_from_arp_request=false is also honored
+# for locally injected mac bindings.
+check ovn-nbctl set logical_router lr0 options:always_learn_from_arp_request=false
+check ovn-nbctl set logical_router lr1 options:always_learn_from_arp_request=false
+check ovn-nbctl --wait=hv sync
+
+# Recreate two floating IPs, one for each VIF.
+check ovn-nbctl lr-nat-del lr0 dnat_and_snat 172.24.4.100
+check ovn-nbctl lr-nat-del lr1 dnat_and_snat 172.24.4.200
+
+check ovn-sbctl --all destroy mac_binding
+
+# Create a mac_binding entry on lr0-pub for 172.24.4.200 with a
+# wrong mac, expecting it to be updated with the real mac.
+lr0_dp=$(fetch_column Datapath_Binding _uuid external_ids:name=lr0)
+ovn-sbctl create mac_binding datapath=$lr0_dp logical_port=lr0-pub \
+    ip=172.24.4.200 mac=\"aa:aa:aa:aa:aa:aa\"
+
+check ovn-nbctl lr-nat-add lr0 dnat_and_snat 172.24.4.100 10.0.0.10
+check ovn-nbctl lr-nat-add lr1 dnat_and_snat 172.24.4.200 20.0.0.10
+check ovn-nbctl --wait=hv sync
+
+check_row_count MAC_Binding 1 logical_port=lr0-pub ip=172.24.4.200
+check_row_count MAC_Binding 0 logical_port=lr1-pub ip=172.24.4.100
+check_column "f0:00:00:00:01:01" MAC_Binding mac logical_port=lr0-pub \
+                                                 ip=172.24.4.200
+
 OVN_CLEANUP([hv1])
 AT_CLEANUP
 
@@ -16481,7 +16508,7 @@ ovn-nbctl --wait=hv sync
 ovn-sbctl dump-flows sw0 > sw0-flows
 AT_CAPTURE_FILE([sw0-flows])
 
-AT_CHECK([grep ls_in_arp_rsp sw0-flows | grep bind_vport | sed 's/table=../table=??/'], [0], [dnl
+AT_CHECK([grep ls_in_arp_rsp sw0-flows | grep bind_vport | sed 's/table=../table=??/' | sort], [0], [dnl
   table=??(ls_in_arp_rsp      ), priority=100  , match=(inport == "sw0-p1" && ((arp.op == 1 && arp.spa == 10.0.0.10 && arp.tpa == 10.0.0.10) || (arp.op == 2 && arp.spa == 10.0.0.10))), action=(bind_vport("sw0-vir", inport); next;)
   table=??(ls_in_arp_rsp      ), priority=100  , match=(inport == "sw0-p2" && ((arp.op == 1 && arp.spa == 10.0.0.10 && arp.tpa == 10.0.0.10) || (arp.op == 2 && arp.spa == 10.0.0.10))), action=(bind_vport("sw0-vir", inport); next;)
   table=??(ls_in_arp_rsp      ), priority=100  , match=(inport == "sw0-p3" && ((arp.op == 1 && arp.spa == 10.0.0.10 && arp.tpa == 10.0.0.10) || (arp.op == 2 && arp.spa == 10.0.0.10))), action=(bind_vport("sw0-vir", inport); next;)
@@ -19562,7 +19589,7 @@ AT_CHECK(
 
 AT_CAPTURE_FILE([sbflows4])
 ovn-sbctl dump-flows lr0 > sbflows4
-AT_CHECK([grep lr_in_dnat sbflows4 | grep priority=120 | sed 's/table=..//'], [0], [dnl
+AT_CHECK([grep lr_in_dnat sbflows4 | grep priority=120 | sed 's/table=..//' | sort], [0], [dnl
   (lr_in_dnat         ), priority=120  , match=(ct.est && ip && ip4.dst == 10.0.0.10 && tcp && tcp.dst == 80 && is_chassis_resident("cr-lr0-public")), action=(ct_dnat;)
   (lr_in_dnat         ), priority=120  , match=(ct.new && ip && ip4.dst == 10.0.0.10 && tcp && tcp.dst == 80 && is_chassis_resident("cr-lr0-public")), action=(drop;)
 ])
@@ -21129,31 +21156,31 @@ AT_CHECK([
 
 AT_CHECK([ovn-sbctl lflow-list | grep -E "lr_in_policy.*priority=1001" | sort], [0], [dnl
   table=12(lr_in_policy       ), priority=1001 , dnl
-match=(ip6), action=(pkt.mark = 4294967295; next;)
+match=(ip6), action=(pkt.mark = 4294967295; reg8[[0..15]] = 0; next;)
 ])
 
 ovn-nbctl --wait=hv set logical_router_policy $pol5 options:pkt_mark=-1
 AT_CHECK([ovn-sbctl lflow-list | grep -E "lr_in_policy.*priority=1001" | sort], [0], [dnl
   table=12(lr_in_policy       ), priority=1001 , dnl
-match=(ip6), action=(next;)
+match=(ip6), action=(reg8[[0..15]] = 0; next;)
 ])
 
 ovn-nbctl --wait=hv set logical_router_policy $pol5 options:pkt_mark=2147483648
 AT_CHECK([ovn-sbctl lflow-list | grep -E "lr_in_policy.*priority=1001" | sort], [0], [dnl
   table=12(lr_in_policy       ), priority=1001 , dnl
-match=(ip6), action=(pkt.mark = 2147483648; next;)
+match=(ip6), action=(pkt.mark = 2147483648; reg8[[0..15]] = 0; next;)
 ])
 
 ovn-nbctl --wait=hv set logical_router_policy $pol5 options:pkt_mark=foo
 AT_CHECK([ovn-sbctl lflow-list | grep -E "lr_in_policy.*priority=1001" | sort], [0], [dnl
   table=12(lr_in_policy       ), priority=1001 , dnl
-match=(ip6), action=(next;)
+match=(ip6), action=(reg8[[0..15]] = 0; next;)
 ])
 
 ovn-nbctl --wait=hv set logical_router_policy $pol5 options:pkt_mark=4294967296
 AT_CHECK([ovn-sbctl lflow-list | grep -E "lr_in_policy.*priority=1001" | sort], [0], [dnl
   table=12(lr_in_policy       ), priority=1001 , dnl
-match=(ip6), action=(next;)
+match=(ip6), action=(reg8[[0..15]] = 0; next;)
 ])
 
 OVN_CLEANUP([hv1])
@@ -21732,7 +21759,7 @@ AT_CHECK([
     grep "ct(commit,zone=NXM_NX_REG11\\[[0..15\\]],exec(move:NXM_OF_ETH_SRC\\[[\\]]->NXM_NX_CT_LABEL\\[[32..79\\]],load:0x[[0-9]]->NXM_NX_CT_LABEL\\[[80..95\\]]))" -c)
 ])
 AT_CHECK([
-    test 1 -eq $(as hv1 ovs-ofctl dump-flows br-int table=21 | \
+    test 1 -eq $(as hv1 ovs-ofctl dump-flows br-int table=22 | \
     grep "priority=200" | \
     grep "actions=move:NXM_NX_CT_LABEL\\[[32..79\\]]->NXM_OF_ETH_DST\\[[\\]]" -c)
 ])
@@ -21743,7 +21770,7 @@ AT_CHECK([
     grep "ct(commit,zone=NXM_NX_REG11\\[[0..15\\]],exec(move:NXM_OF_ETH_SRC\\[[\\]]->NXM_NX_CT_LABEL\\[[32..79\\]],load:0x[[0-9]]->NXM_NX_CT_LABEL\\[[80..95\\]]))" -c)
 ])
 AT_CHECK([
-    test 0 -eq $(as hv2 ovs-ofctl dump-flows br-int table=21 | \
+    test 0 -eq $(as hv2 ovs-ofctl dump-flows br-int table=22 | \
     grep "priority=200" | \
     grep "actions=move:NXM_NX_CT_LABEL\\[[32..79\\]]->NXM_OF_ETH_DST\\[[\\]]" -c)
 ])
@@ -22032,6 +22059,78 @@ OVS_WAIT_UNTIL([test x$(as hv1 ovn-appctl -t ovn-controller debug/status) = "xru
 OVN_CLEANUP([hv1])
 AT_CLEANUP
 
+AT_SETUP([ovn -- Multiple OVS port changes Incremental Processing])
+ovn_start
+
+net_add n1
+sim_add hv1
+as hv1
+ovs-vsctl add-br br-phys
+ovn_attach n1 br-phys 192.168.0.10
+
+check ovn-nbctl ls-add sw
+check ovn-nbctl lsp-add sw lsp1
+check ovn-nbctl lsp-add sw lsp2
+
+as hv1
+ovs-vsctl \
+    -- add-port br-int vif1 \
+    -- set Interface vif1 external_ids:iface-id=lsp1 \
+    ofport-request=1
+ovs-vsctl \
+    -- add-port br-int vif2 \
+    -- set Interface vif2 external_ids:iface-id=lsp2 \
+    ofport-request=2
+
+# Wait for ports to be bound.
+wait_row_count Chassis 1 name=hv1
+ch=$(fetch_column Chassis _uuid name=hv1)
+wait_row_count Port_Binding 1 logical_port=lsp1 chassis=$ch
+wait_row_count Port_Binding 1 logical_port=lsp2 chassis=$ch
+
+AS_BOX([check output flows for initial interfaces])
+as hv1 ovs-ofctl dump-flows br-int table=65 > offlows_table65.txt
+AT_CAPTURE_FILE([offlows_table65.txt])
+AT_CHECK_UNQUOTED([grep -c "output:1" offlows_table65.txt], [0], [dnl
+1
+])
+AT_CHECK_UNQUOTED([grep -c "output:2" offlows_table65.txt], [0], [dnl
+1
+])
+
+AS_BOX([delete and add OVS interfaces and force batch of updates])
+as hv1 ovn-appctl -t ovn-controller debug/pause
+
+as hv1
+ovs-vsctl \
+    -- del-port vif1 \
+    -- del-port vif2
+
+as hv1
+ovs-vsctl \
+    -- add-port br-int vif1 \
+    -- set Interface vif1 external_ids:iface-id=lsp1 \
+    ofport-request=3 \
+    -- add-port br-int vif2 \
+    -- set Interface vif2 external_ids:iface-id=lsp2 \
+    ofport-request=4
+
+as hv1 ovn-appctl -t ovn-controller debug/resume
+check ovn-nbctl --wait=hv sync
+
+AS_BOX([check output flows for new interfaces])
+as hv1 ovs-ofctl dump-flows br-int table=65 > offlows_table65_2.txt
+AT_CAPTURE_FILE([offlows_table65_2.txt])
+AT_CHECK_UNQUOTED([grep -c "output:3" offlows_table65_2.txt], [0], [dnl
+1
+])
+AT_CHECK_UNQUOTED([grep -c "output:4" offlows_table65_2.txt], [0], [dnl
+1
+])
+
+OVN_CLEANUP([hv1])
+AT_CLEANUP
+
 # Test dropping traffic destined to router owned IPs.
 AT_SETUP([ovn -- gateway router drop traffic for own IPs])
 ovn_start
@@ -22109,7 +22208,7 @@ AT_CHECK([as hv1 ovs-ofctl dump-flows br-int | grep "actions=controller" | grep 
 ])
 
 # The packet should've been dropped in the lr_in_arp_resolve stage.
-AT_CHECK([as hv1 ovs-ofctl dump-flows br-int | grep -E "table=21, n_packets=1,.* priority=1,ip,metadata=0x${sw_key},nw_dst=10.0.1.1 actions=drop" -c], [0], [dnl
+AT_CHECK([as hv1 ovs-ofctl dump-flows br-int | grep -E "table=22, n_packets=1,.* priority=1,ip,metadata=0x${sw_key},nw_dst=10.0.1.1 actions=drop" -c], [0], [dnl
 1
 ])
 
@@ -22908,7 +23007,7 @@ OVS_WAIT_UNTIL(
 )
 
 AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=68 | grep -v NXST | cut -d ' ' -f8-], [0], [dnl
-priority=100,tcp,metadata=0x1,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
 ])
 
 AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=69 | grep -v NXST | cut -d ' ' -f8-], [0], [dnl
@@ -22938,9 +23037,9 @@ OVS_WAIT_UNTIL(
 )
 
 AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=68 | grep -v NXST | cut -d ' ' -f8- | sort], [0], [dnl
-priority=100,tcp,metadata=0x1,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,tcp,metadata=0x1,nw_src=42.42.42.42,nw_dst=42.42.42.42,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,tcp,metadata=0x1,nw_src=52.52.52.52,nw_dst=52.52.52.52,tp_dst=4042 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=42.42.42.42,nw_dst=42.42.42.42,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=52.52.52.52,nw_dst=52.52.52.52,tp_dst=4042 actions=load:0x1->NXM_NX_REG10[[7]]
 ])
 
 AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=69 | grep -v NXST | cut -d ' ' -f8- | sort], [0], [dnl
@@ -22975,9 +23074,9 @@ OVS_WAIT_UNTIL(
 )
 
 AT_CHECK([as hv2 ovs-ofctl dump-flows br-int table=68 | grep -v NXST | cut -d ' ' -f8- | sort], [0], [dnl
-priority=100,tcp,metadata=0x1,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,tcp,metadata=0x1,nw_src=42.42.42.42,nw_dst=42.42.42.42,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,tcp,metadata=0x1,nw_src=52.52.52.52,nw_dst=52.52.52.52,tp_dst=4042 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=42.42.42.42,nw_dst=42.42.42.42,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=52.52.52.52,nw_dst=52.52.52.52,tp_dst=4042 actions=load:0x1->NXM_NX_REG10[[7]]
 ])
 
 AT_CHECK([as hv2 ovs-ofctl dump-flows br-int table=69 | grep -v NXST | cut -d ' ' -f8- | sort], [0], [dnl
@@ -23002,10 +23101,10 @@ OVS_WAIT_UNTIL(
 )
 
 AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=68 | grep -v NXST | cut -d ' ' -f8- | sort], [0], [dnl
-priority=100,tcp,metadata=0x1,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,tcp,metadata=0x1,nw_src=42.42.42.42,nw_dst=42.42.42.42,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,tcp,metadata=0x1,nw_src=52.52.52.52,nw_dst=52.52.52.52,tp_dst=4042 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,udp,metadata=0x1,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=42.42.42.42,nw_dst=42.42.42.42,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=52.52.52.52,nw_dst=52.52.52.52,tp_dst=4042 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,udp,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
 ])
 
 AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=69 | grep -v NXST | cut -d ' ' -f8- | sort], [0], [dnl
@@ -23015,16 +23114,16 @@ priority=100,tcp,metadata=0x1,nw_src=52.52.52.52,nw_dst=88.88.88.90,tp_src=4042 
 priority=100,udp,metadata=0x1,nw_src=42.42.42.1,nw_dst=88.88.88.88,tp_src=2021 actions=load:0x1->NXM_NX_REG10[[7]]
 ])
 
-AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=70 | grep -v NXST | cut -d ' ' -f8-], [0], [dnl
+AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=70 | grep -v NXST | cut -d ' ' -f8- | sort], [0], [dnl
 priority=100,ct_state=+trk+dnat,ct_nw_dst=88.88.88.88,ip,metadata=0x1 actions=ct(commit,zone=NXM_NX_REG12[[0..15]],nat(src=88.88.88.88))
 priority=100,ct_state=+trk+dnat,ct_nw_dst=88.88.88.90,ip,metadata=0x1 actions=ct(commit,zone=NXM_NX_REG12[[0..15]],nat(src=88.88.88.90))
 ])
 
 AT_CHECK([as hv2 ovs-ofctl dump-flows br-int table=68 | grep -v NXST | cut -d ' ' -f8- | sort], [0], [dnl
-priority=100,tcp,metadata=0x1,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,tcp,metadata=0x1,nw_src=42.42.42.42,nw_dst=42.42.42.42,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,tcp,metadata=0x1,nw_src=52.52.52.52,nw_dst=52.52.52.52,tp_dst=4042 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,udp,metadata=0x1,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=42.42.42.42,nw_dst=42.42.42.42,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=52.52.52.52,nw_dst=52.52.52.52,tp_dst=4042 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,udp,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
 ])
 
 AT_CHECK([as hv2 ovs-ofctl dump-flows br-int table=69 | grep -v NXST | cut -d ' ' -f8- | sort], [0], [dnl
@@ -23034,7 +23133,7 @@ priority=100,tcp,metadata=0x1,nw_src=52.52.52.52,nw_dst=88.88.88.90,tp_src=4042 
 priority=100,udp,metadata=0x1,nw_src=42.42.42.1,nw_dst=88.88.88.88,tp_src=2021 actions=load:0x1->NXM_NX_REG10[[7]]
 ])
 
-AT_CHECK([as hv2 ovs-ofctl dump-flows br-int table=70 | grep -v NXST | cut -d ' ' -f8-], [0], [dnl
+AT_CHECK([as hv2 ovs-ofctl dump-flows br-int table=70 | grep -v NXST | cut -d ' ' -f8- | sort], [0], [dnl
 priority=100,ct_state=+trk+dnat,ct_nw_dst=88.88.88.88,ip,metadata=0x1 actions=ct(commit,zone=NXM_NX_REG12[[0..15]],nat(src=88.88.88.88))
 priority=100,ct_state=+trk+dnat,ct_nw_dst=88.88.88.90,ip,metadata=0x1 actions=ct(commit,zone=NXM_NX_REG12[[0..15]],nat(src=88.88.88.90))
 ])
@@ -23050,11 +23149,11 @@ OVS_WAIT_UNTIL(
 )
 
 AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=68 | grep -v NXST | cut -d ' ' -f8- | sort], [0], [dnl
-priority=100,tcp,metadata=0x1,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,tcp,metadata=0x1,nw_src=42.42.42.42,nw_dst=42.42.42.42,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,tcp,metadata=0x1,nw_src=52.52.52.52,nw_dst=52.52.52.52,tp_dst=4042 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,tcp6,metadata=0x1,ipv6_src=4200::1,ipv6_dst=4200::1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,udp,metadata=0x1,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=42.42.42.42,nw_dst=42.42.42.42,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=52.52.52.52,nw_dst=52.52.52.52,tp_dst=4042 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp6,ipv6_src=4200::1,ipv6_dst=4200::1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,udp,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
 ])
 
 AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=69 | grep -v NXST | cut -d ' ' -f8- | sort], [0], [dnl
@@ -23072,11 +23171,11 @@ priority=100,ct_state=+trk+dnat,ct_nw_dst=88.88.88.90,ip,metadata=0x1 actions=ct
 ])
 
 AT_CHECK([as hv2 ovs-ofctl dump-flows br-int table=68 | grep -v NXST | cut -d ' ' -f8- | sort], [0], [dnl
-priority=100,tcp,metadata=0x1,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,tcp,metadata=0x1,nw_src=42.42.42.42,nw_dst=42.42.42.42,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,tcp,metadata=0x1,nw_src=52.52.52.52,nw_dst=52.52.52.52,tp_dst=4042 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,tcp6,metadata=0x1,ipv6_src=4200::1,ipv6_dst=4200::1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,udp,metadata=0x1,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=42.42.42.42,nw_dst=42.42.42.42,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=52.52.52.52,nw_dst=52.52.52.52,tp_dst=4042 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp6,ipv6_src=4200::1,ipv6_dst=4200::1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,udp,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
 ])
 
 AT_CHECK([as hv2 ovs-ofctl dump-flows br-int table=69 | grep -v NXST | cut -d ' ' -f8- | sort], [0], [dnl
@@ -23104,12 +23203,12 @@ OVS_WAIT_UNTIL(
 )
 
 AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=68 | grep -v NXST | cut -d ' ' -f8- | sort], [0], [dnl
-priority=100,tcp,metadata=0x1,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,tcp,metadata=0x1,nw_src=42.42.42.42,nw_dst=42.42.42.42,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,tcp,metadata=0x1,nw_src=52.52.52.52,nw_dst=52.52.52.52,tp_dst=4042 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,tcp6,metadata=0x1,ipv6_src=4200::1,ipv6_dst=4200::1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,udp,metadata=0x1,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,udp6,metadata=0x1,ipv6_src=4200::1,ipv6_dst=4200::1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=42.42.42.42,nw_dst=42.42.42.42,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=52.52.52.52,nw_dst=52.52.52.52,tp_dst=4042 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp6,ipv6_src=4200::1,ipv6_dst=4200::1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,udp,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,udp6,ipv6_src=4200::1,ipv6_dst=4200::1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
 ])
 
 AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=69 | grep -v NXST | cut -d ' ' -f8- | sort], [0], [dnl
@@ -23128,12 +23227,12 @@ priority=100,ct_state=+trk+dnat,ct_nw_dst=88.88.88.90,ip,metadata=0x1 actions=ct
 ])
 
 AT_CHECK([as hv2 ovs-ofctl dump-flows br-int table=68 | grep -v NXST | cut -d ' ' -f8- | sort], [0], [dnl
-priority=100,tcp,metadata=0x1,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,tcp,metadata=0x1,nw_src=42.42.42.42,nw_dst=42.42.42.42,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,tcp,metadata=0x1,nw_src=52.52.52.52,nw_dst=52.52.52.52,tp_dst=4042 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,tcp6,metadata=0x1,ipv6_src=4200::1,ipv6_dst=4200::1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,udp,metadata=0x1,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,udp6,metadata=0x1,ipv6_src=4200::1,ipv6_dst=4200::1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=42.42.42.42,nw_dst=42.42.42.42,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=52.52.52.52,nw_dst=52.52.52.52,tp_dst=4042 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp6,ipv6_src=4200::1,ipv6_dst=4200::1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,udp,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,udp6,ipv6_src=4200::1,ipv6_dst=4200::1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
 ])
 
 AT_CHECK([as hv2 ovs-ofctl dump-flows br-int table=69 | grep -v NXST | cut -d ' ' -f8- | sort], [0], [dnl
@@ -23153,22 +23252,23 @@ priority=100,ct_state=+trk+dnat,ct_nw_dst=88.88.88.90,ip,metadata=0x1 actions=ct
 
 check ovn-nbctl --wait=hv ls-lb-add sw1 lb-ipv6-udp
 
+# Number of hairpin flows shouldn't change as it doesn't depend on how many
+# datapaths the LB is applied.
 OVS_WAIT_UNTIL(
-    [test $(as hv1 ovs-ofctl dump-flows br-int table=68 | grep -v NXST | wc -l) -eq 7]
+    [test $(as hv1 ovs-ofctl dump-flows br-int table=68 | grep -v NXST | wc -l) -eq 6]
 )
 
 OVS_WAIT_UNTIL(
-    [test $(as hv2 ovs-ofctl dump-flows br-int table=68 | grep -v NXST | wc -l) -eq 7]
+    [test $(as hv2 ovs-ofctl dump-flows br-int table=68 | grep -v NXST | wc -l) -eq 6]
 )
 
 AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=68 | grep -v NXST | cut -d ' ' -f8- | sort], [0], [dnl
-priority=100,tcp,metadata=0x1,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,tcp,metadata=0x1,nw_src=42.42.42.42,nw_dst=42.42.42.42,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,tcp,metadata=0x1,nw_src=52.52.52.52,nw_dst=52.52.52.52,tp_dst=4042 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,tcp6,metadata=0x1,ipv6_src=4200::1,ipv6_dst=4200::1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,udp,metadata=0x1,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,udp6,metadata=0x1,ipv6_src=4200::1,ipv6_dst=4200::1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,udp6,metadata=0x2,ipv6_src=4200::1,ipv6_dst=4200::1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=42.42.42.42,nw_dst=42.42.42.42,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=52.52.52.52,nw_dst=52.52.52.52,tp_dst=4042 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp6,ipv6_src=4200::1,ipv6_dst=4200::1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,udp,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,udp6,ipv6_src=4200::1,ipv6_dst=4200::1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
 ])
 
 AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=69 | grep -v NXST | cut -d ' ' -f8- | sort], [0], [dnl
@@ -23189,13 +23289,12 @@ priority=100,ct_state=+trk+dnat,ct_nw_dst=88.88.88.90,ip,metadata=0x1 actions=ct
 ])
 
 AT_CHECK([as hv2 ovs-ofctl dump-flows br-int table=68 | grep -v NXST | cut -d ' ' -f8- | sort], [0], [dnl
-priority=100,tcp,metadata=0x1,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,tcp,metadata=0x1,nw_src=42.42.42.42,nw_dst=42.42.42.42,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,tcp,metadata=0x1,nw_src=52.52.52.52,nw_dst=52.52.52.52,tp_dst=4042 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,tcp6,metadata=0x1,ipv6_src=4200::1,ipv6_dst=4200::1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,udp,metadata=0x1,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,udp6,metadata=0x1,ipv6_src=4200::1,ipv6_dst=4200::1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,udp6,metadata=0x2,ipv6_src=4200::1,ipv6_dst=4200::1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=42.42.42.42,nw_dst=42.42.42.42,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp,nw_src=52.52.52.52,nw_dst=52.52.52.52,tp_dst=4042 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp6,ipv6_src=4200::1,ipv6_dst=4200::1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,udp,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,udp6,ipv6_src=4200::1,ipv6_dst=4200::1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
 ])
 
 AT_CHECK([as hv2 ovs-ofctl dump-flows br-int table=69 | grep -v NXST | cut -d ' ' -f8- | sort], [0], [dnl
@@ -23234,13 +23333,13 @@ OVS_WAIT_UNTIL(
 )
 
 OVS_WAIT_UNTIL(
-    [test $(as hv1 ovs-ofctl dump-flows br-int table=68 | grep -v NXST | wc -l) -eq 7]
+    [test $(as hv1 ovs-ofctl dump-flows br-int table=68 | grep -v NXST | wc -l) -eq 6]
 )
 
 check ovn-nbctl --wait=hv lb-del lb-ipv4-tcp
 
 OVS_WAIT_UNTIL(
-    [test $(as hv1 ovs-ofctl dump-flows br-int table=68 | grep -v NXST | wc -l) -eq 4]
+    [test $(as hv1 ovs-ofctl dump-flows br-int table=68 | grep -v NXST | wc -l) -eq 3]
 )
 
 OVS_WAIT_UNTIL(
@@ -23248,10 +23347,9 @@ OVS_WAIT_UNTIL(
 )
 
 AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=68 | grep -v NXST | cut -d ' ' -f8- | sort], [0], [dnl
-priority=100,tcp6,metadata=0x1,ipv6_src=4200::1,ipv6_dst=4200::1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,udp,metadata=0x1,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,udp6,metadata=0x1,ipv6_src=4200::1,ipv6_dst=4200::1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
-priority=100,udp6,metadata=0x2,ipv6_src=4200::1,ipv6_dst=4200::1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,tcp6,ipv6_src=4200::1,ipv6_dst=4200::1,tp_dst=4041 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,udp,nw_src=42.42.42.1,nw_dst=42.42.42.1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
+priority=100,ct_label=0x2/0x2,udp6,ipv6_src=4200::1,ipv6_dst=4200::1,tp_dst=2021 actions=load:0x1->NXM_NX_REG10[[7]]
 ])
 
 AT_CHECK([as hv1 ovs-ofctl dump-flows br-int table=69 | grep -v NXST | cut -d ' ' -f8- | sort], [0], [dnl

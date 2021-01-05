@@ -25,6 +25,7 @@
 #include "openvswitch/dynamic-string.h"
 #include "fatal-signal.h"
 #include "hash.h"
+#include "hmapx.h"
 #include "openvswitch/hmap.h"
 #include "openvswitch/json.h"
 #include "ovn/lex.h"
@@ -187,11 +188,12 @@ enum ovn_stage {
     PIPELINE_STAGE(ROUTER, IN,  IP_ROUTING,      10, "lr_in_ip_routing")   \
     PIPELINE_STAGE(ROUTER, IN,  IP_ROUTING_ECMP, 11, "lr_in_ip_routing_ecmp") \
     PIPELINE_STAGE(ROUTER, IN,  POLICY,          12, "lr_in_policy")       \
-    PIPELINE_STAGE(ROUTER, IN,  ARP_RESOLVE,     13, "lr_in_arp_resolve")  \
-    PIPELINE_STAGE(ROUTER, IN,  CHK_PKT_LEN   ,  14, "lr_in_chk_pkt_len")   \
-    PIPELINE_STAGE(ROUTER, IN,  LARGER_PKTS,     15,"lr_in_larger_pkts")   \
-    PIPELINE_STAGE(ROUTER, IN,  GW_REDIRECT,     16, "lr_in_gw_redirect")  \
-    PIPELINE_STAGE(ROUTER, IN,  ARP_REQUEST,     17, "lr_in_arp_request")  \
+    PIPELINE_STAGE(ROUTER, IN,  POLICY_ECMP,     13, "lr_in_policy_ecmp")  \
+    PIPELINE_STAGE(ROUTER, IN,  ARP_RESOLVE,     14, "lr_in_arp_resolve")  \
+    PIPELINE_STAGE(ROUTER, IN,  CHK_PKT_LEN   ,  15, "lr_in_chk_pkt_len")  \
+    PIPELINE_STAGE(ROUTER, IN,  LARGER_PKTS,     16, "lr_in_larger_pkts")  \
+    PIPELINE_STAGE(ROUTER, IN,  GW_REDIRECT,     17, "lr_in_gw_redirect")  \
+    PIPELINE_STAGE(ROUTER, IN,  ARP_REQUEST,     18, "lr_in_arp_request")  \
                                                                       \
     /* Logical router egress stages. */                               \
     PIPELINE_STAGE(ROUTER, OUT, UNDNAT,    0, "lr_out_undnat")        \
@@ -1188,6 +1190,13 @@ ovn_datapath_update_external_ids(struct ovn_datapath *od)
                                            "snat-ct-zone", -1);
         if (nat_default_ct >= 0) {
             smap_add_format(&ids, "snat-ct-zone", "%d", nat_default_ct);
+        }
+
+        bool learn_from_arp_request =
+            smap_get_bool(&od->nbr->options, "always_learn_from_arp_request",
+                          true);
+        if (!learn_from_arp_request) {
+            smap_add(&ids, "always_learn_from_arp_request", "false");
         }
     }
 
@@ -3428,12 +3437,12 @@ ovn_lb_svc_create(struct northd_context *ctx, struct ovn_northd_lb *lb,
 }
 
 static
-void build_lb_vip_ct_lb_actions(struct ovn_lb_vip *lb_vip,
-                                struct ovn_northd_lb_vip *lb_vip_nb,
-                                struct ds *action,
-                                char *selection_fields)
+void build_lb_vip_actions(struct ovn_lb_vip *lb_vip,
+                          struct ovn_northd_lb_vip *lb_vip_nb,
+                          struct ds *action, char *selection_fields,
+                          bool ls_dp)
 {
-    bool skip_hash_fields = false;
+    bool skip_hash_fields = false, reject = false;
 
     if (lb_vip_nb->lb_health_check) {
         ds_put_cstr(action, "ct_lb(backends=");
@@ -3455,18 +3464,30 @@ void build_lb_vip_ct_lb_actions(struct ovn_lb_vip *lb_vip,
         }
 
         if (!n_active_backends) {
-            skip_hash_fields = true;
-            ds_clear(action);
-            ds_put_cstr(action, "drop;");
+            if (!lb_vip->empty_backend_rej) {
+                ds_clear(action);
+                ds_put_cstr(action, "drop;");
+                skip_hash_fields = true;
+            } else {
+                reject = true;
+            }
         } else {
             ds_chomp(action, ',');
             ds_put_cstr(action, ");");
         }
+    } else if (lb_vip->empty_backend_rej && !lb_vip->n_backends) {
+        reject = true;
     } else {
         ds_put_format(action, "ct_lb(backends=%s);", lb_vip_nb->backend_ips);
     }
 
-    if (!skip_hash_fields && selection_fields && selection_fields[0]) {
+    if (reject) {
+        int stage = ls_dp ? ovn_stage_get_table(S_SWITCH_OUT_QOS_MARK)
+                          : ovn_stage_get_table(S_ROUTER_OUT_SNAT);
+        ds_clear(action);
+        ds_put_format(action, "reg0 = 0; reject { outport <-> inport; "
+                      "next(pipeline=egress,table=%d);};", stage);
+    } else if (!skip_hash_fields && selection_fields && selection_fields[0]) {
         ds_chomp(action, ';');
         ds_chomp(action, ')');
         ds_put_format(action, "; hash_fields=\"%s\");", selection_fields);
@@ -3735,6 +3756,9 @@ build_ports(struct northd_context *ctx,
     sset_destroy(&active_ha_chassis_grps);
 }
 
+/* XXX: The 'ovn_lflow_add_unique*()' functions should be used for logical
+ *      flows using a multicast group.
+ *      See the comment on 'ovn_lflow_add_unique()' for details. */
 struct multicast_group {
     const char *name;
     uint16_t key;               /* OVN_MIN_MULTICAST...OVN_MAX_MULTICAST. */
@@ -4086,7 +4110,8 @@ ovn_igmp_group_destroy(struct hmap *igmp_groups,
 struct ovn_lflow {
     struct hmap_node hmap_node;
 
-    struct ovn_datapath *od;
+    struct ovn_datapath *od;     /* 'logical_datapath' in SB schema.  */
+    struct hmapx od_group;       /* Hash map of 'struct ovn_datapath *'. */
     enum ovn_stage stage;
     uint16_t priority;
     char *match;
@@ -4095,11 +4120,15 @@ struct ovn_lflow {
     const char *where;
 };
 
-static size_t
+static void ovn_lflow_destroy(struct hmap *lflows, struct ovn_lflow *lflow);
+static struct ovn_lflow * ovn_lflow_find_by_lflow(const struct hmap *,
+                                                  const struct ovn_lflow *,
+                                                  uint32_t hash);
+
+static uint32_t
 ovn_lflow_hash(const struct ovn_lflow *lflow)
 {
-    return ovn_logical_flow_hash(&lflow->od->sb->header_.uuid,
-                                 ovn_stage_get_table(lflow->stage),
+    return ovn_logical_flow_hash(ovn_stage_get_table(lflow->stage),
                                  ovn_stage_get_pipeline_name(lflow->stage),
                                  lflow->priority, lflow->match,
                                  lflow->actions);
@@ -4130,6 +4159,7 @@ ovn_lflow_init(struct ovn_lflow *lflow, struct ovn_datapath *od,
                char *match, char *actions, char *stage_hint,
                const char *where)
 {
+    hmapx_init(&lflow->od_group);
     lflow->od = od;
     lflow->stage = stage;
     lflow->priority = priority;
@@ -4139,31 +4169,72 @@ ovn_lflow_init(struct ovn_lflow *lflow, struct ovn_datapath *od,
     lflow->where = where;
 }
 
+/* If this option is 'true' northd will combine logical flows that differs by
+ * logical datapath only by creating a datapah group. */
+static bool use_logical_dp_groups = false;
+
 /* Adds a row with the specified contents to the Logical_Flow table. */
 static void
 ovn_lflow_add_at(struct hmap *lflow_map, struct ovn_datapath *od,
                  enum ovn_stage stage, uint16_t priority,
-                 const char *match, const char *actions,
+                 const char *match, const char *actions, bool shared,
                  const struct ovsdb_idl_row *stage_hint, const char *where)
 {
     ovs_assert(ovn_stage_to_datapath_type(stage) == ovn_datapath_get_type(od));
 
-    struct ovn_lflow *lflow = xmalloc(sizeof *lflow);
-    ovn_lflow_init(lflow, od, stage, priority,
+    struct ovn_lflow *old_lflow, *lflow;
+    uint32_t hash;
+
+    lflow = xmalloc(sizeof *lflow);
+    /* While adding new logical flows we're not setting single datapath, but
+     * collecting a group.  'od' will be updated later for all flows with only
+     * one datapath in a group, so it could be hashed correctly. */
+    ovn_lflow_init(lflow, NULL, stage, priority,
                    xstrdup(match), xstrdup(actions),
                    ovn_lflow_hint(stage_hint), where);
-    hmap_insert(lflow_map, &lflow->hmap_node, ovn_lflow_hash(lflow));
+
+    hash = ovn_lflow_hash(lflow);
+    if (shared && use_logical_dp_groups) {
+        old_lflow = ovn_lflow_find_by_lflow(lflow_map, lflow, hash);
+        if (old_lflow) {
+            ovn_lflow_destroy(NULL, lflow);
+            hmapx_add(&old_lflow->od_group, od);
+            return;
+        }
+    }
+
+    hmapx_add(&lflow->od_group, od);
+    hmap_insert(lflow_map, &lflow->hmap_node, hash);
 }
 
 /* Adds a row with the specified contents to the Logical_Flow table. */
 #define ovn_lflow_add_with_hint(LFLOW_MAP, OD, STAGE, PRIORITY, MATCH, \
                                 ACTIONS, STAGE_HINT) \
-    ovn_lflow_add_at(LFLOW_MAP, OD, STAGE, PRIORITY, MATCH, ACTIONS, \
+    ovn_lflow_add_at(LFLOW_MAP, OD, STAGE, PRIORITY, MATCH, ACTIONS, true, \
                      STAGE_HINT, OVS_SOURCE_LOCATOR)
 
 #define ovn_lflow_add(LFLOW_MAP, OD, STAGE, PRIORITY, MATCH, ACTIONS) \
-    ovn_lflow_add_with_hint(LFLOW_MAP, OD, STAGE, PRIORITY, MATCH, \
-                            ACTIONS, NULL)
+    ovn_lflow_add_at(LFLOW_MAP, OD, STAGE, PRIORITY, MATCH, ACTIONS, true, \
+                     NULL, OVS_SOURCE_LOCATOR)
+
+/* Adds a row with the specified contents to the Logical_Flow table.
+ * Combining of this logical flow with already existing ones, e.g., by using
+ * Logical Datapath Groups, is forbidden.
+ *
+ * XXX: ovn-controller assumes that a logical flow using multicast group always
+ *      comes after or in the same database update with the corresponding
+ *      multicast group.  That will not be the case with datapath groups.
+ *      For this reason, the 'ovn_lflow_add_unique*()' functions should be used
+ *      for such logical flows.
+ */
+#define ovn_lflow_add_unique_with_hint(LFLOW_MAP, OD, STAGE, PRIORITY, MATCH, \
+                                       ACTIONS, STAGE_HINT) \
+    ovn_lflow_add_at(LFLOW_MAP, OD, STAGE, PRIORITY, MATCH, ACTIONS, false, \
+                     STAGE_HINT, OVS_SOURCE_LOCATOR)
+
+#define ovn_lflow_add_unique(LFLOW_MAP, OD, STAGE, PRIORITY, MATCH, ACTIONS) \
+    ovn_lflow_add_at(LFLOW_MAP, OD, STAGE, PRIORITY, MATCH, ACTIONS, false, \
+                     NULL, OVS_SOURCE_LOCATOR)
 
 static struct ovn_lflow *
 ovn_lflow_find(struct hmap *lflows, struct ovn_datapath *od,
@@ -4175,25 +4246,35 @@ ovn_lflow_find(struct hmap *lflows, struct ovn_datapath *od,
                    CONST_CAST(char *, match), CONST_CAST(char *, actions),
                    NULL, NULL);
 
-    struct ovn_lflow *lflow;
-    HMAP_FOR_EACH_WITH_HASH (lflow, hmap_node, hash, lflows) {
-        if (ovn_lflow_equal(lflow, &target)) {
-            return lflow;
-        }
-    }
-    return NULL;
+    return ovn_lflow_find_by_lflow(lflows, &target, hash);
 }
 
 static void
 ovn_lflow_destroy(struct hmap *lflows, struct ovn_lflow *lflow)
 {
     if (lflow) {
-        hmap_remove(lflows, &lflow->hmap_node);
+        if (lflows) {
+            hmap_remove(lflows, &lflow->hmap_node);
+        }
+        hmapx_destroy(&lflow->od_group);
         free(lflow->match);
         free(lflow->actions);
         free(lflow->stage_hint);
         free(lflow);
     }
+}
+
+static struct ovn_lflow *
+ovn_lflow_find_by_lflow(const struct hmap *lflows,
+                        const struct ovn_lflow *target, uint32_t hash)
+{
+    struct ovn_lflow *lflow;
+    HMAP_FOR_EACH_WITH_HASH (lflow, hmap_node, hash, lflows) {
+        if (ovn_lflow_equal(lflow, target)) {
+            return lflow;
+        }
+    }
+    return NULL;
 }
 
 /* Appends port security constraints on L2 address field 'eth_addr_field'
@@ -5016,7 +5097,8 @@ build_empty_lb_event_flow(struct ovn_datapath *od, struct hmap *lflows,
                           struct nbrec_load_balancer *lb,
                           int pl, struct shash *meter_groups)
 {
-    if (!controller_event_en || lb_vip->n_backends) {
+    if (!controller_event_en || lb_vip->n_backends ||
+        lb_vip->empty_backend_rej) {
         return;
     }
 
@@ -5906,8 +5988,8 @@ build_lb_rules(struct ovn_datapath *od, struct hmap *lflows,
 
         /* New connections in Ingress table. */
         struct ds action = DS_EMPTY_INITIALIZER;
-        build_lb_vip_ct_lb_actions(lb_vip, lb_vip_nb, &action,
-                                   lb->selection_fields);
+        build_lb_vip_actions(lb_vip, lb_vip_nb, &action,
+                             lb->selection_fields, true);
 
         struct ds match = DS_EMPTY_INITIALIZER;
         ds_put_format(&match, "ct.new && %s.dst == %s", ip_match,
@@ -6294,9 +6376,9 @@ build_lswitch_rport_arp_req_self_orig_flow(struct ovn_port *op,
 
     ds_put_format(&match, "eth.src == %s && (arp.op == 1 || nd_ns)",
                   ds_cstr(&eth_src));
-    ovn_lflow_add(lflows, od, S_SWITCH_IN_L2_LKUP, priority,
-                  ds_cstr(&match),
-                  "outport = \""MC_FLOOD_L2"\"; output;");
+    ovn_lflow_add_unique(lflows, od, S_SWITCH_IN_L2_LKUP, priority,
+                         ds_cstr(&match),
+                         "outport = \""MC_FLOOD_L2"\"; output;");
 
     sset_destroy(&all_eth_addrs);
     ds_destroy(&eth_src);
@@ -6349,11 +6431,15 @@ build_lswitch_rport_arp_req_flow_for_ip(struct sset *ips,
         ds_put_format(&actions, "clone {outport = %s; output; }; "
                                 "outport = \""MC_FLOOD_L2"\"; output;",
                       patch_op->json_key);
+        ovn_lflow_add_unique_with_hint(lflows, od, S_SWITCH_IN_L2_LKUP,
+                                       priority, ds_cstr(&match),
+                                       ds_cstr(&actions), stage_hint);
     } else {
         ds_put_format(&actions, "outport = %s; output;", patch_op->json_key);
+        ovn_lflow_add_with_hint(lflows, od, S_SWITCH_IN_L2_LKUP, priority,
+                                ds_cstr(&match), ds_cstr(&actions),
+                                stage_hint);
     }
-    ovn_lflow_add_with_hint(lflows, od, S_SWITCH_IN_L2_LKUP, priority,
-                            ds_cstr(&match), ds_cstr(&actions), stage_hint);
 
     ds_destroy(&match);
     ds_destroy(&actions);
@@ -6896,7 +6982,7 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
 
             for (size_t j = 0; j < lb_vip_nb->n_backends; j++) {
                 struct ovn_northd_lb_backend *backend_nb =
-                    &lb_vip_nb->backends_nb[i];
+                    &lb_vip_nb->backends_nb[j];
                 if (!backend_nb->op || !backend_nb->svc_mon_src_ip) {
                     continue;
                 }
@@ -7058,26 +7144,26 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
             }
             ds_put_cstr(&actions, "igmp;");
             /* Punt IGMP traffic to controller. */
-            ovn_lflow_add(lflows, od, S_SWITCH_IN_L2_LKUP, 100,
-                          "ip4 && ip.proto == 2", ds_cstr(&actions));
+            ovn_lflow_add_unique(lflows, od, S_SWITCH_IN_L2_LKUP, 100,
+                                 "ip4 && ip.proto == 2", ds_cstr(&actions));
 
             /* Punt MLD traffic to controller. */
-            ovn_lflow_add(lflows, od, S_SWITCH_IN_L2_LKUP, 100,
-                          "mldv1 || mldv2", ds_cstr(&actions));
+            ovn_lflow_add_unique(lflows, od, S_SWITCH_IN_L2_LKUP, 100,
+                                 "mldv1 || mldv2", ds_cstr(&actions));
 
             /* Flood all IP multicast traffic destined to 224.0.0.X to all
              * ports - RFC 4541, section 2.1.2, item 2.
              */
-            ovn_lflow_add(lflows, od, S_SWITCH_IN_L2_LKUP, 85,
-                          "ip4.mcast && ip4.dst == 224.0.0.0/24",
-                          "outport = \""MC_FLOOD"\"; output;");
+            ovn_lflow_add_unique(lflows, od, S_SWITCH_IN_L2_LKUP, 85,
+                                 "ip4.mcast && ip4.dst == 224.0.0.0/24",
+                                 "outport = \""MC_FLOOD"\"; output;");
 
             /* Flood all IPv6 multicast traffic destined to reserved
              * multicast IPs (RFC 4291, 2.7.1).
              */
-            ovn_lflow_add(lflows, od, S_SWITCH_IN_L2_LKUP, 85,
-                          "ip6.mcast_flood",
-                          "outport = \""MC_FLOOD"\"; output;");
+            ovn_lflow_add_unique(lflows, od, S_SWITCH_IN_L2_LKUP, 85,
+                                 "ip6.mcast_flood",
+                                 "outport = \""MC_FLOOD"\"; output;");
 
             /* Forward uregistered IP multicast to routers with relay enabled
              * and to any ports configured to flood IP multicast traffic.
@@ -7107,13 +7193,14 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
                     ds_put_cstr(&actions, "drop;");
                 }
 
-                ovn_lflow_add(lflows, od, S_SWITCH_IN_L2_LKUP, 80,
-                              "ip4.mcast || ip6.mcast", ds_cstr(&actions));
+                ovn_lflow_add_unique(lflows, od, S_SWITCH_IN_L2_LKUP, 80,
+                                     "ip4.mcast || ip6.mcast",
+                                     ds_cstr(&actions));
             }
         }
 
-        ovn_lflow_add(lflows, od, S_SWITCH_IN_L2_LKUP, 70, "eth.mcast",
-                      "outport = \""MC_FLOOD"\"; output;");
+        ovn_lflow_add_unique(lflows, od, S_SWITCH_IN_L2_LKUP, 70, "eth.mcast",
+                             "outport = \""MC_FLOOD"\"; output;");
     }
 
     /* Ingress table 19: Add IP multicast flows learnt from IGMP/MLD
@@ -7180,8 +7267,8 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
         ds_put_format(&actions, "outport = \"%s\"; output; ",
                       igmp_group->mcgroup.name);
 
-        ovn_lflow_add(lflows, igmp_group->datapath, S_SWITCH_IN_L2_LKUP, 90,
-                      ds_cstr(&match), ds_cstr(&actions));
+        ovn_lflow_add_unique(lflows, igmp_group->datapath, S_SWITCH_IN_L2_LKUP,
+                             90, ds_cstr(&match), ds_cstr(&actions));
     }
 
     /* Ingress table 19: Destination lookup, unicast handling (priority 50), */
@@ -7327,8 +7414,8 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
         }
 
         if (od->has_unknown) {
-            ovn_lflow_add(lflows, od, S_SWITCH_IN_L2_LKUP, 0, "1",
-                          "outport = \""MC_UNKNOWN"\"; output;");
+            ovn_lflow_add_unique(lflows, od, S_SWITCH_IN_L2_LKUP, 0, "1",
+                                 "outport = \""MC_UNKNOWN"\"; output;");
         }
     }
 
@@ -7476,33 +7563,39 @@ build_routing_policy_flow(struct hmap *lflows, struct ovn_datapath *od,
     struct ds actions = DS_EMPTY_INITIALIZER;
 
     if (!strcmp(rule->action, "reroute")) {
+        ovs_assert(rule->n_nexthops <= 1);
+
+        char *nexthop =
+            (rule->n_nexthops == 1 ? rule->nexthops[0] : rule->nexthop);
         struct ovn_port *out_port = get_outport_for_routing_policy_nexthop(
-             od, ports, rule->priority, rule->nexthop);
+             od, ports, rule->priority, nexthop);
         if (!out_port) {
             return;
         }
 
-        const char *lrp_addr_s = find_lrp_member_ip(out_port, rule->nexthop);
+        const char *lrp_addr_s = find_lrp_member_ip(out_port, nexthop);
         if (!lrp_addr_s) {
             static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
             VLOG_WARN_RL(&rl, "lrp_addr not found for routing policy "
                          " priority %"PRId64" nexthop %s",
-                         rule->priority, rule->nexthop);
+                         rule->priority, nexthop);
             return;
         }
         uint32_t pkt_mark = ovn_smap_get_uint(&rule->options, "pkt_mark", 0);
         if (pkt_mark) {
             ds_put_format(&actions, "pkt.mark = %u; ", pkt_mark);
         }
-        bool is_ipv4 = strchr(rule->nexthop, '.') ? true : false;
+
+        bool is_ipv4 = strchr(nexthop, '.') ? true : false;
         ds_put_format(&actions, "%s = %s; "
                       "%s = %s; "
                       "eth.src = %s; "
                       "outport = %s; "
                       "flags.loopback = 1; "
+                      REG_ECMP_GROUP_ID" = 0; "
                       "next;",
                       is_ipv4 ? REG_NEXT_HOP_IPV4 : REG_NEXT_HOP_IPV6,
-                      rule->nexthop,
+                      nexthop,
                       is_ipv4 ? REG_SRC_IPV4 : REG_SRC_IPV6,
                       lrp_addr_s,
                       out_port->lrp_networks.ea_s,
@@ -7515,12 +7608,113 @@ build_routing_policy_flow(struct hmap *lflows, struct ovn_datapath *od,
         if (pkt_mark) {
             ds_put_format(&actions, "pkt.mark = %u; ", pkt_mark);
         }
-        ds_put_cstr(&actions, "next;");
+        ds_put_cstr(&actions, REG_ECMP_GROUP_ID" = 0; next;");
     }
     ds_put_format(&match, "%s", rule->match);
 
     ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_POLICY, rule->priority,
                             ds_cstr(&match), ds_cstr(&actions), stage_hint);
+    ds_destroy(&match);
+    ds_destroy(&actions);
+}
+
+static void
+build_ecmp_routing_policy_flows(struct hmap *lflows, struct ovn_datapath *od,
+                                struct hmap *ports,
+                                const struct nbrec_logical_router_policy *rule,
+                                uint16_t ecmp_group_id)
+{
+    ovs_assert(rule->n_nexthops > 1);
+
+    bool nexthops_is_ipv4 = true;
+
+    /* Check that all the nexthops belong to the same addr family before
+     * adding logical flows. */
+    for (uint16_t i = 0; i < rule->n_nexthops; i++) {
+        bool is_ipv4 = strchr(rule->nexthops[i], '.') ? true : false;
+
+        if (i == 0) {
+            nexthops_is_ipv4 = is_ipv4;
+        }
+
+        if (is_ipv4 != nexthops_is_ipv4) {
+            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
+            VLOG_WARN_RL(&rl, "nexthop [%s] of the router policy with "
+                         "the match [%s] do not belong to the same address "
+                         "family as other next hops",
+                         rule->nexthops[i], rule->match);
+            return;
+        }
+    }
+
+    struct ds match = DS_EMPTY_INITIALIZER;
+    struct ds actions = DS_EMPTY_INITIALIZER;
+
+    for (size_t i = 0; i < rule->n_nexthops; i++) {
+        struct ovn_port *out_port = get_outport_for_routing_policy_nexthop(
+             od, ports, rule->priority, rule->nexthops[i]);
+        if (!out_port) {
+            goto cleanup;
+        }
+
+        const char *lrp_addr_s =
+            find_lrp_member_ip(out_port, rule->nexthops[i]);
+        if (!lrp_addr_s) {
+            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
+            VLOG_WARN_RL(&rl, "lrp_addr not found for routing policy "
+                            " priority %"PRId64" nexthop %s",
+                            rule->priority, rule->nexthops[i]);
+            goto cleanup;
+        }
+
+        ds_clear(&actions);
+        uint32_t pkt_mark = ovn_smap_get_uint(&rule->options, "pkt_mark", 0);
+        if (pkt_mark) {
+            ds_put_format(&actions, "pkt.mark = %u; ", pkt_mark);
+        }
+
+        bool is_ipv4 = strchr(rule->nexthops[i], '.') ? true : false;
+
+        ds_put_format(&actions, "%s = %s; "
+                      "%s = %s; "
+                      "eth.src = %s; "
+                      "outport = %s; "
+                      "flags.loopback = 1; "
+                      "next;",
+                      is_ipv4 ? REG_NEXT_HOP_IPV4 : REG_NEXT_HOP_IPV6,
+                      rule->nexthops[i],
+                      is_ipv4 ? REG_SRC_IPV4 : REG_SRC_IPV6,
+                      lrp_addr_s,
+                      out_port->lrp_networks.ea_s,
+                      out_port->json_key);
+
+        ds_clear(&match);
+        ds_put_format(&match, REG_ECMP_GROUP_ID" == %"PRIu16" && "
+                      REG_ECMP_MEMBER_ID" == %"PRIuSIZE,
+                      ecmp_group_id, i + 1);
+        ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_POLICY_ECMP,
+                                100, ds_cstr(&match),
+                                ds_cstr(&actions), &rule->header_);
+    }
+
+    ds_clear(&actions);
+    ds_put_format(&actions, "%s = %"PRIu16
+                  "; %s = select(", REG_ECMP_GROUP_ID, ecmp_group_id,
+                  REG_ECMP_MEMBER_ID);
+
+    for (size_t i = 0; i < rule->n_nexthops; i++) {
+        if (i > 0) {
+            ds_put_cstr(&actions, ", ");
+        }
+
+        ds_put_format(&actions, "%"PRIuSIZE, i + 1);
+    }
+    ds_put_cstr(&actions, ");");
+    ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_POLICY,
+                            rule->priority, rule->match,
+                            ds_cstr(&actions), &rule->header_);
+
+cleanup:
     ds_destroy(&match);
     ds_destroy(&actions);
 }
@@ -9612,8 +9806,8 @@ build_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
                 struct ovn_lb_vip *lb_vip = &lb->vips[j];
                 struct ovn_northd_lb_vip *lb_vip_nb = &lb->vips_nb[j];
                 ds_clear(&actions);
-                build_lb_vip_ct_lb_actions(lb_vip, lb_vip_nb, &actions,
-                                           lb->selection_fields);
+                build_lb_vip_actions(lb_vip, lb_vip_nb, &actions,
+                                     lb->selection_fields, false);
 
                 if (!sset_contains(&all_ips, lb_vip->vip_str)) {
                     sset_add(&all_ips, lb_vip->vip_str);
@@ -9664,7 +9858,8 @@ build_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
                     prio = 120;
                 }
 
-                if (od->l3redirect_port) {
+                if (od->l3redirect_port &&
+                    (lb_vip->n_backends || !lb_vip->empty_backend_rej)) {
                     ds_put_format(&match, " && is_chassis_resident(%s)",
                                   od->l3redirect_port->json_key);
                 }
@@ -10174,15 +10369,15 @@ build_mcast_lookup_flows_for_lrouter(
             }
             ds_put_format(actions, "outport = \"%s\"; ip.ttl--; next;",
                           igmp_group->mcgroup.name);
-            ovn_lflow_add(lflows, od, S_ROUTER_IN_IP_ROUTING, 500,
-                          ds_cstr(match), ds_cstr(actions));
+            ovn_lflow_add_unique(lflows, od, S_ROUTER_IN_IP_ROUTING, 500,
+                                 ds_cstr(match), ds_cstr(actions));
         }
 
         /* If needed, flood unregistered multicast on statically configured
          * ports. Otherwise drop any multicast traffic.
          */
         if (od->mcast_info.rtr.flood_static) {
-            ovn_lflow_add(lflows, od, S_ROUTER_IN_IP_ROUTING, 450,
+            ovn_lflow_add_unique(lflows, od, S_ROUTER_IN_IP_ROUTING, 450,
                           "ip4.mcast || ip6.mcast",
                           "clone { "
                                 "outport = \""MC_STATIC"\"; "
@@ -10213,13 +10408,27 @@ build_ingress_policy_flows_for_lrouter(
     if (od->nbr) {
         /* This is a catch-all rule. It has the lowest priority (0)
          * does a match-all("1") and pass-through (next) */
-        ovn_lflow_add(lflows, od, S_ROUTER_IN_POLICY, 0, "1", "next;");
+        ovn_lflow_add(lflows, od, S_ROUTER_IN_POLICY, 0, "1",
+                      REG_ECMP_GROUP_ID" = 0; next;");
+        ovn_lflow_add(lflows, od, S_ROUTER_IN_POLICY_ECMP, 150,
+                      REG_ECMP_GROUP_ID" == 0", "next;");
 
         /* Convert routing policies to flows. */
+        uint16_t ecmp_group_id = 1;
         for (int i = 0; i < od->nbr->n_policies; i++) {
             const struct nbrec_logical_router_policy *rule
                 = od->nbr->policies[i];
-            build_routing_policy_flow(lflows, od, ports, rule, &rule->header_);
+            bool is_ecmp_reroute =
+                (!strcmp(rule->action, "reroute") && rule->n_nexthops > 1);
+
+            if (is_ecmp_reroute) {
+                build_ecmp_routing_policy_flows(lflows, od, ports, rule,
+                                                ecmp_group_id);
+                ecmp_group_id++;
+            } else {
+                build_routing_policy_flow(lflows, od, ports, rule,
+                                          &rule->header_);
+            }
         }
     }
 }
@@ -11209,6 +11418,72 @@ build_lswitch_and_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
     build_lrouter_flows(datapaths, ports, lflows, meter_groups, lbs);
 }
 
+struct ovn_dp_group {
+    struct hmapx map;
+    struct sbrec_logical_dp_group *dp_group;
+    struct hmap_node node;
+};
+
+static struct ovn_dp_group *
+ovn_dp_group_find(const struct hmap *dp_groups,
+                  const struct hmapx *od, uint32_t hash)
+{
+    struct ovn_dp_group *dpg;
+
+    HMAP_FOR_EACH_WITH_HASH (dpg, node, hash, dp_groups) {
+        if (hmapx_equals(&dpg->map, od)) {
+            return dpg;
+        }
+    }
+    return NULL;
+}
+
+static struct sbrec_logical_dp_group *
+ovn_sb_insert_logical_dp_group(struct northd_context *ctx,
+                                     const struct hmapx *od)
+{
+    struct sbrec_logical_dp_group *dp_group;
+    const struct sbrec_datapath_binding **sb;
+    const struct hmapx_node *node;
+    int n = 0;
+
+    sb = xmalloc(hmapx_count(od) * sizeof *sb);
+    HMAPX_FOR_EACH (node, od) {
+        sb[n++] = ((struct ovn_datapath *) node->data)->sb;
+    }
+    dp_group = sbrec_logical_dp_group_insert(ctx->ovnsb_txn);
+    sbrec_logical_dp_group_set_datapaths(
+        dp_group, (struct sbrec_datapath_binding **) sb, n);
+    free(sb);
+
+    return dp_group;
+}
+
+static void
+ovn_sb_set_lflow_logical_dp_group(
+    struct northd_context *ctx,
+    struct hmap *dp_groups,
+    const struct sbrec_logical_flow *sbflow,
+    const struct hmapx *od_group)
+{
+    struct ovn_dp_group *dpg;
+
+    if (!hmapx_count(od_group)) {
+        sbrec_logical_flow_set_logical_dp_group(sbflow, NULL);
+        return;
+    }
+
+    ovs_assert(hmapx_count(od_group) != 1);
+
+    dpg = ovn_dp_group_find(dp_groups, od_group,
+                            hash_int(hmapx_count(od_group), 0));
+    ovs_assert(dpg != NULL);
+
+    if (!dpg->dp_group) {
+        dpg->dp_group = ovn_sb_insert_logical_dp_group(ctx, &dpg->map);
+    }
+    sbrec_logical_flow_set_logical_dp_group(sbflow, dpg->dp_group);
+}
 
 /* Updates the Logical_Flow and Multicast_Group tables in the OVN_SB database,
  * constructing their contents based on the OVN_NB database. */
@@ -11225,36 +11500,139 @@ build_lflows(struct northd_context *ctx, struct hmap *datapaths,
                                     port_groups, &lflows, mcgroups,
                                     igmp_groups, meter_groups, lbs);
 
-    /* Push changes to the Logical_Flow table to database. */
-    const struct sbrec_logical_flow *sbflow, *next_sbflow;
-    SBREC_LOGICAL_FLOW_FOR_EACH_SAFE (sbflow, next_sbflow, ctx->ovnsb_idl) {
-        struct ovn_datapath *od
-            = ovn_datapath_from_sbrec(datapaths, sbflow->logical_datapath);
+    /* Collecting all unique datapath groups. */
+    struct hmap dp_groups = HMAP_INITIALIZER(&dp_groups);
+    struct hmapx single_dp_lflows = HMAPX_INITIALIZER(&single_dp_lflows);
+    struct ovn_lflow *lflow;
+    HMAP_FOR_EACH (lflow, hmap_node, &lflows) {
+        uint32_t hash = hash_int(hmapx_count(&lflow->od_group), 0);
+        struct ovn_dp_group *dpg;
 
-        if (!od || ovn_datapath_is_stale(od)) {
-            sbrec_logical_flow_delete(sbflow);
+        ovs_assert(hmapx_count(&lflow->od_group));
+
+        if (hmapx_count(&lflow->od_group) == 1) {
+            /* There is only one datapath, so it should be moved out of the
+             * group to a single 'od'. */
+            const struct hmapx_node *node;
+            HMAPX_FOR_EACH (node, &lflow->od_group) {
+                lflow->od = node->data;
+                break;
+            }
+            hmapx_clear(&lflow->od_group);
+            /* Logical flow should be re-hashed later to allow lookups. */
+            hmapx_add(&single_dp_lflows, lflow);
             continue;
         }
 
-        enum ovn_datapath_type dp_type = od->nbs ? DP_SWITCH : DP_ROUTER;
+        dpg = ovn_dp_group_find(&dp_groups, &lflow->od_group, hash);
+        if (!dpg) {
+            dpg = xzalloc(sizeof *dpg);
+            hmapx_clone(&dpg->map, &lflow->od_group);
+            hmap_insert(&dp_groups, &dpg->node, hash);
+        }
+    }
+
+    /* Adding datapath to the flow hash for logical flows that have only one,
+     * so they could be found by the southbound db record. */
+    const struct hmapx_node *node;
+    uint32_t hash;
+    HMAPX_FOR_EACH (node, &single_dp_lflows) {
+        lflow = node->data;
+        hash = hmap_node_hash(&lflow->hmap_node);
+        hmap_remove(&lflows, &lflow->hmap_node);
+        hash = ovn_logical_flow_hash_datapath(&lflow->od->sb->header_.uuid,
+                                              hash);
+        hmap_insert(&lflows, &lflow->hmap_node, hash);
+    }
+    hmapx_destroy(&single_dp_lflows);
+
+    /* Push changes to the Logical_Flow table to database. */
+    const struct sbrec_logical_flow *sbflow, *next_sbflow;
+    SBREC_LOGICAL_FLOW_FOR_EACH_SAFE (sbflow, next_sbflow, ctx->ovnsb_idl) {
+        struct sbrec_logical_dp_group *dp_group = sbflow->logical_dp_group;
+        struct ovn_datapath **od, *logical_datapath_od = NULL;
+        int n_datapaths = 0;
+        size_t i;
+
+        od = xmalloc((dp_group ? dp_group->n_datapaths + 1 : 1) * sizeof *od);
+        /* Check all logical datapaths from the group. */
+        for (i = 0; dp_group && i < dp_group->n_datapaths; i++) {
+            od[n_datapaths] = ovn_datapath_from_sbrec(datapaths,
+                                                      dp_group->datapaths[i]);
+            if (!od[n_datapaths] || ovn_datapath_is_stale(od[n_datapaths])) {
+                continue;
+            }
+            n_datapaths++;
+        }
+
+        struct sbrec_datapath_binding *dp = sbflow->logical_datapath;
+        if (dp) {
+            logical_datapath_od = ovn_datapath_from_sbrec(datapaths, dp);
+            if (logical_datapath_od
+                && ovn_datapath_is_stale(logical_datapath_od)) {
+                logical_datapath_od = NULL;
+            }
+        }
+
+        if (!n_datapaths && !logical_datapath_od) {
+            /* This lflow has no valid logical datapaths. */
+            sbrec_logical_flow_delete(sbflow);
+            free(od);
+            continue;
+        }
+
         enum ovn_pipeline pipeline
             = !strcmp(sbflow->pipeline, "ingress") ? P_IN : P_OUT;
-        struct ovn_lflow *lflow = ovn_lflow_find(
-            &lflows, od, ovn_stage_build(dp_type, pipeline, sbflow->table_id),
+        enum ovn_datapath_type dp_type;
+
+        if (n_datapaths) {
+            dp_type = od[0]->nbs ? DP_SWITCH : DP_ROUTER;
+        } else {
+            dp_type = logical_datapath_od->nbs ? DP_SWITCH : DP_ROUTER;
+        }
+        lflow = ovn_lflow_find(
+            &lflows, logical_datapath_od,
+            ovn_stage_build(dp_type, pipeline, sbflow->table_id),
             sbflow->priority, sbflow->match, sbflow->actions, sbflow->hash);
         if (lflow) {
+            /* This is a valid lflow.  Checking if the datapath group needs
+             * updates. */
+            bool update_dp_group = false;
+
+            if (n_datapaths != hmapx_count(&lflow->od_group)) {
+                update_dp_group = true;
+            } else {
+                for (i = 0; i < n_datapaths; i++) {
+                    if (od[i] && !hmapx_contains(&lflow->od_group, od[i])) {
+                        update_dp_group = true;
+                        break;
+                    }
+                }
+            }
+
+            if (update_dp_group) {
+                ovn_sb_set_lflow_logical_dp_group(ctx, &dp_groups,
+                                                  sbflow, &lflow->od_group);
+            }
+            /* This lflow updated.  Not needed anymore. */
             ovn_lflow_destroy(&lflows, lflow);
         } else {
             sbrec_logical_flow_delete(sbflow);
         }
+        free(od);
     }
-    struct ovn_lflow *lflow, *next_lflow;
+
+    struct ovn_lflow *next_lflow;
     HMAP_FOR_EACH_SAFE (lflow, next_lflow, hmap_node, &lflows) {
         const char *pipeline = ovn_stage_get_pipeline_name(lflow->stage);
         uint8_t table = ovn_stage_get_table(lflow->stage);
 
         sbflow = sbrec_logical_flow_insert(ctx->ovnsb_txn);
-        sbrec_logical_flow_set_logical_datapath(sbflow, lflow->od->sb);
+        if (lflow->od) {
+            sbrec_logical_flow_set_logical_datapath(sbflow, lflow->od->sb);
+        }
+        ovn_sb_set_lflow_logical_dp_group(ctx, &dp_groups,
+                                          sbflow, &lflow->od_group);
         sbrec_logical_flow_set_pipeline(sbflow, pipeline);
         sbrec_logical_flow_set_table_id(sbflow, table);
         sbrec_logical_flow_set_priority(sbflow, lflow->priority);
@@ -11285,6 +11663,13 @@ build_lflows(struct northd_context *ctx, struct hmap *datapaths,
         ovn_lflow_destroy(&lflows, lflow);
     }
     hmap_destroy(&lflows);
+
+    struct ovn_dp_group *dpg;
+    HMAP_FOR_EACH_POP (dpg, node, &dp_groups) {
+        hmapx_destroy(&dpg->map);
+        free(dpg);
+    }
+    hmap_destroy(&dp_groups);
 
     /* Push changes to the Multicast_Group table to database. */
     const struct sbrec_multicast_group *sbmc, *next_sbmc;
@@ -12103,6 +12488,8 @@ ovnnb_db_run(struct northd_context *ctx,
     northd_probe_interval_nb = get_probe_interval(ovnnb_db, nb);
     northd_probe_interval_sb = get_probe_interval(ovnsb_db, nb);
 
+    use_logical_dp_groups = smap_get_bool(&nb->options,
+                                          "use_logical_dp_groups", false);
     controller_event_en = smap_get_bool(&nb->options,
                                         "controller_event", false);
     check_lsp_is_up = !smap_get_bool(&nb->options,
@@ -12340,6 +12727,8 @@ static struct gen_opts_map supported_dhcp_opts[] = {
     DHCP_OPT_DOMAIN_SEARCH_LIST,
     DHCP_OPT_BOOTFILE_ALT,
     DHCP_OPT_BROADCAST_ADDRESS,
+    DHCP_OPT_NETBIOS_NAME_SERVER,
+    DHCP_OPT_NETBIOS_NODE_TYPE,
 };
 
 static struct gen_opts_map supported_dhcpv6_opts[] = {
@@ -12424,17 +12813,17 @@ static const char *rbac_chassis_auth[] =
     {"name"};
 static const char *rbac_chassis_update[] =
     {"nb_cfg", "external_ids", "encaps", "vtep_logical_switches",
-     "other_config", "name"};
+     "other_config"};
 
 static const char *rbac_chassis_private_auth[] =
     {"name"};
 static const char *rbac_chassis_private_update[] =
-    {"nb_cfg", "nb_cfg_timestamp", "chassis", "name"};
+    {"nb_cfg", "nb_cfg_timestamp", "chassis"};
 
 static const char *rbac_encap_auth[] =
     {"chassis_name"};
 static const char *rbac_encap_update[] =
-    {"type", "options", "ip", "chassis_name"};
+    {"type", "options", "ip"};
 
 static const char *rbac_port_binding_auth[] =
     {""};
@@ -12875,11 +13264,18 @@ main(int argc, char *argv[])
     ovsdb_idl_add_table(ovnsb_idl_loop.idl, &sbrec_table_logical_flow);
     add_column_noalert(ovnsb_idl_loop.idl,
                        &sbrec_logical_flow_col_logical_datapath);
+    add_column_noalert(ovnsb_idl_loop.idl,
+                       &sbrec_logical_flow_col_logical_dp_group);
     add_column_noalert(ovnsb_idl_loop.idl, &sbrec_logical_flow_col_pipeline);
     add_column_noalert(ovnsb_idl_loop.idl, &sbrec_logical_flow_col_table_id);
     add_column_noalert(ovnsb_idl_loop.idl, &sbrec_logical_flow_col_priority);
     add_column_noalert(ovnsb_idl_loop.idl, &sbrec_logical_flow_col_match);
     add_column_noalert(ovnsb_idl_loop.idl, &sbrec_logical_flow_col_actions);
+
+    ovsdb_idl_add_table(ovnsb_idl_loop.idl,
+                        &sbrec_table_logical_dp_group);
+    add_column_noalert(ovnsb_idl_loop.idl,
+                       &sbrec_logical_dp_group_col_datapaths);
 
     ovsdb_idl_add_table(ovnsb_idl_loop.idl, &sbrec_table_multicast_group);
     add_column_noalert(ovnsb_idl_loop.idl,

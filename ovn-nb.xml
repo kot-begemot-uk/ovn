@@ -193,6 +193,26 @@
         </p>
       </column>
 
+      <column name="options" key="use_logical_dp_groups">
+        <p>
+          If set to <code>true</code>, <code>ovn-northd</code> will combine
+          logical flows that differs only by logical datapath into a single
+          logical flow with logical datapath group attached.
+        </p>
+        <p>
+          While this should significantly reduce number of logical flows stored
+          in Southbound database this could also increase processing complexity
+          on the <code>ovn-controller</code> side, e.g.,
+          <code>ovn-controller</code> will re-consider logical flow for all
+          logical datapaths in a group.  If the option set to
+          <code>false</code>, there will be separate logical flow per logical
+          datapath and only this flow will be re-considered.
+        </p>
+        <p>
+          The default value is <code>false</code>.
+        </p>
+      </column>
+
       <column name="options" key="ignore_lsp_down">
         <p>
           If set to false, ARP/ND reply flows for logical switch ports will be
@@ -1615,6 +1635,16 @@
         See <em>External IDs</em> at the beginning of this document.
       </column>
     </group>
+    <group title="Load_Balancer options">
+      <column name="options" key="reject" type='{"type": "boolean"}'>
+        If the load balancer is created with <code>--reject</code> option and
+        it has no active backends, a TCP reset segment (for tcp) or an ICMP
+        port unreachable packet (for all other kind of traffic) will be sent
+        whenever an incoming packet is received for this load-balancer.
+        Please note using <code>--reject</code> option will disable empty_lb
+        SB controller event for this load balancer.
+      </column>
+    </group>
   </table>
 
   <table name="Load_Balancer_Health_Check" title="load balancer">
@@ -2693,15 +2723,31 @@
         </li>
 
         <li>
-          <code>reroute</code>: Reroute packet to <ref column="nexthop"/>.
+          <code>reroute</code>: Reroute packet to <ref column="nexthop"/> or
+          <ref column="nexthops"/>.
         </li>
       </ul>
     </column>
 
     <column name="nexthop">
       <p>
+        Note: This column is deprecated in favor of <ref column="nexthops"/>.
+      </p>
+      <p>
         Next-hop IP address for this route, which should be the IP
         address of a connected router port or the IP address of a logical port.
+      </p>
+    </column>
+
+    <column name="nexthops">
+      <p>
+        Next-hop ECMP IP addresses for this route. Each IP in the list should
+        be the IP address of a connected router port or the IP address of a
+        logical port.
+      </p>
+
+      <p>
+        One IP from the list is selected as next hop.
       </p>
     </column>
 
@@ -3011,6 +3057,12 @@
           </p>
         </column>
 
+        <column name="options" key="netbios_name_server">
+          <p>
+            The DHCPv4 option code for this option is 44.
+          </p>
+        </column>
+
         <column name="options" key="classless_static_route">
           <p>
             The DHCPv4 option code for this option is 121.
@@ -3111,6 +3163,13 @@
           The DHCPv4 option code for this option is 38. This option
           specifies the interval that the client TCP should wait before
           sending a keepalive message on a TCP connection.
+        </column>
+
+        <column name="options" key="netbios_node_type"
+                type='{"type": "integer", "minInteger": 0, "maxInteger": 255}'>
+          <p>
+            The DHCPv4 option code for this option is 46.
+          </p>
         </column>
       </group>
 

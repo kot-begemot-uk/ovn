@@ -102,10 +102,11 @@ const char *db_table_usage(struct ds *tables,
 bool ovn_is_known_nb_lsp_type(const char *type);
 
 uint32_t sbrec_logical_flow_hash(const struct sbrec_logical_flow *);
-uint32_t ovn_logical_flow_hash(const struct uuid *logical_datapath,
-                               uint8_t table_id, const char *pipeline,
+uint32_t ovn_logical_flow_hash(uint8_t table_id, const char *pipeline,
                                uint16_t priority,
                                const char *match, const char *actions);
+uint32_t ovn_logical_flow_hash_datapath(const struct uuid *logical_datapath,
+                                        uint32_t hash);
 bool datapath_is_switch(const struct sbrec_datapath_binding *);
 int datapath_snat_ct_zone(const struct sbrec_datapath_binding *ldp);
 void ovn_conn_show(struct unixctl_conn *conn, int argc OVS_UNUSED,

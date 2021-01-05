@@ -506,26 +506,29 @@ uint32_t
 sbrec_logical_flow_hash(const struct sbrec_logical_flow *lf)
 {
     const struct sbrec_datapath_binding *ld = lf->logical_datapath;
-    if (!ld) {
-        return 0;
-    }
+    uint32_t hash = ovn_logical_flow_hash(lf->table_id, lf->pipeline,
+                                          lf->priority, lf->match,
+                                          lf->actions);
 
-    return ovn_logical_flow_hash(&ld->header_.uuid,
-                                 lf->table_id, lf->pipeline,
-                                 lf->priority, lf->match, lf->actions);
+    return ld ? ovn_logical_flow_hash_datapath(&ld->header_.uuid, hash) : hash;
 }
 
 uint32_t
-ovn_logical_flow_hash(const struct uuid *logical_datapath,
-                      uint8_t table_id, const char *pipeline,
+ovn_logical_flow_hash(uint8_t table_id, const char *pipeline,
                       uint16_t priority,
                       const char *match, const char *actions)
 {
-    size_t hash = uuid_hash(logical_datapath);
-    hash = hash_2words((table_id << 16) | priority, hash);
+    size_t hash = hash_2words((table_id << 16) | priority, 0);
     hash = hash_string(pipeline, hash);
     hash = hash_string(match, hash);
     return hash_string(actions, hash);
+}
+
+uint32_t
+ovn_logical_flow_hash_datapath(const struct uuid *logical_datapath,
+                               uint32_t hash)
+{
+    return hash_add(hash, uuid_hash(logical_datapath));
 }
 
 bool

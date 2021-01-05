@@ -3,10 +3,10 @@
 set -o errexit
 set -x
 
-CFLAGS="-Werror"
+CFLAGS=""
+OVN_CFLAGS=""
 SPARSE_FLAGS=""
-EXTRA_OPTS=""
-TARGET="x86_64-native-linuxapp-gcc"
+EXTRA_OPTS="--enable-Werror"
 
 function configure_ovs()
 {
@@ -20,20 +20,33 @@ function configure_ovs()
 function configure_ovn()
 {
     configure_ovs $*
+
+    export OVS_CFLAGS="${OVS_CFLAGS} ${OVN_CFLAGS}"
     ./boot.sh && ./configure --with-ovs-source=$PWD/ovs_src $* || \
     { cat config.log; exit 1; }
 }
 
-OPTS="$EXTRA_OPTS $*"
+save_OPTS="${OPTS} $*"
+OPTS="${EXTRA_OPTS} ${save_OPTS}"
+
+# If AddressSanitizer is requested, enable it, but only for OVN, not for OVS.
+# However, disable some optimizations for OVS, to make AddressSanitizer
+# reports user friendly.
+if [ "$ASAN" ]; then
+    CFLAGS="-fno-omit-frame-pointer -fno-common"
+    OVN_CFLAGS="-fsanitize=address"
+fi
 
 if [ "$CC" = "clang" ]; then
     export OVS_CFLAGS="$CFLAGS -Wno-error=unused-command-line-argument"
-elif [[ $BUILD_ENV =~ "-m32" ]]; then
-    # Disable sparse for 32bit builds on 64bit machine
-    export OVS_CFLAGS="$CFLAGS $BUILD_ENV"
+elif [ "$M32" ]; then
+    # Not using sparse for 32bit builds on 64bit machine.
+    # Adding m32 flag directly to CC to avoid any posiible issues with API/ABI
+    # difference on 'configure' and 'make' stages.
+    export CC="$CC -m32"
 else
     OPTS="$OPTS --enable-sparse"
-    export OVS_CFLAGS="$CFLAGS $BUILD_ENV $SPARSE_FLAGS"
+    export OVS_CFLAGS="$CFLAGS $SPARSE_FLAGS"
 fi
 
 if [ "$TESTSUITE" ]; then
