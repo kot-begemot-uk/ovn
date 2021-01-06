@@ -11494,11 +11494,16 @@ build_lflows(struct northd_context *ctx, struct hmap *datapaths,
              struct shash *meter_groups,
              struct hmap *lbs)
 {
+    long long finish, start = time_usec();
     struct hmap lflows = HMAP_INITIALIZER(&lflows);
 
     build_lswitch_and_lrouter_flows(datapaths, ports,
                                     port_groups, &lflows, mcgroups,
                                     igmp_groups, meter_groups, lbs);
+    finish = time_usec();
+    if (hmap_count(&lflows)) {
+        VLOG_INFO("Time to compute lflows %ld, %lld, %f", hmap_count(&lflows), finish - start, 1.0 * (finish - start)/hmap_count(&lflows));
+    }
 
     /* Collecting all unique datapath groups. */
     struct hmap dp_groups = HMAP_INITIALIZER(&dp_groups);
@@ -12490,6 +12495,7 @@ ovnnb_db_run(struct northd_context *ctx,
 
     use_logical_dp_groups = smap_get_bool(&nb->options,
                                           "use_logical_dp_groups", false);
+    use_logical_dp_groups = true;
     controller_event_en = smap_get_bool(&nb->options,
                                         "controller_event", false);
     check_lsp_is_up = !smap_get_bool(&nb->options,
