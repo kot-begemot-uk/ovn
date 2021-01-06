@@ -11841,6 +11841,7 @@ build_lflows(struct northd_context *ctx, struct hmap *datapaths,
              struct hmap *lbs, struct hmap *bfd_connections)
 {
     struct hmap lflows;
+    long long finish, start = time_usec();
 
     fast_hmap_size_for(&lflows, max_seen_lflow_size);
     if (use_parallel_build) {
@@ -11850,6 +11851,10 @@ build_lflows(struct northd_context *ctx, struct hmap *datapaths,
                                     port_groups, &lflows, mcgroups,
                                     igmp_groups, meter_groups, lbs,
                                     bfd_connections);
+    finish = time_usec();
+    if (hmap_count(&lflows)) {
+        VLOG_INFO("Time to compute lflows %ld, %lld, %f", hmap_count(&lflows), finish - start, 1.0 * (finish - start)/hmap_count(&lflows));
+    }
 
     if (hmap_count(&lflows) > max_seen_lflow_size) {
         max_seen_lflow_size = hmap_count(&lflows);
