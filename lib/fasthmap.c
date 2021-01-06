@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <semaphore.h>
+#include <fcntl.h>
 #include "fatal-signal.h"
 #include "util.h"
 #include "openvswitch/vlog.h"
@@ -29,6 +30,8 @@
 #include "fasthmap.h"
 #include "ovs-atomic.h"
 #include "ovs-thread.h"
+#include "random.h"
+#include "random.h"
 #include "ovs-numa.h"
 
 VLOG_DEFINE_THIS_MODULE(fasthmap);
@@ -36,11 +39,11 @@ VLOG_DEFINE_THIS_MODULE(fasthmap);
 #ifndef OVS_HAS_PARALLEL_HMAP
 
 
-/* These are accessed under mutex inside ovn_add_worker_pool().
+/* These are accessed under mutex inside add_worker_pool().
  * They do not need to be atomic.
  */
 
-static bool worker_pool_setup = false;
+static atomic_bool initial_pool_setup = ATOMIC_VAR_INIT(false);
 static bool can_parallelize = false;
 
 /* This is set only in the process of exit and the set is
@@ -55,6 +58,8 @@ static struct ovs_list worker_pools = OVS_LIST_INITIALIZER(&worker_pools);
 static struct ovs_mutex init_mutex = OVS_MUTEX_INITIALIZER;
 
 static int pool_size;
+
+static int sembase;
 
 static void worker_pool_hook(void *aux OVS_UNUSED) {
     int i;
@@ -71,8 +76,12 @@ static void worker_pool_hook(void *aux OVS_UNUSED) {
 
     LIST_FOR_EACH (pool, list_node, &worker_pools) {
         for (i = 0; i < pool->size ; i++) {
-            sem_post(&pool->controls[i].fire);
+            sem_post(pool->controls[i].fire);
         }
+        for (i = 0; i < pool->size ; i++) {
+            sem_close(pool->controls[i].fire);
+        }
+        sem_close(pool->done);
     }
 }
 
@@ -104,6 +113,7 @@ static void setup_worker_pools(void) {
     }
     can_parallelize = (pool_size >= 3);
     fatal_signal_add_hook(worker_pool_hook, NULL, NULL, true);
+    sembase = random_uint32();
 }
 
 bool ovn_stop_parallel_processing(void)
@@ -111,23 +121,46 @@ bool ovn_stop_parallel_processing(void)
     return workers_must_exit;
 }
 
+bool ovn_can_parallelize_hashes(void)
+{
+    bool test = false;
+
+    if (atomic_compare_exchange_strong(
+            &initial_pool_setup,
+            &test,
+            true)) {
+        ovs_mutex_lock(&init_mutex);
+        setup_worker_pools();
+        ovs_mutex_unlock(&init_mutex);
+    }
+    return can_parallelize;
+}
+
 struct worker_pool *ovn_add_worker_pool(void *(*start)(void *)){
 
     struct worker_pool *new_pool = NULL;
     struct worker_control *new_control;
+    bool test = false;
     int i;
+    char sem_name[256];
 
-    ovs_mutex_lock(&init_mutex);
 
-    if (!worker_pool_setup) {
+    if (atomic_compare_exchange_strong(
+            &initial_pool_setup,
+            &test,
+            true)) {
+        ovs_mutex_lock(&init_mutex);
         setup_worker_pools();
-        worker_pool_setup = true;
+        ovs_mutex_unlock(&init_mutex);
     }
 
+    ovs_mutex_lock(&init_mutex);
     if (can_parallelize) {
         new_pool = xmalloc(sizeof(struct worker_pool));
         new_pool->size = pool_size;
-        sem_init(&new_pool->done, 0, 0);
+        sprintf(sem_name, "%x-%p-main", sembase, new_pool);
+        new_pool->done = sem_open(sem_name, O_CREAT);
+        sem_unlink(sem_name);
 
         ovs_list_push_back(&worker_pools, &new_pool->list_node);
 
@@ -136,9 +169,12 @@ struct worker_pool *ovn_add_worker_pool(void *(*start)(void *)){
 
         for (i = 0; i < new_pool->size; i++) {
             new_control = &new_pool->controls[i];
-            sem_init(&new_control->fire, 0, 0);
+            sprintf(sem_name, "%x-%p-%x", sembase, new_pool, i);
+            new_control->fire = sem_open(sem_name, O_CREAT);
+            /* we do not want this visible to other processes */
+            sem_unlink(sem_name);
             new_control->id = i;
-            new_control->done = &new_pool->done;
+            new_control->done = new_pool->done;
             new_control->data = NULL;
             ovs_mutex_init(&new_control->mutex);
             new_control->finished = ATOMIC_VAR_INIT(false);
@@ -197,12 +233,11 @@ ovn_fast_hmap_size_for(struct hmap *hmap, int size)
 /* Run a thread pool which uses a callback function to process results
  */
 
-void ovn_run_pool_callback(struct worker_pool *pool, void *fin_result,
-                           void *result_frags,
-                           void (*helper_func)(struct worker_pool *pool,
-                                               void *fin_result,
-                                               void *result_frags,
-                                               int index))
+void ovn_run_pool_callback(struct worker_pool *pool,
+                       void *fin_result, void *result_frags,
+                       void (*helper_func)(struct worker_pool *pool,
+                                           void *fin_result,
+                                           void *result_frags, int index))
 {
     int index, completed;
 
@@ -215,7 +250,7 @@ void ovn_run_pool_callback(struct worker_pool *pool, void *fin_result,
     /* Start workers */
 
     for (index = 0; index < pool->size; index++) {
-        sem_post(&pool->controls[index].fire);
+        sem_post(pool->controls[index].fire);
     }
 
     completed = 0;
@@ -235,7 +270,7 @@ void ovn_run_pool_callback(struct worker_pool *pool, void *fin_result,
          * doing nothing while the workers are processing their data
          * slices.
          */
-        sem_wait(&pool->done);
+        sem_wait(pool->done);
         for (index = 0; index < pool->size; index++) {
             test = true;
             /* If the worker has marked its data chunk as complete,
@@ -265,7 +300,7 @@ void ovn_run_pool_callback(struct worker_pool *pool, void *fin_result,
 
 void ovn_run_pool(struct worker_pool *pool)
 {
-    ovn_run_pool_callback(pool, NULL, NULL, NULL);
+    run_pool_callback(pool, NULL, NULL, NULL);
 }
 
 /* Brute force merge of a hashmap into another hashmap.
@@ -309,7 +344,8 @@ void ovn_fast_hmap_merge(struct hmap *dest, struct hmap *inc)
  */
 
 static void merge_hash_results(struct worker_pool *pool OVS_UNUSED,
-                               void *fin_result, void *result_frags, int index)
+                               void *fin_result, void *result_frags,
+                               int index)
 {
     struct hmap *result = (struct hmap *)fin_result;
     struct hmap *res_frags = (struct hmap *)result_frags;
@@ -319,9 +355,13 @@ static void merge_hash_results(struct worker_pool *pool OVS_UNUSED,
 }
 
 
-void ovn_run_pool_hash(struct worker_pool *pool, struct hmap *result,
-                       struct hmap *result_frags)
+void ovn_run_pool_hash(
+        struct worker_pool *pool,
+        struct hmap *result,
+        struct hmap *result_frags)
 {
-    ovn_run_pool_callback(pool, result, result_frags, merge_hash_results);
+    run_pool_callback(pool, result, result_frags, merge_hash_results);
 }
+
+
 #endif

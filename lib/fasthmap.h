@@ -70,7 +70,7 @@ extern "C" {
 struct worker_control {
     int id; /* Used as a modulo when iterating over a hash. */
     atomic_bool finished; /* Set to true after achunk of work is complete. */
-    sem_t fire; /* Work start semaphore - sem_post starts the worker. */
+    sem_t *fire; /* Work start semaphore - sem_post starts the worker. */
     sem_t *done; /* Work completion semaphore - sem_post on completion. */
     struct ovs_mutex mutex; /* Guards the data. */
     void *data; /* Pointer to data to be processed. */
@@ -81,7 +81,7 @@ struct worker_pool {
     int size;   /* Number of threads in the pool. */
     struct ovs_list list_node; /* List of pools - used in cleanup/exit. */
     struct worker_control *controls; /* "Handles" in this pool. */
-    sem_t done; /* Work completion semaphorew. */
+    sem_t *done; /* Work completion semaphorew. */
 };
 
 /* Add a worker pool for thread function start() which expects a pointer to
@@ -176,6 +176,16 @@ parallel_hmap_next(const struct hmap *hmap,
                 (node->hash & hmap->mask) + pool_size, pool_size));
 }
 
+
+static inline void ovn_post_completed_work(struct worker_control *control)
+{
+    atomic_store_relaxed(&control->finished, true);
+    atomic_thread_fence(memory_order_acq_rel);
+    sem_post(control->done);
+}
+
+bool ovn_can_parallelize_hashes(void);
+
 /* Use the OVN library functions for stuff which OVS has not defined
  * If OVS has defined these, they will still compile using the OVN
  * local names, but will be dropped by the linker in favour of the OVS
@@ -201,6 +211,10 @@ parallel_hmap_next(const struct hmap *hmap,
 
 #define run_pool_callback(pool, fin_result, result_frags, helper_func) \
     ovn_run_pool_callback(pool, fin_result, result_frags, helper_func)
+
+#define post_completed_work(control) ovn_post_completed_work(control)
+
+#define can_parallelize_hashes() ovn_can_parallelize_hashes()
 
 #endif
 
