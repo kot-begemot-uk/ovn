@@ -12748,6 +12748,7 @@ ovnnb_db_run(struct northd_context *ctx,
 
     use_logical_dp_groups = smap_get_bool(&nb->options,
                                           "use_logical_dp_groups", false);
+    use_logical_dp_groups = true;
     controller_event_en = smap_get_bool(&nb->options,
                                         "controller_event", false);
     check_lsp_is_up = !smap_get_bool(&nb->options,
