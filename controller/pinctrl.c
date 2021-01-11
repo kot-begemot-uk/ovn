@@ -323,6 +323,23 @@ put_load(uint64_t value, enum mf_field_id dst, int ofs, int n_bits,
 static void notify_pinctrl_main(void);
 static void notify_pinctrl_handler(void);
 
+static bool bfd_monitor_should_inject(void);
+static void bfd_monitor_wait(long long int timeout);
+static void bfd_monitor_init(void);
+static void bfd_monitor_destroy(void);
+static void bfd_monitor_send_msg(struct rconn *swconn, long long int *bfd_time)
+                                 OVS_REQUIRES(pinctrl_mutex);
+static void
+pinctrl_handle_bfd_msg(struct rconn *swconn, const struct flow *ip_flow,
+                       struct dp_packet *pkt_in)
+                       OVS_REQUIRES(pinctrl_mutex);
+static void bfd_monitor_run(struct ovsdb_idl_txn *ovnsb_idl_txn,
+                            const struct sbrec_bfd_table *bfd_table,
+                            struct ovsdb_idl_index *sbrec_port_binding_by_name,
+                            const struct sbrec_chassis *chassis,
+                            const struct sset *active_tunnels)
+                            OVS_REQUIRES(pinctrl_mutex);
+
 COVERAGE_DEFINE(pinctrl_drop_put_mac_binding);
 COVERAGE_DEFINE(pinctrl_drop_buffered_packets_map);
 COVERAGE_DEFINE(pinctrl_drop_controller_event);
@@ -487,6 +504,7 @@ pinctrl_init(void)
     ip_mcast_snoop_init();
     init_put_vport_bindings();
     init_svc_monitors();
+    bfd_monitor_init();
     pinctrl.br_int_name = NULL;
     pinctrl_handler_seq = seq_create();
     pinctrl_main_seq = seq_create();
@@ -2962,6 +2980,12 @@ process_packet_in(struct rconn *swconn, const struct ofp_header *msg)
         ovs_mutex_unlock(&pinctrl_mutex);
         break;
 
+    case ACTION_OPCODE_BFD_MSG:
+        ovs_mutex_lock(&pinctrl_mutex);
+        pinctrl_handle_bfd_msg(swconn, &headers, &packet);
+        ovs_mutex_unlock(&pinctrl_mutex);
+        break;
+
     default:
         VLOG_WARN_RL(&rl, "unrecognized packet-in opcode %"PRIu32,
                      ntohl(ah->opcode));
@@ -3053,6 +3077,8 @@ pinctrl_handler(void *arg_)
     swconn = rconn_create(5, 0, DSCP_DEFAULT, 1 << OFP15_VERSION);
 
     while (!latch_is_set(&pctrl->pinctrl_thread_exit)) {
+        long long int bfd_time = LLONG_MAX;
+
         ovs_mutex_lock(&pinctrl_mutex);
         pinctrl_rconn_setup(swconn, pctrl->br_int_name);
         ip_mcast_snoop_run();
@@ -3085,6 +3111,7 @@ pinctrl_handler(void *arg_)
                 send_ipv6_ras(swconn, &send_ipv6_ra_time);
                 send_ipv6_prefixd(swconn, &send_prefixd_time);
                 send_mac_binding_buffered_pkts(swconn);
+                bfd_monitor_send_msg(swconn, &bfd_time);
                 ovs_mutex_unlock(&pinctrl_mutex);
 
                 ip_mcast_querier_run(swconn, &send_mcast_query_time);
@@ -3102,6 +3129,7 @@ pinctrl_handler(void *arg_)
         ip_mcast_querier_wait(send_mcast_query_time);
         svc_monitors_wait(svc_monitors_next_run_time);
         ipv6_prefixd_wait(send_prefixd_time);
+        bfd_monitor_wait(bfd_time);
 
         new_seq = seq_read(pinctrl_handler_seq);
         seq_wait(pinctrl_handler_seq, new_seq);
@@ -3149,6 +3177,7 @@ pinctrl_run(struct ovsdb_idl_txn *ovnsb_idl_txn,
             const struct sbrec_dns_table *dns_table,
             const struct sbrec_controller_event_table *ce_table,
             const struct sbrec_service_monitor_table *svc_mon_table,
+            const struct sbrec_bfd_table *bfd_table,
             const struct ovsrec_bridge *br_int,
             const struct sbrec_chassis *chassis,
             const struct hmap *local_datapaths,
@@ -3179,6 +3208,8 @@ pinctrl_run(struct ovsdb_idl_txn *ovnsb_idl_txn,
                          local_datapaths);
     sync_svc_monitors(ovnsb_idl_txn, svc_mon_table, sbrec_port_binding_by_name,
                       chassis);
+    bfd_monitor_run(ovnsb_idl_txn, bfd_table, sbrec_port_binding_by_name,
+                    chassis, active_tunnels);
     ovs_mutex_unlock(&pinctrl_mutex);
 }
 
@@ -3722,6 +3753,7 @@ pinctrl_destroy(void)
     destroy_dns_cache();
     ip_mcast_snoop_destroy();
     destroy_svc_monitors();
+    bfd_monitor_destroy();
     seq_destroy(pinctrl_main_seq);
     seq_destroy(pinctrl_handler_seq);
 }
@@ -5558,7 +5590,8 @@ may_inject_pkts(void)
             !shash_is_empty(&send_garp_rarp_data) ||
             ipv6_prefixd_should_inject() ||
             !ovs_list_is_empty(&mcast_query_list) ||
-            !ovs_list_is_empty(&buffered_mac_bindings));
+            !ovs_list_is_empty(&buffered_mac_bindings) ||
+            bfd_monitor_should_inject());
 }
 
 static void
@@ -6343,6 +6376,631 @@ sync_svc_monitors(struct ovsdb_idl_txn *ovnsb_idl_txn,
         notify_pinctrl_handler();
     }
 
+}
+
+enum bfd_state {
+    BFD_STATE_ADMIN_DOWN,
+    BFD_STATE_DOWN,
+    BFD_STATE_INIT,
+    BFD_STATE_UP,
+};
+
+enum bfd_flags {
+    BFD_FLAG_MULTIPOINT = 1 << 0,
+    BFD_FLAG_DEMAND = 1 << 1,
+    BFD_FLAG_AUTH = 1 << 2,
+    BFD_FLAG_CTL = 1 << 3,
+    BFD_FLAG_FINAL = 1 << 4,
+    BFD_FLAG_POLL = 1 << 5
+};
+
+#define BFD_FLAGS_MASK  0x3f
+
+static char *
+bfd_get_status(enum bfd_state state)
+{
+    switch (state) {
+    case BFD_STATE_ADMIN_DOWN:
+        return "admin_down";
+    case BFD_STATE_DOWN:
+        return "down";
+    case BFD_STATE_INIT:
+        return "init";
+    case BFD_STATE_UP:
+        return "up";
+    default:
+        return "";
+    }
+}
+
+static struct hmap bfd_monitor_map;
+
+#define BFD_UPDATE_BATCH_TH     10
+static uint16_t bfd_pending_update;
+#define BFD_UPDATE_TIMEOUT      5000LL
+static long long bfd_last_update;
+
+struct bfd_entry {
+    struct hmap_node node;
+    bool erase;
+
+    /* L2 source address */
+    struct eth_addr src_mac;
+    /* IPv4 source address */
+    ovs_be32 ip_src;
+    /* IPv4 destination address */
+    ovs_be32 ip_dst;
+    /* RFC 5881 section 4
+     * The source port MUST be in the range 49152 through 65535.
+     * The same UDP source port number MUST be used for all BFD
+     * Control packets associated with a particular session.
+     * The source port number SHOULD be unique among all BFD
+     * sessions on the system
+     */
+    uint16_t udp_src;
+    ovs_be32 local_disc;
+    ovs_be32 remote_disc;
+
+    uint32_t local_min_tx;
+    uint32_t local_min_rx;
+    uint32_t remote_min_rx;
+
+    bool remote_demand_mode;
+
+    uint8_t local_mult;
+
+    int64_t port_key;
+    int64_t metadata;
+
+    enum bfd_state state;
+    bool change_state;
+
+    uint32_t detection_timeout;
+    long long int last_rx;
+    long long int next_tx;
+};
+
+static void
+bfd_monitor_init(void)
+{
+    hmap_init(&bfd_monitor_map);
+    bfd_last_update = time_msec();
+}
+
+static void
+bfd_monitor_destroy(void)
+{
+    struct bfd_entry *entry;
+    HMAP_FOR_EACH_POP (entry, node, &bfd_monitor_map) {
+        free(entry);
+    }
+    hmap_destroy(&bfd_monitor_map);
+}
+
+static struct bfd_entry *
+pinctrl_find_bfd_monitor_entry_by_port(char *ip, uint16_t port)
+{
+    struct bfd_entry *entry;
+    HMAP_FOR_EACH_WITH_HASH (entry, node, hash_string(ip, 0),
+                             &bfd_monitor_map) {
+        if (entry->udp_src == port) {
+            return entry;
+        }
+    }
+    return NULL;
+}
+
+static struct bfd_entry *
+pinctrl_find_bfd_monitor_entry_by_disc(ovs_be32 ip, ovs_be32 disc)
+{
+    char *ip_src = xasprintf(IP_FMT, IP_ARGS(ip));
+    struct bfd_entry *ret = NULL, *entry;
+
+    HMAP_FOR_EACH_WITH_HASH (entry, node, hash_string(ip_src, 0),
+                             &bfd_monitor_map) {
+        if (entry->local_disc == disc) {
+            ret = entry;
+            break;
+        }
+    }
+
+    free(ip_src);
+    return ret;
+}
+
+static bool
+bfd_monitor_should_inject(void)
+{
+    long long int cur_time = time_msec();
+    struct bfd_entry *entry;
+
+    HMAP_FOR_EACH (entry, node, &bfd_monitor_map) {
+        if (entry->next_tx < cur_time) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void
+bfd_monitor_wait(long long int timeout)
+{
+    if (!hmap_is_empty(&bfd_monitor_map)) {
+        poll_timer_wait_until(timeout);
+    }
+}
+
+static void
+bfd_monitor_put_bfd_msg(struct bfd_entry *entry, struct dp_packet *packet,
+                        bool final)
+{
+    struct udp_header *udp;
+    struct bfd_msg *msg;
+
+    /* Properly align after the ethernet header */
+    dp_packet_reserve(packet, 2);
+    struct eth_header *eth = dp_packet_put_uninit(packet, sizeof *eth);
+    eth->eth_dst = eth_addr_broadcast;
+    eth->eth_src = entry->src_mac;
+    eth->eth_type = htons(ETH_TYPE_IP);
+
+    struct ip_header *ip = dp_packet_put_zeros(packet, sizeof *ip);
+    ip->ip_ihl_ver = IP_IHL_VER(5, 4);
+    ip->ip_tot_len = htons(sizeof *ip + sizeof *udp + sizeof *msg);
+    ip->ip_ttl = MAXTTL;
+    ip->ip_tos = IPTOS_PREC_INTERNETCONTROL;
+    ip->ip_proto = IPPROTO_UDP;
+    put_16aligned_be32(&ip->ip_src, entry->ip_src);
+    put_16aligned_be32(&ip->ip_dst, entry->ip_dst);
+    /* Checksum has already been zeroed by put_zeros call. */
+    ip->ip_csum = csum(ip, sizeof *ip);
+
+    udp = dp_packet_put_zeros(packet, sizeof *udp);
+    udp->udp_src = htons(entry->udp_src);
+    udp->udp_dst = htons(BFD_DEST_PORT);
+    udp->udp_len = htons(sizeof *udp + sizeof *msg);
+
+    msg = dp_packet_put_zeros(packet, sizeof *msg);
+    msg->vers_diag = (BFD_VERSION << 5);
+    msg->mult = entry->local_mult;
+    msg->length = BFD_PACKET_LEN;
+    msg->flags = final ? BFD_FLAG_FINAL : 0;
+    msg->flags |= entry->state << 6;
+    msg->my_disc = entry->local_disc;
+    msg->your_disc = entry->remote_disc;
+    /* min_tx and min_rx are in us - RFC 5880 page 9 */
+    msg->min_tx = htonl(entry->local_min_tx * 1000);
+    msg->min_rx = htonl(entry->local_min_rx * 1000);
+}
+
+static void
+pinctrl_send_bfd_tx_msg(struct rconn *swconn, struct bfd_entry *entry,
+                        bool final)
+{
+    uint64_t packet_stub[256 / 8];
+    struct dp_packet packet;
+    dp_packet_use_stub(&packet, packet_stub, sizeof packet_stub);
+    bfd_monitor_put_bfd_msg(entry, &packet, final);
+
+    uint64_t ofpacts_stub[4096 / 8];
+    struct ofpbuf ofpacts = OFPBUF_STUB_INITIALIZER(ofpacts_stub);
+
+    /* Set MFF_LOG_DATAPATH and MFF_LOG_INPORT. */
+    uint32_t dp_key = entry->metadata;
+    uint32_t port_key = entry->port_key;
+    put_load(dp_key, MFF_LOG_DATAPATH, 0, 64, &ofpacts);
+    put_load(port_key, MFF_LOG_INPORT, 0, 32, &ofpacts);
+    put_load(1, MFF_LOG_FLAGS, MLF_LOCAL_ONLY_BIT, 1, &ofpacts);
+    struct ofpact_resubmit *resubmit = ofpact_put_RESUBMIT(&ofpacts);
+    resubmit->in_port = OFPP_CONTROLLER;
+    resubmit->table_id = OFTABLE_LOG_INGRESS_PIPELINE;
+
+    struct ofputil_packet_out po = {
+        .packet = dp_packet_data(&packet),
+        .packet_len = dp_packet_size(&packet),
+        .buffer_id = UINT32_MAX,
+        .ofpacts = ofpacts.data,
+        .ofpacts_len = ofpacts.size,
+    };
+
+    match_set_in_port(&po.flow_metadata, OFPP_CONTROLLER);
+    enum ofp_version version = rconn_get_version(swconn);
+    enum ofputil_protocol proto =
+        ofputil_protocol_from_ofp_version(version);
+    queue_msg(swconn, ofputil_encode_packet_out(&po, proto));
+    dp_packet_uninit(&packet);
+    ofpbuf_uninit(&ofpacts);
+}
+
+
+static bool
+bfd_monitor_need_update(void)
+{
+    long long int cur_time = time_msec();
+
+    if (bfd_pending_update == BFD_UPDATE_BATCH_TH) {
+        goto update;
+    }
+
+    if (bfd_pending_update &&
+        bfd_last_update + BFD_UPDATE_TIMEOUT < cur_time) {
+        goto update;
+    }
+    return false;
+
+update:
+    bfd_last_update = cur_time;
+    bfd_pending_update = 0;
+    return true;
+}
+
+static void
+bfd_check_detection_timeout(struct bfd_entry *entry)
+{
+    if (entry->state == BFD_STATE_ADMIN_DOWN) {
+        return;
+    }
+
+    if (!entry->detection_timeout) {
+        return;
+    }
+
+    long long int cur_time = time_msec();
+    if (cur_time < entry->last_rx + entry->detection_timeout) {
+        return;
+    }
+
+    entry->state = BFD_STATE_DOWN;
+    entry->change_state = true;
+    bfd_last_update = cur_time;
+    bfd_pending_update = 0;
+    notify_pinctrl_main();
+}
+
+static void
+bfd_monitor_send_msg(struct rconn *swconn, long long int *bfd_time)
+    OVS_REQUIRES(pinctrl_mutex)
+{
+    long long int cur_time = time_msec();
+    struct bfd_entry *entry;
+
+    if (bfd_monitor_need_update()) {
+        notify_pinctrl_main();
+    }
+
+    HMAP_FOR_EACH (entry, node, &bfd_monitor_map) {
+        unsigned long tx_timeout;
+
+        bfd_check_detection_timeout(entry);
+
+        if (cur_time < entry->next_tx) {
+            goto next;
+        }
+
+        if (!entry->remote_min_rx) {
+            continue;
+        }
+
+        if (entry->state == BFD_STATE_ADMIN_DOWN) {
+            continue;
+        }
+
+        if (entry->remote_demand_mode) {
+            continue;
+        }
+
+        pinctrl_send_bfd_tx_msg(swconn, entry, false);
+
+        tx_timeout = MAX(entry->local_min_tx, entry->remote_min_rx);
+        tx_timeout -= random_range((tx_timeout * 25) / 100);
+        entry->next_tx = cur_time + tx_timeout;
+next:
+        if (*bfd_time > entry->next_tx) {
+            *bfd_time = entry->next_tx;
+        }
+    }
+}
+
+static bool
+pinctrl_check_bfd_msg(const struct flow *ip_flow, struct dp_packet *pkt_in)
+{
+    if (ip_flow->dl_type != htons(ETH_TYPE_IP) &&
+        ip_flow->dl_type != htons(ETH_TYPE_IPV6)) {
+        return false;
+    }
+
+    if (ip_flow->nw_proto != IPPROTO_UDP) {
+        return false;
+    }
+
+    struct udp_header *udp_hdr = dp_packet_l4(pkt_in);
+    if (udp_hdr->udp_dst != htons(BFD_DEST_PORT)) {
+        return false;
+    }
+
+    const struct bfd_msg *msg = dp_packet_get_udp_payload(pkt_in);
+    uint8_t version = msg->vers_diag >> 5;
+    if (version != BFD_VERSION) {
+        return false;
+    }
+
+    enum bfd_flags flags = msg->flags & BFD_FLAGS_MASK;
+    if (flags & BFD_FLAG_AUTH) {
+        /* AUTH not supported yet */
+        return false;
+    }
+
+    if (msg->length < BFD_PACKET_LEN) {
+        return false;
+    }
+
+    if (!msg->mult) {
+        return false;
+    }
+
+    if (flags & BFD_FLAG_MULTIPOINT) {
+        return false;
+    }
+
+    if (!msg->my_disc) {
+        return false;
+    }
+
+    if ((flags & BFD_FLAG_FINAL) && (flags & BFD_FLAG_POLL)) {
+        return false;
+    }
+
+    enum bfd_state peer_state = msg->flags >> 6;
+    if (peer_state >= BFD_STATE_INIT && !msg->your_disc) {
+        return false;
+    }
+
+    return true;
+}
+
+static void
+pinctrl_handle_bfd_msg(struct rconn *swconn, const struct flow *ip_flow,
+                       struct dp_packet *pkt_in)
+    OVS_REQUIRES(pinctrl_mutex)
+{
+    if (!pinctrl_check_bfd_msg(ip_flow, pkt_in)) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
+        VLOG_WARN_RL(&rl, "BFD packet discarded");
+        return;
+    }
+
+    const struct bfd_msg *msg = dp_packet_get_udp_payload(pkt_in);
+    struct bfd_entry *entry = pinctrl_find_bfd_monitor_entry_by_disc(
+            ip_flow->nw_src, msg->your_disc);
+    if (!entry) {
+        return;
+    }
+
+    bool change_state = false;
+    entry->remote_disc = msg->my_disc;
+    uint32_t remote_min_tx = ntohl(msg->min_tx) / 1000;
+    entry->remote_min_rx = ntohl(msg->min_rx) / 1000;
+    entry->detection_timeout = msg->mult * MAX(remote_min_tx,
+                                               entry->local_min_rx);
+
+    enum bfd_state peer_state = msg->flags >> 6;
+    if (peer_state == BFD_STATE_ADMIN_DOWN &&
+        entry->state >= BFD_STATE_INIT) {
+        entry->state = BFD_STATE_DOWN;
+        entry->last_rx = time_msec();
+        change_state = true;
+        goto out;
+    }
+
+    /* bfd state machine */
+    switch (entry->state) {
+    case BFD_STATE_DOWN:
+        if (peer_state == BFD_STATE_DOWN) {
+            entry->state = BFD_STATE_INIT;
+            change_state = true;
+        }
+        if (peer_state == BFD_STATE_INIT) {
+            entry->state = BFD_STATE_UP;
+            change_state = true;
+        }
+        entry->last_rx = time_msec();
+        break;
+    case BFD_STATE_INIT:
+        if (peer_state == BFD_STATE_INIT ||
+            peer_state == BFD_STATE_UP) {
+            entry->state = BFD_STATE_UP;
+            change_state = true;
+        }
+        if (peer_state == BFD_STATE_ADMIN_DOWN) {
+            entry->state = BFD_STATE_DOWN;
+            change_state = true;
+        }
+        entry->last_rx = time_msec();
+        break;
+    case BFD_STATE_UP:
+        if (peer_state == BFD_STATE_ADMIN_DOWN ||
+            peer_state == BFD_STATE_DOWN) {
+            entry->state = BFD_STATE_DOWN;
+            change_state = true;
+        }
+        entry->last_rx = time_msec();
+        break;
+    case BFD_STATE_ADMIN_DOWN:
+    default:
+        break;
+    }
+
+    if (entry->state == BFD_STATE_UP &&
+        (msg->flags & BFD_FLAG_DEMAND)) {
+        entry->remote_demand_mode = true;
+    }
+
+    if (msg->flags & BFD_FLAG_POLL) {
+        pinctrl_send_bfd_tx_msg(swconn, entry, true);
+    }
+
+out:
+    /* let's try to bacth db updates */
+    if (change_state) {
+        entry->change_state = true;
+        bfd_pending_update++;
+    }
+    if (bfd_monitor_need_update()) {
+        notify_pinctrl_main();
+    }
+}
+
+static void
+bfd_monitor_check_sb_conf(const struct sbrec_bfd *sb_bt,
+                          struct bfd_entry *entry)
+{
+    ovs_be32 ip_dst;
+
+    if (ip_parse(sb_bt->dst_ip, &ip_dst) && ip_dst != entry->ip_dst) {
+        entry->ip_dst = ip_dst;
+    }
+
+    if (sb_bt->min_tx != entry->local_min_tx) {
+        entry->local_min_tx = sb_bt->min_tx;
+    }
+
+    if (sb_bt->min_rx != entry->local_min_rx) {
+        entry->local_min_rx = sb_bt->min_rx;
+    }
+
+    if (sb_bt->detect_mult != entry->local_mult) {
+        entry->local_mult = sb_bt->detect_mult;
+    }
+}
+
+static void
+bfd_monitor_run(struct ovsdb_idl_txn *ovnsb_idl_txn,
+                const struct sbrec_bfd_table *bfd_table,
+                struct ovsdb_idl_index *sbrec_port_binding_by_name,
+                const struct sbrec_chassis *chassis,
+                const struct sset *active_tunnels)
+    OVS_REQUIRES(pinctrl_mutex)
+{
+    struct bfd_entry *entry, *next_entry;
+    long long int cur_time = time_msec();
+    bool changed = false;
+
+    HMAP_FOR_EACH (entry, node, &bfd_monitor_map) {
+        entry->erase = true;
+    }
+
+    const struct sbrec_bfd *bt;
+    SBREC_BFD_TABLE_FOR_EACH (bt, bfd_table) {
+        const struct sbrec_port_binding *pb
+            = lport_lookup_by_name(sbrec_port_binding_by_name,
+                                   bt->logical_port);
+        if (!pb) {
+            continue;
+        }
+
+        const char *peer_s = smap_get(&pb->options, "peer");
+        if (!peer_s) {
+            continue;
+        }
+
+        const struct sbrec_port_binding *peer
+            = lport_lookup_by_name(sbrec_port_binding_by_name, peer_s);
+        if (!peer) {
+            continue;
+        }
+
+        char *redirect_name = xasprintf("cr-%s", pb->logical_port);
+        bool resident = lport_is_chassis_resident(
+                sbrec_port_binding_by_name, chassis, active_tunnels,
+                redirect_name);
+        free(redirect_name);
+        if ((strcmp(pb->type, "l3gateway") || pb->chassis != chassis) &&
+            !resident) {
+            continue;
+        }
+
+        entry = pinctrl_find_bfd_monitor_entry_by_port(
+                bt->dst_ip, bt->src_port);
+        if (!entry) {
+            ovs_be32 ip_dst, ip_src = htonl(BFD_DEFAULT_SRC_IP);
+            struct eth_addr ea = eth_addr_zero;
+            int i;
+
+            if (!ip_parse(bt->dst_ip, &ip_dst)) {
+                continue;
+            }
+
+            for (i = 0; i < pb->n_mac; i++) {
+                struct lport_addresses laddrs;
+
+                if (!extract_lsp_addresses(pb->mac[i], &laddrs)) {
+                    continue;
+                }
+
+                ea = laddrs.ea;
+                if (laddrs.n_ipv4_addrs > 0) {
+                    ip_src = laddrs.ipv4_addrs[0].addr;
+                    destroy_lport_addresses(&laddrs);
+                    break;
+                }
+                destroy_lport_addresses(&laddrs);
+            }
+
+            if (eth_addr_is_zero(ea)) {
+                continue;
+            }
+
+            entry = xzalloc(sizeof *entry);
+            entry->src_mac = ea;
+            entry->ip_src = ip_src;
+            entry->ip_dst = ip_dst;
+            entry->udp_src = bt->src_port;
+            entry->local_disc = htonl(bt->disc);
+            entry->next_tx = cur_time;
+            entry->last_rx = cur_time;
+            entry->detection_timeout = 30000;
+            entry->metadata = pb->datapath->tunnel_key;
+            entry->port_key = pb->tunnel_key;
+            entry->state = BFD_STATE_ADMIN_DOWN;
+            entry->local_min_tx = bt->min_tx;
+            entry->local_min_rx = bt->min_rx;
+            entry->remote_min_rx = 1; /* RFC5880 page 29 */
+            entry->local_mult = bt->detect_mult;
+
+            uint32_t hash = hash_string(bt->dst_ip, 0);
+            hmap_insert(&bfd_monitor_map, &entry->node, hash);
+        } else if (!strcmp(bt->status, "admin_down") &&
+                   entry->state != BFD_STATE_ADMIN_DOWN) {
+            entry->state = BFD_STATE_ADMIN_DOWN;
+            entry->change_state = false;
+            entry->remote_disc = 0;
+        } else if (strcmp(bt->status, "admin_down") &&
+                   entry->state == BFD_STATE_ADMIN_DOWN) {
+            entry->state = BFD_STATE_DOWN;
+            entry->change_state = false;
+            entry->remote_disc = 0;
+            changed = true;
+        } else if (entry->change_state && ovnsb_idl_txn) {
+            if (entry->state == BFD_STATE_DOWN) {
+                entry->remote_disc = 0;
+            }
+            sbrec_bfd_set_status(bt, bfd_get_status(entry->state));
+            entry->change_state = false;
+        }
+        bfd_monitor_check_sb_conf(bt, entry);
+        entry->erase = false;
+    }
+
+    HMAP_FOR_EACH_SAFE (entry, next_entry, node, &bfd_monitor_map) {
+        if (entry->erase) {
+            hmap_remove(&bfd_monitor_map, &entry->node);
+            free(entry);
+        }
+    }
+
+    if (changed) {
+        notify_pinctrl_handler();
+    }
 }
 
 static uint16_t

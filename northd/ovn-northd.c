@@ -1473,6 +1473,8 @@ struct ovn_port {
 
     bool has_unknown; /* If the addresses have 'unknown' defined. */
 
+    bool has_bfd;
+
     /* The port's peer:
      *
      *     - A switch port S of type "router" has a router port R as a peer,
@@ -7487,6 +7489,201 @@ build_lswitch_ip_unicast_lookup(struct ovn_port *op,
     }
 }
 
+struct bfd_entry {
+    struct hmap_node hmap_node;
+
+    const struct sbrec_bfd *sb_bt;
+
+    bool ref;
+};
+
+static struct bfd_entry *
+bfd_port_lookup(struct hmap *bfd_map, const char *logical_port,
+                const char *dst_ip)
+{
+    struct bfd_entry *bfd_e;
+    uint32_t hash;
+
+    hash = hash_string(dst_ip, 0);
+    hash = hash_string(logical_port, hash);
+    HMAP_FOR_EACH_WITH_HASH (bfd_e, hmap_node, hash, bfd_map) {
+        if (!strcmp(bfd_e->sb_bt->logical_port, logical_port) &&
+            !strcmp(bfd_e->sb_bt->dst_ip, dst_ip)) {
+            return bfd_e;
+        }
+    }
+    return NULL;
+}
+
+static void
+bfd_cleanup_connections(struct northd_context *ctx, struct hmap *bfd_map)
+{
+    const struct nbrec_bfd *nb_bt;
+    struct bfd_entry *bfd_e;
+
+    NBREC_BFD_FOR_EACH (nb_bt, ctx->ovnnb_idl) {
+        bfd_e = bfd_port_lookup(bfd_map, nb_bt->logical_port, nb_bt->dst_ip);
+        if (!bfd_e) {
+            continue;
+        }
+
+        if (!bfd_e->ref && strcmp(nb_bt->status, "admin_down")) {
+            /* no user for this bfd connection */
+            nbrec_bfd_set_status(nb_bt, "admin_down");
+        }
+    }
+
+    HMAP_FOR_EACH_POP (bfd_e, hmap_node, bfd_map) {
+        free(bfd_e);
+    }
+}
+
+#define BFD_DEF_MINTX       1000 /* 1s */
+#define BFD_DEF_MINRX       1000 /* 1s */
+#define BFD_DEF_DETECT_MULT 5
+
+static void
+build_bfd_update_sb_conf(const struct nbrec_bfd *nb_bt,
+                         const struct sbrec_bfd *sb_bt)
+{
+    if (strcmp(nb_bt->dst_ip, sb_bt->dst_ip)) {
+        sbrec_bfd_set_dst_ip(sb_bt, nb_bt->dst_ip);
+    }
+
+    if (strcmp(nb_bt->logical_port, sb_bt->logical_port)) {
+        sbrec_bfd_set_logical_port(sb_bt, nb_bt->logical_port);
+    }
+
+    if (strcmp(nb_bt->status, sb_bt->status)) {
+        sbrec_bfd_set_status(sb_bt, nb_bt->status);
+    }
+
+    int detect_mult = nb_bt->n_detect_mult ? nb_bt->detect_mult[0]
+                                           : BFD_DEF_DETECT_MULT;
+    if (detect_mult != sb_bt->detect_mult) {
+        sbrec_bfd_set_detect_mult(sb_bt, detect_mult);
+    }
+
+    int min_tx = nb_bt->n_min_tx ? nb_bt->min_tx[0] : BFD_DEF_MINTX;
+    if (min_tx != sb_bt->min_tx) {
+        sbrec_bfd_set_min_tx(sb_bt, min_tx);
+    }
+
+    int min_rx = nb_bt->n_min_rx ? nb_bt->min_rx[0] : BFD_DEF_MINRX;
+    if (min_rx != sb_bt->min_rx) {
+        sbrec_bfd_set_min_rx(sb_bt, min_rx);
+    }
+}
+
+/* RFC 5881 section 4
+ * The source port MUST be in the range 49152 through 65535.
+ * The same UDP source port number MUST be used for all BFD
+ * Control packets associated with a particular session.
+ * The source port number SHOULD be unique among all BFD
+ * sessions on the system
+ */
+#define BFD_UDP_SRC_PORT_START  49152
+#define BFD_UDP_SRC_PORT_LEN    (65535 - BFD_UDP_SRC_PORT_START)
+
+static int bfd_get_unused_port(unsigned long *bfd_src_ports)
+{
+    int port;
+
+    port = bitmap_scan(bfd_src_ports, 0, 0, BFD_UDP_SRC_PORT_LEN);
+    if (port == BFD_UDP_SRC_PORT_LEN) {
+        return -ENOSPC;
+    }
+    bitmap_set1(bfd_src_ports, port);
+
+    return port + BFD_UDP_SRC_PORT_START;
+}
+
+static void
+build_bfd_table(struct northd_context *ctx, struct hmap *bfd_connections,
+                struct hmap *ports)
+{
+    struct hmap sb_only = HMAP_INITIALIZER(&sb_only);
+    const struct sbrec_bfd *sb_bt;
+    unsigned long *bfd_src_ports;
+    struct bfd_entry *bfd_e;
+    uint32_t hash;
+
+    bfd_src_ports = bitmap_allocate(BFD_UDP_SRC_PORT_LEN);
+
+    SBREC_BFD_FOR_EACH (sb_bt, ctx->ovnsb_idl) {
+        bfd_e = xmalloc(sizeof *bfd_e);
+        bfd_e->sb_bt = sb_bt;
+        hash = hash_string(sb_bt->dst_ip, 0);
+        hash = hash_string(sb_bt->logical_port, hash);
+        hmap_insert(&sb_only, &bfd_e->hmap_node, hash);
+        bitmap_set1(bfd_src_ports, sb_bt->src_port - BFD_UDP_SRC_PORT_START);
+    }
+
+    const struct nbrec_bfd *nb_bt;
+    NBREC_BFD_FOR_EACH (nb_bt, ctx->ovnnb_idl) {
+        if (!nb_bt->status) {
+            /* default state is admin_down */
+            nbrec_bfd_set_status(nb_bt, "admin_down");
+        }
+
+        bfd_e = bfd_port_lookup(&sb_only, nb_bt->logical_port, nb_bt->dst_ip);
+        if (!bfd_e) {
+            int udp_src = bfd_get_unused_port(bfd_src_ports);
+            if (udp_src < 0) {
+                continue;
+            }
+
+            sb_bt = sbrec_bfd_insert(ctx->ovnsb_txn);
+            sbrec_bfd_set_logical_port(sb_bt, nb_bt->logical_port);
+            sbrec_bfd_set_dst_ip(sb_bt, nb_bt->dst_ip);
+            sbrec_bfd_set_disc(sb_bt, 1 + random_uint32());
+            sbrec_bfd_set_src_port(sb_bt, udp_src);
+            sbrec_bfd_set_status(sb_bt, nb_bt->status);
+
+            int min_tx = nb_bt->n_min_tx ? nb_bt->min_tx[0] : BFD_DEF_MINTX;
+            sbrec_bfd_set_min_tx(sb_bt, min_tx);
+            int min_rx = nb_bt->n_min_rx ? nb_bt->min_rx[0] : BFD_DEF_MINRX;
+            sbrec_bfd_set_min_rx(sb_bt, min_rx);
+            int d_mult = nb_bt->n_detect_mult ? nb_bt->detect_mult[0]
+                                              : BFD_DEF_DETECT_MULT;
+            sbrec_bfd_set_detect_mult(sb_bt, d_mult);
+        } else if (strcmp(bfd_e->sb_bt->status, nb_bt->status)) {
+            if (!strcmp(nb_bt->status, "admin_down") ||
+                !strcmp(bfd_e->sb_bt->status, "admin_down")) {
+                sbrec_bfd_set_status(bfd_e->sb_bt, nb_bt->status);
+            } else {
+                nbrec_bfd_set_status(nb_bt, bfd_e->sb_bt->status);
+            }
+        }
+        if (bfd_e) {
+            build_bfd_update_sb_conf(nb_bt, bfd_e->sb_bt);
+
+            hmap_remove(&sb_only, &bfd_e->hmap_node);
+            bfd_e->ref = false;
+            hash = hash_string(bfd_e->sb_bt->dst_ip, 0);
+            hash = hash_string(bfd_e->sb_bt->logical_port, hash);
+            hmap_insert(bfd_connections, &bfd_e->hmap_node, hash);
+        }
+
+        struct ovn_port *op = ovn_port_find(ports, nb_bt->logical_port);
+        if (op) {
+            op->has_bfd = true;
+        }
+    }
+
+    HMAP_FOR_EACH_POP (bfd_e, hmap_node, &sb_only) {
+        struct ovn_port *op = ovn_port_find(ports, bfd_e->sb_bt->logical_port);
+        if (op) {
+            op->has_bfd = false;
+        }
+        sbrec_bfd_delete(bfd_e->sb_bt);
+        free(bfd_e);
+    }
+    hmap_destroy(&sb_only);
+
+    bitmap_free(bfd_src_ports);
+}
+
 /* Returns a string of the IP address of the router port 'op' that
  * overlaps with 'ip_s".  If one is not found, returns NULL.
  *
@@ -7755,7 +7952,8 @@ route_hash(struct parsed_route *route)
  * Otherwise return NULL. */
 static struct parsed_route *
 parsed_routes_add(struct ovs_list *routes,
-                  const struct nbrec_logical_router_static_route *route)
+                  const struct nbrec_logical_router_static_route *route,
+                  struct hmap *bfd_connections)
 {
     /* Verify that the next hop is an IP address with an all-ones mask. */
     struct in6_addr nexthop;
@@ -7794,6 +7992,25 @@ parsed_routes_add(struct ovs_list *routes,
                      route->ip_prefix, route->nexthop,
                      UUID_ARGS(&route->header_.uuid));
         return NULL;
+    }
+
+    const struct nbrec_bfd *nb_bt = route->bfd;
+    if (nb_bt && !strcmp(nb_bt->dst_ip, route->nexthop)) {
+        struct bfd_entry *bfd_e;
+
+        bfd_e = bfd_port_lookup(bfd_connections, nb_bt->logical_port,
+                                nb_bt->dst_ip);
+        if (bfd_e) {
+            bfd_e->ref = true;
+        }
+
+        if (!strcmp(nb_bt->status, "admin_down")) {
+            nbrec_bfd_set_status(nb_bt, "down");
+        }
+
+        if (!strcmp(nb_bt->status, "down")) {
+            return NULL;
+        }
     }
 
     struct parsed_route *pr = xzalloc(sizeof *pr);
@@ -8238,16 +8455,15 @@ add_route(struct hmap *lflows, const struct ovn_port *op,
     build_route_match(op_inport, network_s, plen, is_src_route, is_ipv4,
                       &match, &priority);
 
-    struct ds actions = DS_EMPTY_INITIALIZER;
-    ds_put_format(&actions, "ip.ttl--; "REG_ECMP_GROUP_ID" = 0; %s = ",
+    struct ds common_actions = DS_EMPTY_INITIALIZER;
+    ds_put_format(&common_actions, REG_ECMP_GROUP_ID" = 0; %s = ",
                   is_ipv4 ? REG_NEXT_HOP_IPV4 : REG_NEXT_HOP_IPV6);
-
     if (gateway) {
-        ds_put_cstr(&actions, gateway);
+        ds_put_cstr(&common_actions, gateway);
     } else {
-        ds_put_format(&actions, "ip%s.dst", is_ipv4 ? "4" : "6");
+        ds_put_format(&common_actions, "ip%s.dst", is_ipv4 ? "4" : "6");
     }
-    ds_put_format(&actions, "; "
+    ds_put_format(&common_actions, "; "
                   "%s = %s; "
                   "eth.src = %s; "
                   "outport = %s; "
@@ -8257,11 +8473,20 @@ add_route(struct hmap *lflows, const struct ovn_port *op,
                   lrp_addr_s,
                   op->lrp_networks.ea_s,
                   op->json_key);
+    struct ds actions = DS_EMPTY_INITIALIZER;
+    ds_put_format(&actions, "ip.ttl--; %s", ds_cstr(&common_actions));
 
     ovn_lflow_add_with_hint(lflows, op->od, S_ROUTER_IN_IP_ROUTING, priority,
                             ds_cstr(&match), ds_cstr(&actions),
                             stage_hint);
+    if (op->has_bfd) {
+        ds_put_format(&match, " && udp.dst == 3784");
+        ovn_lflow_add_with_hint(lflows, op->od, S_ROUTER_IN_IP_ROUTING,
+                                priority + 1, ds_cstr(&match),
+                                ds_cstr(&common_actions), stage_hint);
+    }
     ds_destroy(&match);
+    ds_destroy(&common_actions);
     ds_destroy(&actions);
 }
 
@@ -8923,6 +9148,52 @@ build_lrouter_force_snat_flows(struct hmap *lflows, struct ovn_datapath *od,
     ds_destroy(&actions);
 }
 
+static void
+build_lrouter_bfd_flows(struct hmap *lflows, struct ovn_port *op)
+{
+    if (!op->has_bfd) {
+        return;
+    }
+
+    struct ds ip_list = DS_EMPTY_INITIALIZER;
+    struct ds match = DS_EMPTY_INITIALIZER;
+
+    if (op->lrp_networks.n_ipv4_addrs) {
+        op_put_v4_networks(&ip_list, op, false);
+        ds_put_format(&match, "ip4.src == %s && udp.dst == 3784",
+                      ds_cstr(&ip_list));
+        ovn_lflow_add_with_hint(lflows, op->od, S_ROUTER_IN_IP_INPUT, 110,
+                                ds_cstr(&match), "next; ",
+                                &op->nbrp->header_);
+        ds_clear(&match);
+        ds_put_format(&match, "ip4.dst == %s && udp.dst == 3784",
+                      ds_cstr(&ip_list));
+        ovn_lflow_add_with_hint(lflows, op->od, S_ROUTER_IN_IP_INPUT, 110,
+                                ds_cstr(&match), "handle_bfd_msg(); ",
+                                &op->nbrp->header_);
+    }
+    if (op->lrp_networks.n_ipv6_addrs) {
+        ds_clear(&ip_list);
+        ds_clear(&match);
+
+        op_put_v6_networks(&ip_list, op);
+        ds_put_format(&match, "ip6.src == %s && udp.dst == 3784",
+                      ds_cstr(&ip_list));
+        ovn_lflow_add_with_hint(lflows, op->od, S_ROUTER_IN_IP_INPUT, 110,
+                                ds_cstr(&match), "next; ",
+                                &op->nbrp->header_);
+        ds_clear(&match);
+        ds_put_format(&match, "ip6.dst == %s && udp.dst == 3784",
+                      ds_cstr(&ip_list));
+        ovn_lflow_add_with_hint(lflows, op->od, S_ROUTER_IN_IP_INPUT, 110,
+                                ds_cstr(&match), "handle_bfd_msg(); ",
+                                &op->nbrp->header_);
+    }
+
+    ds_destroy(&ip_list);
+    ds_destroy(&match);
+}
+
 /* Logical router ingress Table 0: L2 Admission Control
  * Generic admission control flows (without inport check).
  */
@@ -9328,7 +9599,7 @@ build_ip_routing_flows_for_lrouter_port(
 static void
 build_static_route_flows_for_lrouter(
         struct ovn_datapath *od, struct hmap *lflows,
-        struct hmap *ports)
+        struct hmap *ports, struct hmap *bfd_connections)
 {
     if (od->nbr) {
         ovn_lflow_add(lflows, od, S_ROUTER_IN_IP_ROUTING_ECMP, 150,
@@ -9340,7 +9611,8 @@ build_static_route_flows_for_lrouter(
         struct ecmp_groups_node *group;
         for (int i = 0; i < od->nbr->n_static_routes; i++) {
             struct parsed_route *route =
-                parsed_routes_add(&parsed_routes, od->nbr->static_routes[i]);
+                parsed_routes_add(&parsed_routes, od->nbr->static_routes[i],
+                                  bfd_connections);
             if (!route) {
                 continue;
             }
@@ -10429,6 +10701,9 @@ build_lrouter_ipv4_ip_input(struct ovn_port *op,
                                     &op->nbrp->header_);
         }
 
+        /* BFD msg handling */
+        build_lrouter_bfd_flows(lflows, op);
+
         /* ICMP time exceeded */
         for (int i = 0; i < op->lrp_networks.n_ipv4_addrs; i++) {
             ds_clear(match);
@@ -11317,7 +11592,8 @@ struct lswitch_flow_build_info {
 
 static void
 build_lswitch_and_lrouter_iterate_by_od(struct ovn_datapath *od,
-                                        struct lswitch_flow_build_info *lsi)
+                                        struct lswitch_flow_build_info *lsi,
+                                        struct hmap *bfd_connections)
 {
     /* Build Logical Switch Flows. */
     build_lswitch_lflows_pre_acl_and_acl(od, lsi->port_groups, lsi->lflows,
@@ -11337,7 +11613,8 @@ build_lswitch_and_lrouter_iterate_by_od(struct ovn_datapath *od,
     build_neigh_learning_flows_for_lrouter(od, lsi->lflows, &lsi->match,
                                            &lsi->actions);
     build_ND_RA_flows_for_lrouter(od, lsi->lflows);
-    build_static_route_flows_for_lrouter(od, lsi->lflows, lsi->ports);
+    build_static_route_flows_for_lrouter(od, lsi->lflows, lsi->ports,
+                                         bfd_connections);
     build_mcast_lookup_flows_for_lrouter(od, lsi->lflows, &lsi->match,
                                          &lsi->actions);
     build_ingress_policy_flows_for_lrouter(od, lsi->lflows, lsi->ports);
@@ -11401,7 +11678,8 @@ build_lswitch_and_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
                                 struct hmap *port_groups, struct hmap *lflows,
                                 struct hmap *mcgroups,
                                 struct hmap *igmp_groups,
-                                struct shash *meter_groups, struct hmap *lbs)
+                                struct shash *meter_groups, struct hmap *lbs,
+                                struct hmap *bfd_connections)
 {
     struct ovn_datapath *od;
     struct ovn_port *op;
@@ -11428,7 +11706,7 @@ build_lswitch_and_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
      * will move here and will be reogranized by iterator type.
      */
     HMAP_FOR_EACH (od, key_node, datapaths) {
-        build_lswitch_and_lrouter_iterate_by_od(od, &lsi);
+        build_lswitch_and_lrouter_iterate_by_od(od, &lsi, bfd_connections);
     }
     HMAP_FOR_EACH (op, key_node, ports) {
         build_lswitch_and_lrouter_iterate_by_op(op, &lsi);
@@ -11526,13 +11804,14 @@ build_lflows(struct northd_context *ctx, struct hmap *datapaths,
              struct hmap *ports, struct hmap *port_groups,
              struct hmap *mcgroups, struct hmap *igmp_groups,
              struct shash *meter_groups,
-             struct hmap *lbs)
+             struct hmap *lbs, struct hmap *bfd_connections)
 {
     struct hmap lflows = HMAP_INITIALIZER(&lflows);
 
     build_lswitch_and_lrouter_flows(datapaths, ports,
                                     port_groups, &lflows, mcgroups,
-                                    igmp_groups, meter_groups, lbs);
+                                    igmp_groups, meter_groups, lbs,
+                                    bfd_connections);
 
     /* Collecting all unique datapath groups. */
     struct hmap dp_groups = HMAP_INITIALIZER(&dp_groups);
@@ -12444,6 +12723,7 @@ ovnnb_db_run(struct northd_context *ctx,
     struct hmap igmp_groups;
     struct shash meter_groups = SHASH_INITIALIZER(&meter_groups);
     struct hmap lbs;
+    struct hmap bfd_connections = HMAP_INITIALIZER(&bfd_connections);
 
     /* Sync ipsec configuration.
      * Copy nb_cfg from northbound to southbound database.
@@ -12538,8 +12818,9 @@ ovnnb_db_run(struct northd_context *ctx,
     build_ip_mcast(ctx, datapaths);
     build_mcast_groups(ctx, datapaths, ports, &mcast_groups, &igmp_groups);
     build_meter_groups(ctx, &meter_groups);
+    build_bfd_table(ctx, &bfd_connections, ports);
     build_lflows(ctx, datapaths, ports, &port_groups, &mcast_groups,
-                 &igmp_groups, &meter_groups, &lbs);
+                 &igmp_groups, &meter_groups, &lbs, &bfd_connections);
     ovn_update_ipv6_prefix(ports);
 
     sync_address_sets(ctx);
@@ -12563,9 +12844,13 @@ ovnnb_db_run(struct northd_context *ctx,
     HMAP_FOR_EACH_SAFE (pg, next_pg, key_node, &port_groups) {
         ovn_port_group_destroy(&port_groups, pg);
     }
+
+    bfd_cleanup_connections(ctx, &bfd_connections);
+
     hmap_destroy(&igmp_groups);
     hmap_destroy(&mcast_groups);
     hmap_destroy(&port_groups);
+    hmap_destroy(&bfd_connections);
 
     struct shash_node *node, *next;
     SHASH_FOR_EACH_SAFE (node, next, &meter_groups) {
@@ -13499,6 +13784,16 @@ main(int argc, char *argv[])
     add_column_noalert(ovnsb_idl_loop.idl,
                        &sbrec_load_balancer_col_external_ids);
 
+    ovsdb_idl_add_table(ovnsb_idl_loop.idl, &sbrec_table_bfd);
+    ovsdb_idl_add_column(ovnsb_idl_loop.idl, &sbrec_bfd_col_logical_port);
+    ovsdb_idl_add_column(ovnsb_idl_loop.idl, &sbrec_bfd_col_dst_ip);
+    ovsdb_idl_add_column(ovnsb_idl_loop.idl, &sbrec_bfd_col_status);
+    ovsdb_idl_add_column(ovnsb_idl_loop.idl, &sbrec_bfd_col_min_tx);
+    ovsdb_idl_add_column(ovnsb_idl_loop.idl, &sbrec_bfd_col_min_rx);
+    ovsdb_idl_add_column(ovnsb_idl_loop.idl, &sbrec_bfd_col_detect_mult);
+    ovsdb_idl_add_column(ovnsb_idl_loop.idl, &sbrec_bfd_col_disc);
+    ovsdb_idl_add_column(ovnsb_idl_loop.idl, &sbrec_bfd_col_src_port);
+
     struct ovsdb_idl_index *sbrec_chassis_by_name
         = chassis_index_create(ovnsb_idl_loop.idl);
 
@@ -13620,6 +13915,7 @@ main(int argc, char *argv[])
             exiting = true;
         }
     }
+
 
     free(ovn_internal_version);
     unixctl_server_destroy(unixctl);

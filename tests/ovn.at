@@ -1807,6 +1807,10 @@ ct_snat_to_vip;
 ct_snat_to_vip(foo);
     Syntax error at `(' expecting `;'.
 
+# bfd packets
+handle_bfd_msg();
+    encodes as controller(userdata=00.00.00.17.00.00.00.00)
+
 # Miscellaneous negative tests.
 ;
     Syntax error at `;'.
@@ -2486,6 +2490,12 @@ for s in 1 2 3; do
     test_packet $s 01:00:00:00:00:00 f0:00:00:00:00:0$s -eth 1235 $bacl2
     test_packet $s 01:00:00:00:00:00 f0:00:00:00:00:0$s -eth 1236 $bacl3
 done
+
+# send packets for unknown datapath
+AT_CAPTURE_FILE([trace])
+AT_CHECK_UNQUOTED([ovs-appctl -t ovn-trace trace --all lsw100 "inport == p100 && ip4.dst == 10.96.57.175"], [0], [dnl
+unknown datapath "lsw100"
+])
 
 AT_CLEANUP
 
@@ -16895,6 +16905,8 @@ AT_CHECK([ovn-sbctl get controller_event $uuid event_info:vip], [0], [dnl
 AT_CHECK_UNQUOTED([ovn-sbctl get controller_event $uuid event_info:load_balancer], [0], [dnl
 "$uuid_lb2"
 ])
+
+AT_CHECK_UNQUOTED([ovn-trace sw0 'inport == "sw0-p11" && eth.src == 00:00:00:00:00:11 && ip4.dst == 192.168.1.100 && tcp && tcp.dst == 80' | grep -q 'event = "empty_lb_backends"'], [0])
 
 OVN_CLEANUP([hv1], [hv2])
 AT_CLEANUP
