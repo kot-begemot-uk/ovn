@@ -38,6 +38,7 @@
 #include "openvswitch/ofp-util.h"
 #include "openvswitch/vlog.h"
 #include "lib/random.h"
+#include "lib/crc32c.h"
 
 #include "lib/dhcp.h"
 #include "ovn-controller.h"
@@ -1781,6 +1782,116 @@ pinctrl_handle_tcp_reset(struct rconn *swconn, const struct flow *ip_flow,
     dp_packet_uninit(&packet);
 }
 
+static void dp_packet_put_sctp_abort(struct dp_packet *packet,
+                                     bool reflect_tag)
+{
+    struct sctp_chunk_header abort = {
+        .sctp_chunk_type = SCTP_CHUNK_TYPE_ABORT,
+        .sctp_chunk_flags = reflect_tag ? SCTP_ABORT_CHUNK_FLAG_T : 0,
+        .sctp_chunk_len = htons(SCTP_CHUNK_HEADER_LEN),
+    };
+
+    dp_packet_put(packet, &abort, sizeof abort);
+}
+
+static void
+pinctrl_handle_sctp_abort(struct rconn *swconn, const struct flow *ip_flow,
+                         struct dp_packet *pkt_in,
+                         const struct match *md, struct ofpbuf *userdata,
+                         bool loopback)
+{
+    if (ip_flow->nw_proto != IPPROTO_SCTP) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
+        VLOG_WARN_RL(&rl, "SCTP_ABORT action on non-SCTP packet");
+        return;
+    }
+
+    struct sctp_header *sh_in = dp_packet_l4(pkt_in);
+    if (!sh_in) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
+        VLOG_WARN_RL(&rl, "SCTP_ABORT action on malformed SCTP packet");
+        return;
+    }
+
+    const struct sctp_chunk_header *sh_in_chunk =
+        dp_packet_get_sctp_payload(pkt_in);
+    if (!sh_in_chunk) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
+        VLOG_WARN_RL(&rl, "SCTP_ABORT action on SCTP packet with no chunks");
+        return;
+    }
+
+    if (sh_in_chunk->sctp_chunk_type == SCTP_CHUNK_TYPE_ABORT) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
+        VLOG_WARN_RL(&rl, "sctp_abort action on incoming SCTP ABORT.");
+        return;
+    }
+
+    const struct sctp_init_chunk *sh_in_init = NULL;
+    if (sh_in_chunk->sctp_chunk_type == SCTP_CHUNK_TYPE_INIT) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
+        sh_in_init = dp_packet_at(pkt_in, pkt_in->l4_ofs +
+                                          SCTP_HEADER_LEN +
+                                          SCTP_CHUNK_HEADER_LEN,
+                                  SCTP_INIT_CHUNK_LEN);
+        if (!sh_in_init) {
+            VLOG_WARN_RL(&rl, "Incomplete SCTP INIT chunk. Ignoring packet.");
+            return;
+        }
+    }
+
+    uint64_t packet_stub[128 / 8];
+    struct dp_packet packet;
+
+    dp_packet_use_stub(&packet, packet_stub, sizeof packet_stub);
+
+    struct eth_addr eth_src = loopback ? ip_flow->dl_dst : ip_flow->dl_src;
+    struct eth_addr eth_dst = loopback ? ip_flow->dl_src : ip_flow->dl_dst;
+
+    if (get_dl_type(ip_flow) == htons(ETH_TYPE_IPV6)) {
+        const struct in6_addr *ip6_src =
+            loopback ? &ip_flow->ipv6_dst : &ip_flow->ipv6_src;
+        const struct in6_addr *ip6_dst =
+            loopback ? &ip_flow->ipv6_src : &ip_flow->ipv6_dst;
+        pinctrl_compose_ipv6(&packet, eth_src, eth_dst,
+                             (struct in6_addr *) ip6_src,
+                             (struct in6_addr *) ip6_dst,
+                             IPPROTO_SCTP, 63, SCTP_HEADER_LEN +
+                                               SCTP_CHUNK_HEADER_LEN);
+    } else {
+        ovs_be32 nw_src = loopback ? ip_flow->nw_dst : ip_flow->nw_src;
+        ovs_be32 nw_dst = loopback ? ip_flow->nw_src : ip_flow->nw_dst;
+        pinctrl_compose_ipv4(&packet, eth_src, eth_dst, nw_src, nw_dst,
+                             IPPROTO_SCTP, 63, SCTP_HEADER_LEN +
+                                               SCTP_CHUNK_HEADER_LEN);
+    }
+
+    struct sctp_header *sh = dp_packet_put_zeros(&packet, sizeof *sh);
+    dp_packet_set_l4(&packet, sh);
+    sh->sctp_dst = ip_flow->tp_src;
+    sh->sctp_src = ip_flow->tp_dst;
+    put_16aligned_be32(&sh->sctp_csum, 0);
+
+    bool tag_reflected;
+    if (get_16aligned_be32(&sh_in->sctp_vtag) == 0 && sh_in_init) {
+        /* See RFC 4960 Section 8.4, item 3. */
+        put_16aligned_be32(&sh->sctp_vtag, sh_in_init->initiate_tag);
+        tag_reflected = false;
+    } else {
+        /* See RFC 4960 Section 8.4, item 8. */
+        sh->sctp_vtag = sh_in->sctp_vtag;
+        tag_reflected = true;
+    }
+
+    dp_packet_put_sctp_abort(&packet, tag_reflected);
+
+    put_16aligned_be32(&sh->sctp_csum, crc32c((void *) sh,
+                                              dp_packet_l4_size(&packet)));
+
+    set_actions_and_enqueue_msg(swconn, &packet, md, userdata);
+    dp_packet_uninit(&packet);
+}
+
 static void
 pinctrl_handle_reject(struct rconn *swconn, const struct flow *ip_flow,
                       struct dp_packet *pkt_in,
@@ -1788,6 +1899,8 @@ pinctrl_handle_reject(struct rconn *swconn, const struct flow *ip_flow,
 {
     if (ip_flow->nw_proto == IPPROTO_TCP) {
         pinctrl_handle_tcp_reset(swconn, ip_flow, pkt_in, md, userdata, true);
+    } else if (ip_flow->nw_proto == IPPROTO_SCTP) {
+        pinctrl_handle_sctp_abort(swconn, ip_flow, pkt_in, md, userdata, true);
     } else {
         pinctrl_handle_icmp(swconn, ip_flow, pkt_in, md, userdata, true, true);
     }
@@ -2942,6 +3055,11 @@ process_packet_in(struct rconn *swconn, const struct ofp_header *msg)
     case ACTION_OPCODE_TCP_RESET:
         pinctrl_handle_tcp_reset(swconn, &headers, &packet, &pin.flow_metadata,
                                  &userdata, false);
+        break;
+
+    case ACTION_OPCODE_SCTP_ABORT:
+        pinctrl_handle_sctp_abort(swconn, &headers, &packet,
+                                  &pin.flow_metadata, &userdata, false);
         break;
 
     case ACTION_OPCODE_REJECT:
@@ -6426,10 +6544,10 @@ struct bfd_entry {
 
     /* L2 source address */
     struct eth_addr src_mac;
-    /* IPv4 source address */
-    ovs_be32 ip_src;
-    /* IPv4 destination address */
-    ovs_be32 ip_dst;
+    /* IP source address */
+    struct in6_addr ip_src;
+    /* IP destination address */
+    struct in6_addr ip_dst;
     /* RFC 5881 section 4
      * The source port MUST be in the range 49152 through 65535.
      * The same UDP source port number MUST be used for all BFD
@@ -6491,20 +6609,17 @@ pinctrl_find_bfd_monitor_entry_by_port(char *ip, uint16_t port)
 }
 
 static struct bfd_entry *
-pinctrl_find_bfd_monitor_entry_by_disc(ovs_be32 ip, ovs_be32 disc)
+pinctrl_find_bfd_monitor_entry_by_disc(char *ip, ovs_be32 disc)
 {
-    char *ip_src = xasprintf(IP_FMT, IP_ARGS(ip));
     struct bfd_entry *ret = NULL, *entry;
 
-    HMAP_FOR_EACH_WITH_HASH (entry, node, hash_string(ip_src, 0),
+    HMAP_FOR_EACH_WITH_HASH (entry, node, hash_string(ip, 0),
                              &bfd_monitor_map) {
         if (entry->local_disc == disc) {
             ret = entry;
             break;
         }
     }
-
-    free(ip_src);
     return ret;
 }
 
@@ -6534,33 +6649,28 @@ static void
 bfd_monitor_put_bfd_msg(struct bfd_entry *entry, struct dp_packet *packet,
                         bool final)
 {
-    struct udp_header *udp;
-    struct bfd_msg *msg;
+    int payload_len = sizeof(struct udp_header) + sizeof(struct bfd_msg);
 
     /* Properly align after the ethernet header */
     dp_packet_reserve(packet, 2);
-    struct eth_header *eth = dp_packet_put_uninit(packet, sizeof *eth);
-    eth->eth_dst = eth_addr_broadcast;
-    eth->eth_src = entry->src_mac;
-    eth->eth_type = htons(ETH_TYPE_IP);
+    if (IN6_IS_ADDR_V4MAPPED(&entry->ip_src)) {
+        ovs_be32 ip_src = in6_addr_get_mapped_ipv4(&entry->ip_src);
+        ovs_be32 ip_dst = in6_addr_get_mapped_ipv4(&entry->ip_dst);
+        pinctrl_compose_ipv4(packet, entry->src_mac, eth_addr_broadcast,
+                             ip_src, ip_dst, IPPROTO_UDP, MAXTTL, payload_len);
+    } else {
+        pinctrl_compose_ipv6(packet, entry->src_mac, eth_addr_broadcast,
+                             &entry->ip_src, &entry->ip_dst, IPPROTO_UDP,
+                             MAXTTL, payload_len);
+    }
 
-    struct ip_header *ip = dp_packet_put_zeros(packet, sizeof *ip);
-    ip->ip_ihl_ver = IP_IHL_VER(5, 4);
-    ip->ip_tot_len = htons(sizeof *ip + sizeof *udp + sizeof *msg);
-    ip->ip_ttl = MAXTTL;
-    ip->ip_tos = IPTOS_PREC_INTERNETCONTROL;
-    ip->ip_proto = IPPROTO_UDP;
-    put_16aligned_be32(&ip->ip_src, entry->ip_src);
-    put_16aligned_be32(&ip->ip_dst, entry->ip_dst);
-    /* Checksum has already been zeroed by put_zeros call. */
-    ip->ip_csum = csum(ip, sizeof *ip);
-
-    udp = dp_packet_put_zeros(packet, sizeof *udp);
+    struct udp_header *udp = dp_packet_put_zeros(packet, sizeof *udp);
+    udp->udp_len = htons(payload_len);
+    udp->udp_csum = 0;
     udp->udp_src = htons(entry->udp_src);
     udp->udp_dst = htons(BFD_DEST_PORT);
-    udp->udp_len = htons(sizeof *udp + sizeof *msg);
 
-    msg = dp_packet_put_zeros(packet, sizeof *msg);
+    struct bfd_msg *msg = dp_packet_put_zeros(packet, sizeof *msg);
     msg->vers_diag = (BFD_VERSION << 5);
     msg->mult = entry->local_mult;
     msg->length = BFD_PACKET_LEN;
@@ -6571,6 +6681,17 @@ bfd_monitor_put_bfd_msg(struct bfd_entry *entry, struct dp_packet *packet,
     /* min_tx and min_rx are in us - RFC 5880 page 9 */
     msg->min_tx = htonl(entry->local_min_tx * 1000);
     msg->min_rx = htonl(entry->local_min_rx * 1000);
+
+    if (!IN6_IS_ADDR_V4MAPPED(&entry->ip_src)) {
+        /* IPv6 needs UDP checksum calculated */
+        uint32_t csum = packet_csum_pseudoheader6(dp_packet_l3(packet));
+        int len = (uint8_t *)udp - (uint8_t *)dp_packet_eth(packet);
+        csum = csum_continue(csum, udp, dp_packet_size(packet) - len);
+        udp->udp_csum = csum_finish(csum);
+        if (!udp->udp_csum) {
+            udp->udp_csum = htons(0xffff);
+        }
+    }
 }
 
 static void
@@ -6769,9 +6890,18 @@ pinctrl_handle_bfd_msg(struct rconn *swconn, const struct flow *ip_flow,
         return;
     }
 
+    char *ip_src;
+    if (ip_flow->dl_type == htons(ETH_TYPE_IP)) {
+        ip_src = normalize_ipv4_prefix(ip_flow->nw_src, 32);
+    } else {
+        ip_src = normalize_ipv6_prefix(&ip_flow->ipv6_src, 128);
+    }
+
     const struct bfd_msg *msg = dp_packet_get_udp_payload(pkt_in);
-    struct bfd_entry *entry = pinctrl_find_bfd_monitor_entry_by_disc(
-            ip_flow->nw_src, msg->your_disc);
+    struct bfd_entry *entry =
+        pinctrl_find_bfd_monitor_entry_by_disc(ip_src, msg->your_disc);
+    free(ip_src);
+
     if (!entry) {
         return;
     }
@@ -6854,10 +6984,21 @@ static void
 bfd_monitor_check_sb_conf(const struct sbrec_bfd *sb_bt,
                           struct bfd_entry *entry)
 {
-    ovs_be32 ip_dst;
+    struct lport_addresses dst_addr;
 
-    if (ip_parse(sb_bt->dst_ip, &ip_dst) && ip_dst != entry->ip_dst) {
-        entry->ip_dst = ip_dst;
+    if (extract_ip_addresses(sb_bt->dst_ip, &dst_addr)) {
+        struct in6_addr addr;
+
+        if (dst_addr.n_ipv6_addrs > 0) {
+            addr = dst_addr.ipv6_addrs[0].addr;
+        } else {
+            addr = in6_addr_mapped_ipv4(dst_addr.ipv4_addrs[0].addr);
+        }
+
+        if (!ipv6_addr_equals(&addr, &entry->ip_dst)) {
+            entry->ip_dst = addr;
+        }
+        destroy_lport_addresses(&dst_addr);
     }
 
     if (sb_bt->min_tx != entry->local_min_tx) {
@@ -6922,11 +7063,15 @@ bfd_monitor_run(struct ovsdb_idl_txn *ovnsb_idl_txn,
         entry = pinctrl_find_bfd_monitor_entry_by_port(
                 bt->dst_ip, bt->src_port);
         if (!entry) {
-            ovs_be32 ip_dst, ip_src = htonl(BFD_DEFAULT_SRC_IP);
             struct eth_addr ea = eth_addr_zero;
+            struct lport_addresses dst_addr;
+            struct in6_addr ip_src, ip_dst;
             int i;
 
-            if (!ip_parse(bt->dst_ip, &ip_dst)) {
+            ip_dst = in6_addr_mapped_ipv4(htonl(BFD_DEFAULT_DST_IP));
+            ip_src = in6_addr_mapped_ipv4(htonl(BFD_DEFAULT_SRC_IP));
+
+            if (!extract_ip_addresses(bt->dst_ip, &dst_addr)) {
                 continue;
             }
 
@@ -6938,13 +7083,20 @@ bfd_monitor_run(struct ovsdb_idl_txn *ovnsb_idl_txn,
                 }
 
                 ea = laddrs.ea;
-                if (laddrs.n_ipv4_addrs > 0) {
-                    ip_src = laddrs.ipv4_addrs[0].addr;
+                if (dst_addr.n_ipv6_addrs > 0 && laddrs.n_ipv6_addrs > 0) {
+                    ip_dst = dst_addr.ipv6_addrs[0].addr;
+                    ip_src = laddrs.ipv6_addrs[0].addr;
+                    destroy_lport_addresses(&laddrs);
+                    break;
+                } else if (laddrs.n_ipv4_addrs > 0) {
+                    ip_dst = in6_addr_mapped_ipv4(dst_addr.ipv4_addrs[0].addr);
+                    ip_src = in6_addr_mapped_ipv4(laddrs.ipv4_addrs[0].addr);
                     destroy_lport_addresses(&laddrs);
                     break;
                 }
                 destroy_lport_addresses(&laddrs);
             }
+            destroy_lport_addresses(&dst_addr);
 
             if (eth_addr_is_zero(ea)) {
                 continue;
