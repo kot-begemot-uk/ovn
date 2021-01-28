@@ -43,6 +43,12 @@ extern "C" {
 #else
 
 
+#ifdef __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wthread-safety"
+#endif
+
+
 /* A version of the HMAP_FOR_EACH macro intended for iterating as part
  * of parallel processing.
  * Each worker thread has a different ThreadID in the range of 0..POOL_SIZE
@@ -262,6 +268,12 @@ bool ovn_can_parallelize_hashes(void);
 
 #define run_pool_callback(pool, fin_result, result_frags, helper_func) \
     ovn_run_pool_callback(pool, fin_result, result_frags, helper_func)
+
+
+
+#ifdef __clang__
+#pragma clang diagnostic pop
+#endif
 
 #endif
 
