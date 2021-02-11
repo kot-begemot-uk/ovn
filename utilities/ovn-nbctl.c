@@ -2838,6 +2838,13 @@ nbctl_lb_add(struct ctl_context *ctx)
     bool may_exist = shash_find(&ctx->options, "--may-exist") != NULL;
     bool add_duplicate = shash_find(&ctx->options, "--add-duplicate") != NULL;
     bool empty_backend_rej = shash_find(&ctx->options, "--reject") != NULL;
+    bool empty_backend_event = shash_find(&ctx->options, "--event") != NULL;
+
+    if (empty_backend_event && empty_backend_rej) {
+            ctl_error(ctx,
+                      "--reject and --event can't specified at the same time");
+            return;
+    }
 
     const char *lb_proto;
     bool is_update_proto = false;
@@ -2953,6 +2960,10 @@ nbctl_lb_add(struct ctl_context *ctx)
     nbrec_load_balancer_set_vips(lb, &lb->vips);
     if (empty_backend_rej) {
         const struct smap options = SMAP_CONST1(&options, "reject", "true");
+        nbrec_load_balancer_set_options(lb, &options);
+    }
+    if (empty_backend_event) {
+        const struct smap options = SMAP_CONST1(&options, "event", "true");
         nbrec_load_balancer_set_options(lb, &options);
     }
 out:
@@ -3906,6 +3917,47 @@ nbctl_lr_policy_list(struct ctl_context *ctx)
     }
     free(policies);
 }
+
+static struct nbrec_logical_router_static_route *
+nbctl_lr_get_route(const struct nbrec_logical_router *lr, char *prefix,
+                   char *next_hop, bool is_src_route, bool ecmp)
+{
+    for (int i = 0; i < lr->n_static_routes; i++) {
+        struct nbrec_logical_router_static_route *route = lr->static_routes[i];
+
+        /* Compare route policy. */
+        char *nb_policy = route->policy;
+        bool nb_is_src_route = false;
+        if (nb_policy && !strcmp(nb_policy, "src-ip")) {
+                nb_is_src_route = true;
+        }
+        if (is_src_route != nb_is_src_route) {
+            continue;
+        }
+
+        /* Compare route prefix. */
+        char *rt_prefix = normalize_prefix_str(route->ip_prefix);
+        if (!rt_prefix) {
+            /* Ignore existing prefix we couldn't parse. */
+            continue;
+        }
+
+        if (strcmp(rt_prefix, prefix)) {
+            free(rt_prefix);
+            continue;
+        }
+
+        if (ecmp && strcmp(next_hop, route->nexthop)) {
+            free(rt_prefix);
+            continue;
+        }
+
+        free(rt_prefix);
+        return route;
+    }
+    return NULL;
+}
+
 
 static void
 nbctl_lr_route_add(struct ctl_context *ctx)
@@ -3949,44 +4001,42 @@ nbctl_lr_route_add(struct ctl_context *ctx)
         goto cleanup;
     }
 
+    struct shash_node *bfd = shash_find(&ctx->options, "--bfd");
+    const struct nbrec_bfd *nb_bt = NULL;
+    if (bfd) {
+        if (bfd->data) {
+            struct uuid bfd_uuid;
+            if (uuid_from_string(&bfd_uuid, bfd->data)) {
+                nb_bt = nbrec_bfd_get_for_uuid(ctx->idl, &bfd_uuid);
+            }
+            if (!nb_bt) {
+                ctl_error(ctx, "no entry found in the BFD table");
+                goto cleanup;
+            }
+        } else {
+            const struct nbrec_bfd *iter;
+            NBREC_BFD_FOR_EACH (iter, ctx->idl) {
+                if (!strcmp(iter->dst_ip, next_hop)) {
+                    nb_bt = iter;
+                    break;
+                }
+            }
+        }
+    }
+
     bool may_exist = shash_find(&ctx->options, "--may-exist") != NULL;
     bool ecmp_symmetric_reply = shash_find(&ctx->options,
                                            "--ecmp-symmetric-reply") != NULL;
     bool ecmp = shash_find(&ctx->options, "--ecmp") != NULL ||
                 ecmp_symmetric_reply;
+    struct nbrec_logical_router_static_route *route =
+        nbctl_lr_get_route(lr, prefix, next_hop, is_src_route, ecmp);
     if (!ecmp) {
-        for (int i = 0; i < lr->n_static_routes; i++) {
-            const struct nbrec_logical_router_static_route *route
-                = lr->static_routes[i];
-            char *rt_prefix;
-
-            /* Compare route policy. */
-            char *nb_policy = lr->static_routes[i]->policy;
-            bool nb_is_src_route = false;
-            if (nb_policy && !strcmp(nb_policy, "src-ip")) {
-                    nb_is_src_route = true;
-            }
-            if (is_src_route != nb_is_src_route) {
-                continue;
-            }
-
-            /* Compare route prefix. */
-            rt_prefix = normalize_prefix_str(lr->static_routes[i]->ip_prefix);
-            if (!rt_prefix) {
-                /* Ignore existing prefix we couldn't parse. */
-                continue;
-            }
-
-            if (strcmp(rt_prefix, prefix)) {
-                free(rt_prefix);
-                continue;
-            }
-
+        if (route) {
             if (!may_exist) {
                 ctl_error(ctx, "duplicate prefix: %s (policy: %s). Use option"
                           " --ecmp to allow this for ECMP routing.",
                           prefix, is_src_route ? "src-ip" : "dst-ip");
-                free(rt_prefix);
                 goto cleanup;
             }
 
@@ -4003,12 +4053,25 @@ nbctl_lr_route_add(struct ctl_context *ctx)
             if (policy) {
                  nbrec_logical_router_static_route_set_policy(route, policy);
             }
-            free(rt_prefix);
+            if (bfd) {
+                if (!nb_bt) {
+                    if (ctx->argc != 5) {
+                        ctl_error(ctx, "insert entry in the BFD table failed");
+                        goto cleanup;
+                    }
+                    nb_bt = nbrec_bfd_insert(ctx->txn);
+                    nbrec_bfd_set_dst_ip(nb_bt, next_hop);
+                    nbrec_bfd_set_logical_port(nb_bt, ctx->argv[4]);
+                }
+                nbrec_logical_router_static_route_set_bfd(route, nb_bt);
+            }
             goto cleanup;
         }
+    } else if (route) {
+        ctl_error(ctx, "duplicate nexthop for the same ECMP route");
+        goto cleanup;
     }
 
-    struct nbrec_logical_router_static_route *route;
     route = nbrec_logical_router_static_route_insert(ctx->txn);
     nbrec_logical_router_static_route_set_ip_prefix(route, prefix);
     nbrec_logical_router_static_route_set_nexthop(route, next_hop);
@@ -4027,6 +4090,18 @@ nbctl_lr_route_add(struct ctl_context *ctx)
     }
 
     nbrec_logical_router_update_static_routes_addvalue(lr, route);
+    if (bfd) {
+        if (!nb_bt) {
+            if (ctx->argc != 5) {
+                ctl_error(ctx, "insert entry in the BFD table failed");
+                goto cleanup;
+            }
+            nb_bt = nbrec_bfd_insert(ctx->txn);
+            nbrec_bfd_set_dst_ip(nb_bt, next_hop);
+            nbrec_bfd_set_logical_port(nb_bt, ctx->argv[4]);
+        }
+        nbrec_logical_router_static_route_set_bfd(route, nb_bt);
+    }
 
 cleanup:
     free(next_hop);
@@ -5446,16 +5521,26 @@ struct ipv4_route {
 };
 
 static int
+__ipv4_route_cmp(const struct ipv4_route *r1, const struct ipv4_route *r2)
+{
+    if (r1->priority != r2->priority) {
+        return r1->priority > r2->priority ? -1 : 1;
+    }
+    if (r1->addr != r2->addr) {
+        return ntohl(r1->addr) < ntohl(r2->addr) ? -1 : 1;
+    }
+    return 0;
+}
+
+static int
 ipv4_route_cmp(const void *route1_, const void *route2_)
 {
     const struct ipv4_route *route1p = route1_;
     const struct ipv4_route *route2p = route2_;
 
-    if (route1p->priority != route2p->priority) {
-        return route1p->priority > route2p->priority ? -1 : 1;
-    }
-    if (route1p->addr != route2p->addr) {
-        return ntohl(route1p->addr) < ntohl(route2p->addr) ? -1 : 1;
+    int ret = __ipv4_route_cmp(route1p, route2p);
+    if (ret) {
+        return ret;
     }
     return route_cmp_details(route1p->route, route2p->route);
 }
@@ -5467,15 +5552,21 @@ struct ipv6_route {
 };
 
 static int
+__ipv6_route_cmp(const struct ipv6_route *r1, const struct ipv6_route *r2)
+{
+    if (r1->priority != r2->priority) {
+        return r1->priority > r2->priority ? -1 : 1;
+    }
+    return memcmp(&r1->addr, &r2->addr, sizeof(r1->addr));
+}
+
+static int
 ipv6_route_cmp(const void *route1_, const void *route2_)
 {
     const struct ipv6_route *route1p = route1_;
     const struct ipv6_route *route2p = route2_;
 
-    if (route1p->priority != route2p->priority) {
-        return route1p->priority > route2p->priority ? -1 : 1;
-    }
-    int ret = memcmp(&route1p->addr, &route2p->addr, sizeof(route1p->addr));
+    int ret = __ipv6_route_cmp(route1p, route2p);
     if (ret) {
         return ret;
     }
@@ -5483,7 +5574,8 @@ ipv6_route_cmp(const void *route1_, const void *route2_)
 }
 
 static void
-print_route(const struct nbrec_logical_router_static_route *route, struct ds *s)
+print_route(const struct nbrec_logical_router_static_route *route,
+            struct ds *s, bool ecmp)
 {
 
     char *prefix = normalize_prefix_str(route->ip_prefix);
@@ -5504,6 +5596,14 @@ print_route(const struct nbrec_logical_router_static_route *route, struct ds *s)
 
     if (smap_get(&route->external_ids, "ic-learned-route")) {
         ds_put_format(s, " (learned)");
+    }
+
+    if (ecmp) {
+        ds_put_cstr(s, " ecmp");
+    }
+
+    if (smap_get_bool(&route->options, "ecmp_symmetric_reply", false)) {
+        ds_put_cstr(s, " ecmp-symmetric-reply");
     }
 
     if (route->bfd) {
@@ -5575,7 +5675,16 @@ nbctl_lr_route_list(struct ctl_context *ctx)
         ds_put_cstr(&ctx->output, "IPv4 Routes\n");
     }
     for (int i = 0; i < n_ipv4_routes; i++) {
-        print_route(ipv4_routes[i].route, &ctx->output);
+        bool ecmp = false;
+        if (i < n_ipv4_routes - 1 &&
+            !__ipv4_route_cmp(&ipv4_routes[i], &ipv4_routes[i + 1])) {
+            ecmp = true;
+        } else if (i > 0 &&
+                   !__ipv4_route_cmp(&ipv4_routes[i],
+                                     &ipv4_routes[i - 1])) {
+            ecmp = true;
+        }
+        print_route(ipv4_routes[i].route, &ctx->output, ecmp);
     }
 
     if (n_ipv6_routes) {
@@ -5583,7 +5692,16 @@ nbctl_lr_route_list(struct ctl_context *ctx)
                       n_ipv4_routes ?  "\n" : "");
     }
     for (int i = 0; i < n_ipv6_routes; i++) {
-        print_route(ipv6_routes[i].route, &ctx->output);
+        bool ecmp = false;
+        if (i < n_ipv6_routes - 1 &&
+            !__ipv6_route_cmp(&ipv6_routes[i], &ipv6_routes[i + 1])) {
+            ecmp = true;
+        } else if (i > 0 &&
+                   !__ipv6_route_cmp(&ipv6_routes[i],
+                                     &ipv6_routes[i - 1])) {
+            ecmp = true;
+        }
+        print_route(ipv6_routes[i].route, &ctx->output, ecmp);
     }
 
     free(ipv4_routes);
@@ -6497,7 +6615,7 @@ static const struct ctl_command_syntax nbctl_commands[] = {
     /* logical router route commands. */
     { "lr-route-add", 3, 4, "ROUTER PREFIX NEXTHOP [PORT]", NULL,
       nbctl_lr_route_add, NULL, "--may-exist,--ecmp,--ecmp-symmetric-reply,"
-      "--policy=", RW },
+      "--policy=,--bfd?", RW },
     { "lr-route-del", 1, 4, "ROUTER [PREFIX [NEXTHOP [PORT]]]", NULL,
       nbctl_lr_route_del, NULL, "--if-exists,--policy=", RW },
     { "lr-route-list", 1, 1, "ROUTER", NULL, nbctl_lr_route_list, NULL,
@@ -6524,7 +6642,7 @@ static const struct ctl_command_syntax nbctl_commands[] = {
       nbctl_lr_nat_set_ext_ips, NULL, "--is-exempted", RW},
     /* load balancer commands. */
     { "lb-add", 3, 4, "LB VIP[:PORT] IP[:PORT]... [PROTOCOL]", NULL,
-      nbctl_lb_add, NULL, "--may-exist,--add-duplicate,--reject", RW },
+      nbctl_lb_add, NULL, "--may-exist,--add-duplicate,--reject,--event", RW },
     { "lb-del", 1, 2, "LB [VIP]", NULL, nbctl_lb_del, NULL,
         "--if-exists", RW },
     { "lb-list", 0, 1, "[LB]", NULL, nbctl_lb_list, NULL, "", RO },

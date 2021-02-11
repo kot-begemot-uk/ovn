@@ -322,6 +322,11 @@
       table. See <code>ovn-controller</code>(8) for more information.
     </column>
 
+    <column name="other_config" key="port-up-notif">
+      <code>ovn-controller</code> populates this key with <code>true</code>
+      when it supports <code>Port_Binding.up</code>.
+    </column>
+
     <group title="Common Columns">
       The overall purpose of these columns is described under <code>Common
       Columns</code> at the beginning of this document.
@@ -4232,6 +4237,14 @@ tcp.flags = RST;
     <column name="datapaths">
       Datapaths to which this load balancer applies to.
     </column>
+
+    <group title="Load_Balancer options">
+    <column name="options" key="hairpin_snat_ip">
+      IP to be used as source IP for packets that have been hair-pinned after
+      load balancing.  This value is automatically populated by
+      <code>ovn-northd</code>.
+    </column>
+    </group>
 
     <group title="Common Columns">
       <column name="external_ids">

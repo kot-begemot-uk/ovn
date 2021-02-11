@@ -249,6 +249,29 @@
         processing the southbound and local Open vSwitch database changes.
         The default value is considered false if this option is not defined.
       </dd>
+
+      <dt><code>external_ids:ovn-enable-lflow-cache</code></dt>
+      <dd>
+        The boolean flag indicates if <code>ovn-controller</code> should
+        enable/disable the logical flow in-memory cache it uses when
+        processing Southbound database logical flow changes.  By default
+        caching is enabled.
+      </dd>
+
+      <dt><code>external_ids:ovn-limit-lflow-cache</code></dt>
+      <dd>
+        When used, this configuration value determines the maximum number of
+        logical flow cache entries <code>ovn-controller</code> may create
+        when the logical flow cache is enabled.  By default the size of the
+        cache is unlimited.
+      </dd>
+      <dt><code>external_ids:ovn-memlimit-lflow-cache-kb</code></dt>
+      <dd>
+        When used, this configuration value determines the maximum size of
+        the logical flow cache (in KB) <code>ovn-controller</code> may create
+        when the logical flow cache is enabled.  By default the size of the
+        cache is unlimited.
+      </dd>
     </dl>
 
     <p>
@@ -543,6 +566,17 @@
         is useful when <code>ovn-nbctl --wait=hv</code> is used to measure
         end-to-end latency in a large scale environment.  See
         <code>ovn-nbctl</code>(8) for more details.
+      </dd>
+
+      <dt><code>lflow-cache/flush</code></dt>
+      <dd>
+        Flushes the <code>ovn-controller</code> logical flow cache.
+      </dd>
+
+      <dt><code>lflow-cache/show-stats</code></dt>
+      <dd>
+        Displays logical flow cache statistics: enabled/disabled, per cache
+        type entry counts.
       </dd>
       </dl>
     </p>

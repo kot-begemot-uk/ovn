@@ -156,6 +156,7 @@ Geoffrey Wossum                    gwossum@acm.org
 Gianluca Merlo                     gianluca.merlo@gmail.com
 Giuseppe Lettieri                  g.lettieri@iet.unipi.it
 Glen Gibb                          grg@stanford.edu
+Gongming Chen                      gmingchen@tencent.com
 Guoshuai Li                        ligs@dtdream.com
 Guolin Yang                        gyang@vmware.com
 Guru Chaitanya Perakam             gperakam@Brocade.com
@@ -416,6 +417,7 @@ parameswaran krishnamurthy         parkrish@gmail.com
 solomon                            liwei.solomon@gmail.com
 wenxu                              wenxu@ucloud.cn
 wisd0me                            ak47izatool@gmail.com
+xieyanker                          xjsisnice@gmail.com
 xushengping                        shengping.xu@huawei.com
 yinpeijun                          yinpeijun@huawei.com
 zangchuanqiang                     zangchuanqiang@huawei.com

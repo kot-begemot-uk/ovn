@@ -659,6 +659,7 @@
     <dl>
       <dt>[<code>--may-exist</code>] [<code>--policy</code>=<var>POLICY</var>]
         [<code>--ecmp</code>] [<code>--ecmp-symmetric-reply</code>]
+        [<code>--bfd[=<var>UUID</var></code>]]
         <code>lr-route-add</code> <var>router</var>
         <var>prefix</var> <var>nexthop</var> [<var>port</var>]</dt>
       <dd>
@@ -693,6 +694,16 @@
           sent out over that same route. Setting
           <code>--ecmp-symmetric-reply</code> implies <code>--ecmp</code> so
           it is not necessary to set both.
+        </p>
+
+        <p>
+          <code>--bfd</code> option is used to link a BFD session to the
+          OVN route. If the BFD session UUID is provided, it will be used
+          for the OVN route otherwise the next-hop will be used to perform
+          a lookup in the OVN BFD table.
+          If the lookup fails and <var>port</var> is specified, a new entry
+          in the BFD table will be created using the <var>nexthop</var> as
+          <var>dst_ip</var> and <var>port</var> as <var>logical_port</var>.
         </p>
 
         <p>
@@ -905,7 +916,7 @@
 
     <h1>Load Balancer Commands</h1>
     <dl>
-        <dt>[<code>--may-exist</code> | <code>--add-duplicate</code> | <code>--reject</code>] <code>lb-add</code> <var>lb</var> <var>vip</var> <var>ips</var> [<var>protocol</var>]</dt>
+        <dt>[<code>--may-exist</code> | <code>--add-duplicate</code> | <code>--reject</code> | <code>--event</code>] <code>lb-add</code> <var>lb</var> <var>vip</var> <var>ips</var> [<var>protocol</var>]</dt>
       <dd>
         <p>
          Creates a new load balancer named <var>lb</var> with the provided
@@ -945,6 +956,14 @@
          whenever an incoming packet is received for this load-balancer.
          Please note using <code>--reject</code> option will disable
          empty_lb SB controller event for this load balancer.
+        </p>
+
+        <p>
+         If the load balancer is created with <code>--event</code> option and
+         it has no active backends, whenever the lb receives traffic, the event
+         is reported in the Controller_Event table in the SB db.
+         Please note <code>--event</code> option can't be specified with
+         <code>--reject</code> one.
         </p>
 
         <p>

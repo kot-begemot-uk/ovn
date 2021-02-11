@@ -40,6 +40,7 @@
 #include "lib/lb.h"
 #include "memory.h"
 #include "ovn/actions.h"
+#include "ovn/features.h"
 #include "ovn/logical-fields.h"
 #include "packets.h"
 #include "openvswitch/poll-loop.h"
@@ -596,6 +597,8 @@ struct ovn_datapath {
     struct hmap port_tnlids;
     uint32_t port_key_hint;
 
+    bool has_stateful_acl;
+    bool has_lb_vip;
     bool has_unknown;
 
     /* IPAM data. */
@@ -633,6 +636,9 @@ struct ovn_datapath {
     /* Port groups related to the datapath, used only when nbs is NOT NULL. */
     struct hmap nb_pgs;
 };
+
+static bool ls_has_stateful_acl(struct ovn_datapath *od);
+static bool ls_has_lb_vip(struct ovn_datapath *od);
 
 /* Contains a NAT entry with the external addresses pre-parsed. */
 struct ovn_nat {
@@ -3099,6 +3105,14 @@ ovn_port_update_sbrec(struct northd_context *ctx,
     if (op->tunnel_key != op->sb->tunnel_key) {
         sbrec_port_binding_set_tunnel_key(op->sb, op->tunnel_key);
     }
+
+    /* ovn-controller will update 'Port_Binding.up' only if it was explicitly
+     * set to 'false'.
+     */
+    if (!op->sb->n_up) {
+        bool up = false;
+        sbrec_port_binding_set_up(op->sb, &up, 1);
+    }
 }
 
 /* Remove mac_binding entries that refer to logical_ports which are
@@ -3367,6 +3381,7 @@ build_ovn_lbs(struct northd_context *ctx, struct hmap *datapaths,
         sbrec_load_balancer_set_name(lb->slb, lb->nlb->name);
         sbrec_load_balancer_set_vips(lb->slb, &lb->nlb->vips);
         sbrec_load_balancer_set_protocol(lb->slb, lb->nlb->protocol);
+        sbrec_load_balancer_set_options(lb->slb, &lb->nlb->options);
         sbrec_load_balancer_set_datapaths(
             lb->slb, (struct sbrec_datapath_binding **)lb->dps,
             lb->n_dps);
@@ -4625,7 +4640,7 @@ ovn_ls_port_group_destroy(struct hmap *nb_pgs)
 }
 
 static bool
-has_stateful_acl(struct ovn_datapath *od)
+ls_has_stateful_acl(struct ovn_datapath *od)
 {
     for (size_t i = 0; i < od->nbs->n_acls; i++) {
         struct nbrec_acl *acl = od->nbs->acls[i];
@@ -4804,8 +4819,6 @@ skip_port_from_conntrack(struct ovn_datapath *od, struct ovn_port *op,
 static void
 build_pre_acls(struct ovn_datapath *od, struct hmap *lflows)
 {
-    bool has_stateful = has_stateful_acl(od);
-
     /* Ingress and Egress Pre-ACL Table (Priority 0): Packets are
      * allowed by default. */
     ovn_lflow_add(lflows, od, S_SWITCH_IN_PRE_ACL, 0, "1", "next;");
@@ -4820,7 +4833,7 @@ build_pre_acls(struct ovn_datapath *od, struct hmap *lflows)
     /* If there are any stateful ACL rules in this datapath, we must
      * send all IP packets through the conntrack action, which handles
      * defragmentation, in order to match L4 headers. */
-    if (has_stateful) {
+    if (od->has_stateful_acl) {
         for (size_t i = 0; i < od->n_router_ports; i++) {
             skip_port_from_conntrack(od, od->router_ports[i],
                                      S_SWITCH_IN_PRE_ACL, S_SWITCH_OUT_PRE_ACL,
@@ -4880,7 +4893,9 @@ build_empty_lb_event_flow(struct ovn_datapath *od, struct hmap *lflows,
                           struct nbrec_load_balancer *lb,
                           int pl, struct shash *meter_groups)
 {
-    if (!controller_event_en || lb_vip->n_backends ||
+    bool controller_event = smap_get_bool(&lb->options, "event", false) ||
+                            controller_event_en; /* deprecated */
+    if (!controller_event || lb_vip->n_backends ||
         lb_vip->empty_backend_rej) {
         return;
     }
@@ -4921,7 +4936,7 @@ build_empty_lb_event_flow(struct ovn_datapath *od, struct hmap *lflows,
 }
 
 static bool
-has_lb_vip(struct ovn_datapath *od)
+ls_has_lb_vip(struct ovn_datapath *od)
 {
     for (int i = 0; i < od->nbs->n_load_balancer; i++) {
         struct nbrec_load_balancer *nb_lb = od->nbs->load_balancer[i];
@@ -5064,6 +5079,13 @@ build_acl_hints(struct ovn_datapath *od, struct hmap *lflows)
     for (size_t i = 0; i < ARRAY_SIZE(stages); i++) {
         enum ovn_stage stage = stages[i];
 
+        /* In any case, advance to the next stage. */
+        ovn_lflow_add(lflows, od, stage, 0, "1", "next;");
+
+        if (!od->has_stateful_acl && !od->has_lb_vip) {
+            continue;
+        }
+
         /* New, not already established connections, may hit either allow
          * or drop ACLs. For allow ACLs, the connection must also be committed
          * to conntrack so we set REGBIT_ACL_HINT_ALLOW_NEW.
@@ -5124,9 +5146,6 @@ build_acl_hints(struct ovn_datapath *od, struct hmap *lflows)
         ovn_lflow_add(lflows, od, stage, 1, "ct.est && ct_label.blocked == 0",
                       REGBIT_ACL_HINT_BLOCK " = 1; "
                       "next;");
-
-        /* In any case, advance to the next stage. */
-        ovn_lflow_add(lflows, od, stage, 0, "1", "next;");
     }
 }
 
@@ -5458,7 +5477,7 @@ static void
 build_acls(struct ovn_datapath *od, struct hmap *lflows,
            struct hmap *port_groups, const struct shash *meter_groups)
 {
-    bool has_stateful = (has_stateful_acl(od) || has_lb_vip(od));
+    bool has_stateful = od->has_stateful_acl || od->has_lb_vip;
 
     /* Ingress and Egress ACL Table (Priority 0): Packets are allowed by
      * default.  A related rule at priority 1 is added below if there
@@ -5727,7 +5746,7 @@ build_lb(struct ovn_datapath *od, struct hmap *lflows)
         }
     }
 
-    if (has_lb_vip(od)) {
+    if (od->has_lb_vip) {
         /* Ingress and Egress LB Table (Priority 65534).
          *
          * Send established traffic through conntrack for just NAT. */
@@ -5848,7 +5867,7 @@ build_lb_hairpin(struct ovn_datapath *od, struct hmap *lflows)
     ovn_lflow_add(lflows, od, S_SWITCH_IN_NAT_HAIRPIN, 0, "1", "next;");
     ovn_lflow_add(lflows, od, S_SWITCH_IN_HAIRPIN, 0, "1", "next;");
 
-    if (has_lb_vip(od)) {
+    if (od->has_lb_vip) {
         /* Check if the packet needs to be hairpinned. */
         ovn_lflow_add_with_hint(lflows, od, S_SWITCH_IN_PRE_HAIRPIN, 100,
                                 "ip && ct.trk && ct.dnat",
@@ -6585,7 +6604,10 @@ build_lswitch_lflows_pre_acl_and_acl(struct ovn_datapath *od,
                                      struct shash *meter_groups,
                                      struct hmap *lbs)
 {
-   if (od->nbs) {
+    if (od->nbs) {
+        od->has_stateful_acl = ls_has_stateful_acl(od);
+        od->has_lb_vip = ls_has_lb_vip(od);
+
         build_pre_acls(od, lflows);
         build_pre_lb(od, lflows, meter_groups, lbs);
         build_pre_stateful(od, lflows);
@@ -8352,15 +8374,10 @@ get_force_snat_ip(struct ovn_datapath *od, const char *key_type,
         return false;
     }
 
-    if (!extract_ip_addresses(addresses, laddrs) ||
-        laddrs->n_ipv4_addrs > 1 ||
-        laddrs->n_ipv6_addrs > 1 ||
-        (laddrs->n_ipv4_addrs && laddrs->ipv4_addrs[0].plen != 32) ||
-        (laddrs->n_ipv6_addrs && laddrs->ipv6_addrs[0].plen != 128)) {
+    if (!extract_ip_address(addresses, laddrs)) {
         static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
         VLOG_WARN_RL(&rl, "bad ip %s in options of router "UUID_FMT"",
                      addresses, UUID_ARGS(&od->key));
-        destroy_lport_addresses(laddrs);
         return false;
     }
 
@@ -11393,6 +11410,7 @@ struct lswitch_flow_build_info {
     struct hmap *igmp_groups;
     struct shash *meter_groups;
     struct hmap *lbs;
+    struct hmap *bfd_connections;
     char *svc_check_match;
     struct ds match;
     struct ds actions;
@@ -11400,12 +11418,14 @@ struct lswitch_flow_build_info {
 
 /* Helper function to combine all lflow generation which is iterated by
  * datapath.
+ *
+ * When extending the function new "work data" must be added to the lsi
+ * struct, not passed as an argument.
  */
 
 static void
 build_lswitch_and_lrouter_iterate_by_od(struct ovn_datapath *od,
-                                        struct lswitch_flow_build_info *lsi,
-                                        struct hmap *bfd_connections)
+                                        struct lswitch_flow_build_info *lsi)
 {
     /* Build Logical Switch Flows. */
     build_lswitch_lflows_pre_acl_and_acl(od, lsi->port_groups, lsi->lflows,
@@ -11426,7 +11446,7 @@ build_lswitch_and_lrouter_iterate_by_od(struct ovn_datapath *od,
                                            &lsi->actions);
     build_ND_RA_flows_for_lrouter(od, lsi->lflows);
     build_static_route_flows_for_lrouter(od, lsi->lflows, lsi->ports,
-                                         bfd_connections);
+                                         lsi->bfd_connections);
     build_mcast_lookup_flows_for_lrouter(od, lsi->lflows, &lsi->match,
                                          &lsi->actions);
     build_ingress_policy_flows_for_lrouter(od, lsi->lflows, lsi->ports);
@@ -11509,6 +11529,7 @@ build_lswitch_and_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
         .igmp_groups = igmp_groups,
         .meter_groups = meter_groups,
         .lbs = lbs,
+        .bfd_connections = bfd_connections,
         .svc_check_match = svc_check_match,
         .match = DS_EMPTY_INITIALIZER,
         .actions = DS_EMPTY_INITIALIZER,
@@ -11518,7 +11539,7 @@ build_lswitch_and_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
      * will move here and will be reogranized by iterator type.
      */
     HMAP_FOR_EACH (od, key_node, datapaths) {
-        build_lswitch_and_lrouter_iterate_by_od(od, &lsi, bfd_connections);
+        build_lswitch_and_lrouter_iterate_by_od(od, &lsi);
     }
     HMAP_FOR_EACH (op, key_node, ports) {
         build_lswitch_and_lrouter_iterate_by_op(op, &lsi);
@@ -12121,8 +12142,7 @@ sync_acl_fair_meter(struct northd_context *ctx, struct shash *meter_groups,
  * a private copy of its meter in the SB table.
  */
 static void
-sync_meters(struct northd_context *ctx, struct hmap *datapaths,
-            struct shash *meter_groups, struct hmap *port_groups)
+sync_meters(struct northd_context *ctx, struct shash *meter_groups)
 {
     struct shash sb_meters = SHASH_INITIALIZER(&sb_meters);
     struct sset used_sb_meters = SSET_INITIALIZER(&used_sb_meters);
@@ -12143,24 +12163,10 @@ sync_meters(struct northd_context *ctx, struct hmap *datapaths,
      * and see if additional rows are needed to get ACLs logs individually
      * rate-limited.
      */
-    struct ovn_datapath *od;
-    HMAP_FOR_EACH (od, key_node, datapaths) {
-        if (!od->nbs) {
-            continue;
-        }
-        for (size_t i = 0; i < od->nbs->n_acls; i++) {
-            sync_acl_fair_meter(ctx, meter_groups, od->nbs->acls[i],
-                                &sb_meters, &used_sb_meters);
-        }
-        struct ovn_port_group *pg;
-        HMAP_FOR_EACH (pg, key_node, port_groups) {
-            if (ovn_port_group_ls_find(pg, &od->nbs->header_.uuid)) {
-                for (size_t i = 0; i < pg->nb_pg->n_acls; i++) {
-                    sync_acl_fair_meter(ctx, meter_groups, pg->nb_pg->acls[i],
-                                        &sb_meters, &used_sb_meters);
-                }
-            }
-        }
+    const struct nbrec_acl *acl;
+    NBREC_ACL_FOR_EACH (acl, ctx->ovnnb_idl) {
+        sync_acl_fair_meter(ctx, meter_groups, acl,
+                            &sb_meters, &used_sb_meters);
     }
 
     const char *used_meter;
@@ -12631,6 +12637,7 @@ ovnnb_db_run(struct northd_context *ctx,
 
     use_logical_dp_groups = smap_get_bool(&nb->options,
                                           "use_logical_dp_groups", false);
+    /* deprecated, use --event instead */
     controller_event_en = smap_get_bool(&nb->options,
                                         "controller_event", false);
     check_lsp_is_up = !smap_get_bool(&nb->options,
@@ -12652,7 +12659,7 @@ ovnnb_db_run(struct northd_context *ctx,
 
     sync_address_sets(ctx);
     sync_port_groups(ctx, &port_groups);
-    sync_meters(ctx, datapaths, &meter_groups, &port_groups);
+    sync_meters(ctx, &meter_groups);
     sync_dns_entries(ctx, datapaths);
 
     struct ovn_northd_lb *lb;
@@ -12831,7 +12838,17 @@ handle_port_binding_changes(struct northd_context *ctx, struct hmap *ports,
             continue;
         }
 
-        bool up = ((sb->up && (*sb->up)) || lsp_is_router(op->nbsp));
+        bool up = false;
+
+        if (lsp_is_router(op->nbsp)) {
+            up = true;
+        } else if (sb->chassis) {
+            up = smap_get_bool(&sb->chassis->other_config,
+                               OVN_FEATURE_PORT_UP_NOTIF, false)
+                 ? sb->n_up && sb->up[0]
+                 : true;
+        }
+
         if (!op->nbsp->up || *op->nbsp->up != up) {
             nbrec_logical_switch_port_set_up(op->nbsp, &up, 1);
         }
@@ -12971,7 +12988,7 @@ static const char *rbac_chassis_update[] =
 static const char *rbac_chassis_private_auth[] =
     {"name"};
 static const char *rbac_chassis_private_update[] =
-    {"nb_cfg", "nb_cfg_timestamp", "chassis"};
+    {"nb_cfg", "nb_cfg_timestamp", "chassis", "external_ids"};
 
 static const char *rbac_encap_auth[] =
     {"chassis_name"};
@@ -13617,6 +13634,7 @@ main(int argc, char *argv[])
     add_column_noalert(ovnsb_idl_loop.idl, &sbrec_load_balancer_col_name);
     add_column_noalert(ovnsb_idl_loop.idl, &sbrec_load_balancer_col_vips);
     add_column_noalert(ovnsb_idl_loop.idl, &sbrec_load_balancer_col_protocol);
+    add_column_noalert(ovnsb_idl_loop.idl, &sbrec_load_balancer_col_options);
     add_column_noalert(ovnsb_idl_loop.idl,
                        &sbrec_load_balancer_col_external_ids);
 

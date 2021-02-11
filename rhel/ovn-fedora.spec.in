@@ -84,14 +84,6 @@ Provides: openvswitch-ovn-central = %{?epoch:%{epoch}:}%{version}-%{release}
 %description central
 OVN DB servers and ovn-northd running on a central node.
 
-%package ic
-Summary: Open Virtual Network interconnection support
-License: ASL 2.0
-Requires: ovn
-
-%description ic
-OVN IC DB servers and ovn-ic.
-
 %package host
 Summary: Open Virtual Network support
 License: ASL 2.0
@@ -169,7 +161,7 @@ install -p -D -m 0644 \
         rhel/usr_share_ovn_scripts_systemd_sysconfig.template \
         $RPM_BUILD_ROOT/%{_sysconfdir}/sysconfig/ovn
 
-for service in ovn-controller ovn-controller-vtep ovn-northd ovn-ic; do
+for service in ovn-controller ovn-controller-vtep ovn-northd ovn-ic ovn-ic-db; do
         install -p -D -m 0644 \
                         rhel/usr_lib_systemd_system_${service}.service \
                         $RPM_BUILD_ROOT%{_unitdir}/${service}.service
@@ -280,7 +272,6 @@ fi
     fi
 %endif
 
-%preun ic
 %if 0%{?systemd_preun:1}
     %systemd_preun ovn-ic.service
 %else
@@ -288,6 +279,16 @@ fi
         # Package removal, not upgrade
         /bin/systemctl --no-reload disable ovn-ic.service >/dev/null 2>&1 || :
         /bin/systemctl stop ovn-ic.service >/dev/null 2>&1 || :
+    fi
+%endif
+
+%if 0%{?systemd_preun:1}
+    %systemd_preun ovn-ic-db.service
+%else
+    if [ $1 -eq 0 ] ; then
+        # Package removal, not upgrade
+        /bin/systemctl --no-reload disable ovn-ic-db.service >/dev/null 2>&1 || :
+        /bin/systemctl stop ovn-ic-db.service >/dev/null 2>&1 || :
     fi
 %endif
 
@@ -331,9 +332,17 @@ fi
     fi
 %endif
 
-%post ic
 %if 0%{?systemd_post:1}
     %systemd_post ovn-ic.service
+%else
+    # Package install, not upgrade
+    if [ $1 -eq 1 ]; then
+        /bin/systemctl daemon-reload >dev/null || :
+    fi
+%endif
+
+%if 0%{?systemd_post:1}
+    %systemd_post ovn-ic-db.service
 %else
     # Package install, not upgrade
     if [ $1 -eq 1 ]; then
@@ -374,7 +383,6 @@ fi
     fi
 %endif
 
-%postun ic
 %if 0%{?systemd_postun_with_restart:1}
     %systemd_postun_with_restart ovn-ic.service
 %else
@@ -383,6 +391,12 @@ fi
     # Package upgrade, not uninstall
         /bin/systemctl try-restart ovn-ic.service >/dev/null 2>&1 || :
     fi
+%endif
+
+%if 0%{?systemd_postun:1}
+    %systemd_postun ovn-ic-db.service
+%else
+    /bin/systemctl daemon-reload >/dev/null 2>&1 || :
 %endif
 
 %postun host
@@ -461,6 +475,7 @@ fi
 %{_mandir}/man5/ovn-sb.5*
 %{_mandir}/man8/ovn-ic-nbctl.8*
 %{_mandir}/man8/ovn-ic-sbctl.8*
+%{_mandir}/man8/ovn-ic.8*
 %{_mandir}/man5/ovn-ic-nb.5*
 %{_mandir}/man5/ovn-ic-sb.5*
 %{_prefix}/lib/ocf/resource.d/ovn/ovndb-servers
@@ -472,18 +487,16 @@ fi
 
 %files central
 %{_bindir}/ovn-northd
+%{_bindir}/ovn-ic
 %{_mandir}/man8/ovn-northd.8*
 %config %{_datadir}/ovn/ovn-nb.ovsschema
 %config %{_datadir}/ovn/ovn-sb.ovsschema
-%{_unitdir}/ovn-northd.service
-%{_prefix}/lib/firewalld/services/ovn-central-firewall-service.xml
-
-%files ic
-%{_bindir}/ovn-ic
-%{_mandir}/man8/ovn-ic.8*
 %config %{_datadir}/ovn/ovn-ic-nb.ovsschema
 %config %{_datadir}/ovn/ovn-ic-sb.ovsschema
 %{_unitdir}/ovn-ic.service
+%{_unitdir}/ovn-ic-db.service
+%{_unitdir}/ovn-northd.service
+%{_prefix}/lib/firewalld/services/ovn-central-firewall-service.xml
 
 %files host
 %{_bindir}/ovn-controller
@@ -497,8 +510,8 @@ fi
 %{_unitdir}/ovn-controller-vtep.service
 
 %changelog
-* Wed Dec 9 2020 Vladislav Odintsov <odivlad@gmail.com>
-- Added ovn-ic systemd-unit and subpackage.
+* Mon Feb 1 2021 Vladislav Odintsov <odivlad@gmail.com>
+- Added ovn-ic, ovn-ic-db systemd-units.
 
 * Thu Dec 20 2018 Numan Siddique <nusiddiq@redhat.com>
 - OVS/OVN split.
