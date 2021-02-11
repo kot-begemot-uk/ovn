@@ -12853,6 +12853,7 @@ ovnnb_db_run(struct northd_context *ctx,
     use_parallel_build = smap_get_bool(&nb->options,
                                           "use_parallel_build", false) &&
                           ovn_can_parallelize_hashes(false);
+    use_parallel_build = true;
     use_logical_dp_groups = smap_get_bool(&nb->options,
                                           "use_logical_dp_groups", false);
     /* deprecated, use --event instead */
