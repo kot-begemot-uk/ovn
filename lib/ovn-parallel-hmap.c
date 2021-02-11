@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <errno.h>
 #include <semaphore.h>
 #include "fatal-signal.h"
 #include "util.h"
@@ -166,31 +167,57 @@ struct worker_pool *ovn_add_worker_pool(void *(*start)(void *)){
     if (can_parallelize) {
         new_pool = xmalloc(sizeof(struct worker_pool));
         new_pool->size = pool_size;
+        new_pool->controls = NULL;
         sprintf(sem_name, MAIN_SEM_NAME, sembase, new_pool);
         new_pool->done = sem_open(sem_name, O_CREAT, S_IRWXU, 0);
-
-        ovs_list_push_back(&worker_pools, &new_pool->list_node);
+        if (new_pool->done == SEM_FAILED) {
+            goto cleanup;
+        }
 
         new_pool->controls =
             xmalloc(sizeof(struct worker_control) * new_pool->size);
 
         for (i = 0; i < new_pool->size; i++) {
             new_control = &new_pool->controls[i];
-            sprintf(sem_name, WORKER_SEM_NAME, sembase, new_pool, i);
-            new_control->fire = sem_open(sem_name, O_CREAT, S_IRWXU, 0);
             new_control->id = i;
             new_control->done = new_pool->done;
             new_control->data = NULL;
             ovs_mutex_init(&new_control->mutex);
             new_control->finished = ATOMIC_VAR_INIT(false);
+            sprintf(sem_name, WORKER_SEM_NAME, sembase, new_pool, i);
+            new_control->fire = sem_open(sem_name, O_CREAT, S_IRWXU, 0);
+            if (new_control->fire == SEM_FAILED) {
+                goto cleanup;
+            }
         }
 
         for (i = 0; i < pool_size; i++) {
             ovs_thread_create("worker pool helper", start, &new_pool->controls[i]);
         }
+        ovs_list_push_back(&worker_pools, &new_pool->list_node);
     }
     ovs_mutex_unlock(&init_mutex);
     return new_pool;
+cleanup:
+    VLOG_INFO("Failed to initialize parallel processing, error %d", errno);
+    can_parallelize = false;
+    if (new_pool->controls) {
+        for (i = 0; i < new_pool->size; i++) {
+            if (new_pool->controls[i].fire != SEM_FAILED) {
+                sem_close(new_pool->controls[i].fire);
+                sprintf(sem_name, WORKER_SEM_NAME, sembase, new_pool, i);
+                sem_unlink(sem_name);
+                break; /* semaphores past this one are uninitialized */
+            }
+        }
+    }
+    if (new_pool->done != SEM_FAILED) {
+        sem_close(new_pool->done);
+        sprintf(sem_name, MAIN_SEM_NAME, sembase, new_pool);
+        sem_unlink(sem_name);
+    }
+    ovs_mutex_unlock(&init_mutex);
+    return NULL;
 }
 
 
