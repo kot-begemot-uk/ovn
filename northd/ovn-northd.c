@@ -11645,6 +11645,12 @@ build_lswitch_and_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
 
     if (use_parallel_build) {
         init_lflows_thread_pool();
+        if (!can_parallelize_hashes()) {
+            use_parallel_build = false;
+        }
+    }
+
+    if (use_parallel_build) {
         struct hmap *lflow_segs;
         struct lswitch_flow_build_info *lsiv;
         int index;
