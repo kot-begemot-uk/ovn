@@ -608,7 +608,18 @@ add_pending_ct_zone_entry(struct shash *pending_ct_zones,
     pending->state = state; /* Skip flushing zone. */
     pending->zone = zone;
     pending->add = add;
-    shash_add(pending_ct_zones, name, pending);
+
+    /* Its important that we add only one entry for the key 'name'.
+     * Replace 'pending' with 'existing' and free up 'existing'.
+     * Otherwise, we may end up in a continuous loop of adding
+     * and deleting the zone entry in the 'external_ids' of
+     * integration bridge.
+     */
+    struct ct_zone_pending_entry *existing =
+        shash_replace(pending_ct_zones, name, pending);
+    if (existing) {
+        free(existing);
+    }
 }
 
 static void
@@ -942,7 +953,8 @@ ctrl_register_ovs_idl(struct ovsdb_idl *ovs_idl)
     SB_NODE(dhcp_options, "dhcp_options") \
     SB_NODE(dhcpv6_options, "dhcpv6_options") \
     SB_NODE(dns, "dns") \
-    SB_NODE(load_balancer, "load_balancer")
+    SB_NODE(load_balancer, "load_balancer") \
+    SB_NODE(fdb, "fdb")
 
 enum sb_engine_node {
 #define SB_NODE(NAME, NAME_STR) SB_##NAME,
@@ -1868,6 +1880,10 @@ static void init_lflow_ctx(struct engine_node *node,
         (struct sbrec_load_balancer_table *)EN_OVSDB_GET(
             engine_get_input("SB_load_balancer", node));
 
+    struct sbrec_fdb_table *fdb_table =
+        (struct sbrec_fdb_table *)EN_OVSDB_GET(
+            engine_get_input("SB_fdb", node));
+
     struct ovsrec_open_vswitch_table *ovs_table =
         (struct ovsrec_open_vswitch_table *)EN_OVSDB_GET(
             engine_get_input("OVS_open_vswitch", node));
@@ -1905,6 +1921,7 @@ static void init_lflow_ctx(struct engine_node *node,
     l_ctx_in->logical_flow_table = logical_flow_table;
     l_ctx_in->logical_dp_group_table = logical_dp_group_table;
     l_ctx_in->mc_group_table = multicast_group_table;
+    l_ctx_in->fdb_table = fdb_table,
     l_ctx_in->chassis = chassis;
     l_ctx_in->lb_table = lb_table;
     l_ctx_in->local_datapaths = &rt_data->local_datapaths;
@@ -2335,6 +2352,23 @@ flow_output_sb_load_balancer_handler(struct engine_node *node, void *data)
     return handled;
 }
 
+static bool
+flow_output_sb_fdb_handler(struct engine_node *node, void *data)
+{
+    struct ed_type_runtime_data *rt_data =
+        engine_get_input_data("runtime_data", node);
+
+    struct ed_type_flow_output *fo = data;
+    struct lflow_ctx_in l_ctx_in;
+    struct lflow_ctx_out l_ctx_out;
+    init_lflow_ctx(node, rt_data, fo, &l_ctx_in, &l_ctx_out);
+
+    bool handled = lflow_handle_changed_fdbs(&l_ctx_in, &l_ctx_out);
+
+    engine_set_node_state(node, EN_UPDATED);
+    return handled;
+}
+
 struct ovn_controller_exit_args {
     bool *exiting;
     bool *restart;
@@ -2466,6 +2500,10 @@ main(int argc, char *argv[])
         = ip_mcast_index_create(ovnsb_idl_loop.idl);
     struct ovsdb_idl_index *sbrec_igmp_group
         = igmp_group_index_create(ovnsb_idl_loop.idl);
+    struct ovsdb_idl_index *sbrec_fdb_by_dp_key_mac
+        = ovsdb_idl_index_create2(ovnsb_idl_loop.idl,
+                                  &sbrec_fdb_col_mac,
+                                  &sbrec_fdb_col_dp_key);
 
     ovsdb_idl_track_add_all(ovnsb_idl_loop.idl);
     ovsdb_idl_omit_alert(ovnsb_idl_loop.idl,
@@ -2592,6 +2630,8 @@ main(int argc, char *argv[])
     engine_add_input(&en_flow_output, &en_sb_dns, NULL);
     engine_add_input(&en_flow_output, &en_sb_load_balancer,
                      flow_output_sb_load_balancer_handler);
+    engine_add_input(&en_flow_output, &en_sb_fdb,
+                     flow_output_sb_fdb_handler);
 
     engine_add_input(&en_ct_zones, &en_ovs_open_vswitch, NULL);
     engine_add_input(&en_ct_zones, &en_ovs_bridge, NULL);
@@ -2885,6 +2925,7 @@ main(int argc, char *argv[])
                                     sbrec_mac_binding_by_lport_ip,
                                     sbrec_igmp_group,
                                     sbrec_ip_multicast,
+                                    sbrec_fdb_by_dp_key_mac,
                                     sbrec_dns_table_get(ovnsb_idl_loop.idl),
                                     sbrec_controller_event_table_get(
                                         ovnsb_idl_loop.idl),

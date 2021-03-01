@@ -26,6 +26,7 @@
 #include "flow.h"
 #include "ha-chassis.h"
 #include "lport.h"
+#include "mac-learn.h"
 #include "nx-match.h"
 #include "latch.h"
 #include "lib/packets.h"
@@ -193,7 +194,6 @@ static void run_put_mac_bindings(
     struct ovsdb_idl_index *sbrec_mac_binding_by_lport_ip)
     OVS_REQUIRES(pinctrl_mutex);
 static void wait_put_mac_bindings(struct ovsdb_idl_txn *ovnsb_idl_txn);
-static void flush_put_mac_bindings(void);
 static void send_mac_binding_buffered_pkts(struct rconn *swconn)
     OVS_REQUIRES(pinctrl_mutex);
 
@@ -340,6 +340,22 @@ static void bfd_monitor_run(struct ovsdb_idl_txn *ovnsb_idl_txn,
                             const struct sbrec_chassis *chassis,
                             const struct sset *active_tunnels)
                             OVS_REQUIRES(pinctrl_mutex);
+static void init_fdb_entries(void);
+static void destroy_fdb_entries(void);
+static const struct sbrec_fdb *fdb_lookup(
+    struct ovsdb_idl_index *sbrec_fdb_by_dp_key_mac,
+    uint32_t dp_key, const char *mac);
+static void run_put_fdb(struct ovsdb_idl_txn *ovnsb_idl_txn,
+                        struct ovsdb_idl_index *sbrec_fdb_by_dp_key_mac,
+                        const struct fdb_entry *fdb_e)
+                        OVS_REQUIRES(pinctrl_mutex);
+static void run_put_fdbs(struct ovsdb_idl_txn *ovnsb_idl_txn,
+                        struct ovsdb_idl_index *sbrec_fdb_by_dp_key_mac)
+                        OVS_REQUIRES(pinctrl_mutex);
+static void wait_put_fdbs(struct ovsdb_idl_txn *ovnsb_idl_txn);
+static void pinctrl_handle_put_fdb(const struct flow *md,
+                                   const struct flow *headers)
+                                   OVS_REQUIRES(pinctrl_mutex);
 
 COVERAGE_DEFINE(pinctrl_drop_put_mac_binding);
 COVERAGE_DEFINE(pinctrl_drop_buffered_packets_map);
@@ -506,6 +522,7 @@ pinctrl_init(void)
     init_put_vport_bindings();
     init_svc_monitors();
     bfd_monitor_init();
+    init_fdb_entries();
     pinctrl.br_int_name = NULL;
     pinctrl_handler_seq = seq_create();
     pinctrl_main_seq = seq_create();
@@ -3020,6 +3037,12 @@ process_packet_in(struct rconn *swconn, const struct ofp_header *msg)
         ovs_mutex_unlock(&pinctrl_mutex);
         break;
 
+    case ACTION_OPCODE_PUT_FDB:
+        ovs_mutex_lock(&pinctrl_mutex);
+        pinctrl_handle_put_fdb(&pin.flow_metadata.flow, &headers);
+        ovs_mutex_unlock(&pinctrl_mutex);
+        break;
+
     case ACTION_OPCODE_PUT_DHCPV6_OPTS:
         pinctrl_handle_put_dhcpv6_opts(swconn, &packet, &pin, &userdata,
                                        &continuation);
@@ -3297,6 +3320,7 @@ pinctrl_run(struct ovsdb_idl_txn *ovnsb_idl_txn,
             struct ovsdb_idl_index *sbrec_mac_binding_by_lport_ip,
             struct ovsdb_idl_index *sbrec_igmp_groups,
             struct ovsdb_idl_index *sbrec_ip_multicast_opts,
+            struct ovsdb_idl_index *sbrec_fdb_by_dp_key_mac,
             const struct sbrec_dns_table *dns_table,
             const struct sbrec_controller_event_table *ce_table,
             const struct sbrec_service_monitor_table *svc_mon_table,
@@ -3333,6 +3357,7 @@ pinctrl_run(struct ovsdb_idl_txn *ovnsb_idl_txn,
                       chassis);
     bfd_monitor_run(ovnsb_idl_txn, bfd_table, sbrec_port_binding_by_name,
                     chassis, active_tunnels);
+    run_put_fdbs(ovnsb_idl_txn, sbrec_fdb_by_dp_key_mac);
     ovs_mutex_unlock(&pinctrl_mutex);
 }
 
@@ -3856,6 +3881,7 @@ pinctrl_wait(struct ovsdb_idl_txn *ovnsb_idl_txn)
     wait_put_vport_bindings(ovnsb_idl_txn);
     int64_t new_seq = seq_read(pinctrl_main_seq);
     seq_wait(pinctrl_main_seq, new_seq);
+    wait_put_fdbs(ovnsb_idl_txn);
 }
 
 /* Called by ovn-controller. */
@@ -3877,6 +3903,7 @@ pinctrl_destroy(void)
     ip_mcast_snoop_destroy();
     destroy_svc_monitors();
     bfd_monitor_destroy();
+    destroy_fdb_entries();
     seq_destroy(pinctrl_main_seq);
     seq_destroy(pinctrl_handler_seq);
 }
@@ -3893,47 +3920,20 @@ pinctrl_destroy(void)
  * available. */
 
 /* Buffered "put_mac_binding" operation. */
-struct put_mac_binding {
-    struct hmap_node hmap_node; /* In 'put_mac_bindings'. */
 
-    /* Key. */
-    uint32_t dp_key;
-    uint32_t port_key;
-    struct in6_addr ip_key;
-
-    /* Value. */
-    struct eth_addr mac;
-};
-
-/* Contains "struct put_mac_binding"s. */
+/* Contains "struct mac_binding"s. */
 static struct hmap put_mac_bindings;
 
 static void
 init_put_mac_bindings(void)
 {
-    hmap_init(&put_mac_bindings);
+    ovn_mac_bindings_init(&put_mac_bindings);
 }
 
 static void
 destroy_put_mac_bindings(void)
 {
-    flush_put_mac_bindings();
-    hmap_destroy(&put_mac_bindings);
-}
-
-static struct put_mac_binding *
-pinctrl_find_put_mac_binding(uint32_t dp_key, uint32_t port_key,
-                             const struct in6_addr *ip_key, uint32_t hash)
-{
-    struct put_mac_binding *pa;
-    HMAP_FOR_EACH_WITH_HASH (pa, hmap_node, hash, &put_mac_bindings) {
-        if (pa->dp_key == dp_key
-            && pa->port_key == port_key
-            && IN6_ARE_ADDR_EQUAL(&pa->ip_key, ip_key)) {
-            return pa;
-        }
-    }
-    return NULL;
+    ovn_mac_bindings_destroy(&put_mac_bindings);
 }
 
 /* Called with in the pinctrl_handler thread context. */
@@ -3953,23 +3953,14 @@ pinctrl_handle_put_mac_binding(const struct flow *md,
         ovs_be128 ip6 = hton128(flow_get_xxreg(md, 0));
         memcpy(&ip_key, &ip6, sizeof ip_key);
     }
-    uint32_t hash = hash_bytes(&ip_key, sizeof ip_key,
-                               hash_2words(dp_key, port_key));
-    struct put_mac_binding *pmb
-        = pinctrl_find_put_mac_binding(dp_key, port_key, &ip_key, hash);
-    if (!pmb) {
-        if (hmap_count(&put_mac_bindings) >= 1000) {
-            COVERAGE_INC(pinctrl_drop_put_mac_binding);
-            return;
-        }
 
-        pmb = xmalloc(sizeof *pmb);
-        hmap_insert(&put_mac_bindings, &pmb->hmap_node, hash);
-        pmb->dp_key = dp_key;
-        pmb->port_key = port_key;
-        pmb->ip_key = ip_key;
+    struct mac_binding *mb = ovn_mac_binding_add(&put_mac_bindings, dp_key,
+                                                 port_key, &ip_key,
+                                                 headers->dl_src);
+    if (!mb) {
+        COVERAGE_INC(pinctrl_drop_put_mac_binding);
+        return;
     }
-    pmb->mac = headers->dl_src;
 
     /* We can send the buffered packet once the main ovn-controller
      * thread calls pinctrl_run() and it writes the mac_bindings stored
@@ -4012,12 +4003,12 @@ mac_binding_lookup(struct ovsdb_idl_index *sbrec_mac_binding_by_lport_ip,
 /* Update or add an IP-MAC binding for 'logical_port'.
  * Caller should make sure that 'ovnsb_idl_txn' is valid. */
 static void
-mac_binding_add(struct ovsdb_idl_txn *ovnsb_idl_txn,
-                struct ovsdb_idl_index *sbrec_mac_binding_by_lport_ip,
-                const char *logical_port,
-                const struct sbrec_datapath_binding *dp,
-                struct eth_addr ea, const char *ip,
-                bool update_only)
+mac_binding_add_to_sb(struct ovsdb_idl_txn *ovnsb_idl_txn,
+                      struct ovsdb_idl_index *sbrec_mac_binding_by_lport_ip,
+                      const char *logical_port,
+                      const struct sbrec_datapath_binding *dp,
+                      struct eth_addr ea, const char *ip,
+                      bool update_only)
 {
     /* Convert ethernet argument to string form for database. */
     char mac_string[ETH_ADDR_STRLEN + 1];
@@ -4073,9 +4064,9 @@ send_garp_locally(struct ovsdb_idl_txn *ovnsb_idl_txn,
         struct ds ip_s = DS_EMPTY_INITIALIZER;
 
         ip_format_masked(ip, OVS_BE32_MAX, &ip_s);
-        mac_binding_add(ovnsb_idl_txn, sbrec_mac_binding_by_lport_ip,
-                        remote->logical_port, remote->datapath,
-                        ea, ds_cstr(&ip_s), update_only);
+        mac_binding_add_to_sb(ovnsb_idl_txn, sbrec_mac_binding_by_lport_ip,
+                              remote->logical_port, remote->datapath,
+                              ea, ds_cstr(&ip_s), update_only);
         ds_destroy(&ip_s);
     }
 }
@@ -4085,30 +4076,30 @@ run_put_mac_binding(struct ovsdb_idl_txn *ovnsb_idl_txn,
                     struct ovsdb_idl_index *sbrec_datapath_binding_by_key,
                     struct ovsdb_idl_index *sbrec_port_binding_by_key,
                     struct ovsdb_idl_index *sbrec_mac_binding_by_lport_ip,
-                    const struct put_mac_binding *pmb)
+                    const struct mac_binding *mb)
 {
     /* Convert logical datapath and logical port key into lport. */
     const struct sbrec_port_binding *pb = lport_lookup_by_key(
         sbrec_datapath_binding_by_key, sbrec_port_binding_by_key,
-        pmb->dp_key, pmb->port_key);
+        mb->dp_key, mb->port_key);
     if (!pb) {
         static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
 
         VLOG_WARN_RL(&rl, "unknown logical port with datapath %"PRIu32" "
-                     "and port %"PRIu32, pmb->dp_key, pmb->port_key);
+                     "and port %"PRIu32, mb->dp_key, mb->port_key);
         return;
     }
 
     /* Convert ethernet argument to string form for database. */
     char mac_string[ETH_ADDR_STRLEN + 1];
     snprintf(mac_string, sizeof mac_string,
-             ETH_ADDR_FMT, ETH_ADDR_ARGS(pmb->mac));
+             ETH_ADDR_FMT, ETH_ADDR_ARGS(mb->mac));
 
     struct ds ip_s = DS_EMPTY_INITIALIZER;
-    ipv6_format_mapped(&pmb->ip_key, &ip_s);
-    mac_binding_add(ovnsb_idl_txn, sbrec_mac_binding_by_lport_ip,
-                    pb->logical_port, pb->datapath, pmb->mac, ds_cstr(&ip_s),
-                    false);
+    ipv6_format_mapped(&mb->ip, &ip_s);
+    mac_binding_add_to_sb(ovnsb_idl_txn, sbrec_mac_binding_by_lport_ip,
+                          pb->logical_port, pb->datapath, mb->mac,
+                          ds_cstr(&ip_s), false);
     ds_destroy(&ip_s);
 }
 
@@ -4125,14 +4116,14 @@ run_put_mac_bindings(struct ovsdb_idl_txn *ovnsb_idl_txn,
         return;
     }
 
-    const struct put_mac_binding *pmb;
-    HMAP_FOR_EACH (pmb, hmap_node, &put_mac_bindings) {
+    const struct mac_binding *mb;
+    HMAP_FOR_EACH (mb, hmap_node, &put_mac_bindings) {
         run_put_mac_binding(ovnsb_idl_txn, sbrec_datapath_binding_by_key,
                             sbrec_port_binding_by_key,
                             sbrec_mac_binding_by_lport_ip,
-                            pmb);
+                            mb);
     }
-    flush_put_mac_bindings();
+    ovn_mac_bindings_flush(&put_mac_bindings);
 }
 
 static void
@@ -4188,14 +4179,6 @@ wait_put_mac_bindings(struct ovsdb_idl_txn *ovnsb_idl_txn)
     }
 }
 
-static void
-flush_put_mac_bindings(void)
-{
-    struct put_mac_binding *pmb;
-    HMAP_FOR_EACH_POP (pmb, hmap_node, &put_mac_bindings) {
-        free(pmb);
-    }
-}
 
 /*
  * Send gratuitous/reverse ARP for vif on localnet.
@@ -7571,4 +7554,95 @@ pinctrl_handle_svc_check(struct rconn *swconn, const struct flow *ip_flow,
         /* Calculate next_send_time. */
         svc_mon->next_send_time = time_msec() + svc_mon->interval;
     }
+}
+
+static struct hmap put_fdbs;
+
+/* MAC learning (fdb) related functions.  Runs within the main
+ * ovn-controller thread context. */
+
+static void
+init_fdb_entries(void)
+{
+    ovn_fdb_init(&put_fdbs);
+}
+
+static void
+destroy_fdb_entries(void)
+{
+    ovn_fdbs_destroy(&put_fdbs);
+}
+
+static const struct sbrec_fdb *
+fdb_lookup(struct ovsdb_idl_index *sbrec_fdb_by_dp_key_mac, uint32_t dp_key,
+           const char *mac)
+{
+    struct sbrec_fdb *fdb = sbrec_fdb_index_init_row(sbrec_fdb_by_dp_key_mac);
+    sbrec_fdb_index_set_dp_key(fdb, dp_key);
+    sbrec_fdb_index_set_mac(fdb, mac);
+
+    const struct sbrec_fdb *retval
+        = sbrec_fdb_index_find(sbrec_fdb_by_dp_key_mac, fdb);
+
+    sbrec_fdb_index_destroy_row(fdb);
+
+    return retval;
+}
+
+static void
+run_put_fdb(struct ovsdb_idl_txn *ovnsb_idl_txn,
+            struct ovsdb_idl_index *sbrec_fdb_by_dp_key_mac,
+            const struct fdb_entry *fdb_e)
+{
+    /* Convert ethernet argument to string form for database. */
+    char mac_string[ETH_ADDR_STRLEN + 1];
+    snprintf(mac_string, sizeof mac_string,
+             ETH_ADDR_FMT, ETH_ADDR_ARGS(fdb_e->mac));
+
+    /* Update or add an FDB entry. */
+    const struct sbrec_fdb *sb_fdb =
+        fdb_lookup(sbrec_fdb_by_dp_key_mac, fdb_e->dp_key, mac_string);
+    if (!sb_fdb) {
+        sb_fdb = sbrec_fdb_insert(ovnsb_idl_txn);
+        sbrec_fdb_set_dp_key(sb_fdb, fdb_e->dp_key);
+        sbrec_fdb_set_mac(sb_fdb, mac_string);
+    }
+    sbrec_fdb_set_port_key(sb_fdb, fdb_e->port_key);
+}
+
+static void
+run_put_fdbs(struct ovsdb_idl_txn *ovnsb_idl_txn,
+             struct ovsdb_idl_index *sbrec_fdb_by_dp_key_mac)
+             OVS_REQUIRES(pinctrl_mutex)
+{
+    if (!ovnsb_idl_txn) {
+        return;
+    }
+
+    const struct fdb_entry *fdb_e;
+    HMAP_FOR_EACH (fdb_e, hmap_node, &put_fdbs) {
+        run_put_fdb(ovnsb_idl_txn, sbrec_fdb_by_dp_key_mac, fdb_e);
+    }
+    ovn_fdbs_flush(&put_fdbs);
+}
+
+
+static void
+wait_put_fdbs(struct ovsdb_idl_txn *ovnsb_idl_txn)
+{
+    if (ovnsb_idl_txn && !hmap_is_empty(&put_fdbs)) {
+        poll_immediate_wake();
+    }
+}
+
+/* Called with in the pinctrl_handler thread context. */
+static void
+pinctrl_handle_put_fdb(const struct flow *md, const struct flow *headers)
+                       OVS_REQUIRES(pinctrl_mutex)
+{
+    uint32_t dp_key = ntohll(md->metadata);
+    uint32_t port_key = md->regs[MFF_LOG_INPORT - MFF_REG0];
+
+    ovn_fdb_add(&put_fdbs, dp_key, headers->dl_src, port_key);
+    notify_pinctrl_main();
 }

@@ -107,6 +107,9 @@ struct ovn_extend_table;
     OVNACT(CT_SNAT_TO_VIP,    ovnact_null)            \
     OVNACT(BFD_MSG,           ovnact_null)            \
     OVNACT(SCTP_ABORT,        ovnact_nest)            \
+    OVNACT(PUT_FDB,           ovnact_put_fdb)         \
+    OVNACT(GET_FDB,           ovnact_get_fdb)         \
+    OVNACT(LOOKUP_FDB,        ovnact_lookup_fdb)      \
 
 /* enum ovnact_type, with a member OVNACT_<ENUM> for each action. */
 enum OVS_PACKED_ENUM ovnact_type {
@@ -415,6 +418,28 @@ struct ovnact_fwd_group {
     uint8_t ltable;           /* Logical table ID of next table. */
 };
 
+/* OVNACT_PUT_FDB. */
+struct ovnact_put_fdb {
+    struct ovnact ovnact;
+    struct expr_field port;     /* Logical port name. */
+    struct expr_field mac;      /* 48-bit Ethernet address. */
+};
+
+/* OVNACT_GET_FDB. */
+struct ovnact_get_fdb {
+    struct ovnact ovnact;
+    struct expr_field mac;     /* 48-bit Ethernet address. */
+    struct expr_field dst;     /* 32-bit destination field. */
+};
+
+/* OVNACT_LOOKUP_FDB. */
+struct ovnact_lookup_fdb {
+    struct ovnact ovnact;
+    struct expr_field mac;     /* 48-bit Ethernet address. */
+    struct expr_field port;    /* Logical port name. */
+    struct expr_field dst;     /* 1-bit destination field. */
+};
+
 /* Internal use by the helpers below. */
 void ovnact_init(struct ovnact *, enum ovnact_type, size_t len);
 void *ovnact_put(struct ofpbuf *, enum ovnact_type, size_t len);
@@ -641,6 +666,10 @@ enum action_opcode {
      * The actions, in OpenFlow 1.3 format, follow the action_header.
      */
     ACTION_OPCODE_SCTP_ABORT,
+
+    /* put_fdb(inport, eth.src).
+     */
+    ACTION_OPCODE_PUT_FDB,
 };
 
 /* Header. */
@@ -762,6 +791,10 @@ struct ovnact_encode_params {
                                        * 'chk_lb_hairpin_reply' to resubmit. */
     uint8_t ct_snat_vip_ptable;  /* OpenFlow table for
                                   * 'ct_snat_to_vip' to resubmit. */
+    uint8_t fdb_ptable; /* OpenFlow table for
+                         * 'get_fdb' to resubmit. */
+    uint8_t fdb_lookup_ptable; /* OpenFlow table for
+                                * 'lookup_fdb' to resubmit. */
 };
 
 void ovnacts_encode(const struct ovnact[], size_t ovnacts_len,

@@ -1,4 +1,6 @@
 AT_BANNER([OVN northd])
+
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- check from NBDB to SBDB])
 ovn_start
 
@@ -65,7 +67,9 @@ check_row_count Gateway_Chassis 0
 check_row_count Ha_Chassis_Group 0
 
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- check up state of VIF LSP])
 ovn_start
 
@@ -78,7 +82,9 @@ ovn-sbctl lsp-bind S1-vm1 hv1
 wait_row_count nb:Logical_Switch_Port 1 name=S1-vm1 'up=true'
 
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- check up state of router LSP linked to a distributed LR])
 ovn_start
 
@@ -93,7 +99,9 @@ ovn-nbctl --wait=sb lsp-set-options S1-R1 router-port=R1-S1
 AT_CHECK([test x`ovn-nbctl lsp-get-up S1-R1` = xup])
 
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- check up state of router LSP linked to a gateway LR])
 ovn_start
 
@@ -112,7 +120,9 @@ ovn-sbctl lsp-bind S1-R1 gw1
 AT_CHECK([test x`ovn-nbctl lsp-get-up S1-R1` = xup])
 
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- check up state of router LSP linked to an LRP with set Gateway Chassis])
 ovn_start
 
@@ -130,7 +140,9 @@ ovn-nbctl --wait=sb lsp-set-options S1-R1 router-port=R1-S1
 AT_CHECK([test x`ovn-nbctl lsp-get-up S1-R1` = xup])
 
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- check IPv6 RA config propagation to SBDB])
 ovn_start
 
@@ -240,14 +252,16 @@ AT_CHECK_UNQUOTED([ovn-sbctl get Port_Binding ${uuid} options:ipv6_ra_prefixes],
 ])
 
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- test unixctl])
 ovn_init_db ovn-sb; ovn-sbctl init
 ovn_init_db ovn-nb; ovn-nbctl init
 
 # test unixctl option
 mkdir "$ovs_base"/northd
-as northd start_daemon ovn-northd --unixctl="$ovs_base"/northd/ovn-northd.ctl --ovnnb-db=unix:"$ovs_base"/ovn-nb/ovn-nb.sock --ovnsb-db=unix:"$ovs_base"/ovn-sb/ovn-sb.sock
+as northd start_daemon NORTHD_TYPE --unixctl="$ovs_base"/northd/NORTHD_TYPE[].ctl --ovnnb-db=unix:"$ovs_base"/ovn-nb/ovn-nb.sock --ovnsb-db=unix:"$ovs_base"/ovn-sb/ovn-sb.sock
 ovn-nbctl ls-add sw
 ovn-nbctl --wait=sb lsp-add sw p1
 # northd created with unixctl option successfully created port_binding entry
@@ -255,7 +269,7 @@ check_row_count Port_Binding 1 logical_port=p1
 AT_CHECK([ovn-nbctl --wait=sb lsp-del p1])
 
 # ovs-appctl exit with unixctl option
-OVS_APP_EXIT_AND_WAIT_BY_TARGET(["$ovs_base"/northd/ovn-northd.ctl], ["$ovs_base"/northd/ovn-northd.pid])
+OVS_APP_EXIT_AND_WAIT_BY_TARGET(["$ovs_base"/northd/]NORTHD_TYPE[.ctl], ["$ovs_base"/northd/]NORTHD_TYPE[.pid])
 
 # Check no port_binding entry for new port as ovn-northd is not running
 #
@@ -266,7 +280,7 @@ AT_CHECK([ovn-nbctl --timeout=10 --wait=sb sync], [142], [], [ignore])
 check_row_count Port_Binding 0 logical_port=p2
 
 # test default unixctl path
-as northd start_daemon ovn-northd --ovnnb-db=unix:"$ovs_base"/ovn-nb/ovn-nb.sock --ovnsb-db=unix:"$ovs_base"/ovn-sb/ovn-sb.sock
+as northd start_daemon NORTHD_TYPE --ovnnb-db=unix:"$ovs_base"/ovn-nb/ovn-nb.sock --ovnsb-db=unix:"$ovs_base"/ovn-sb/ovn-sb.sock
 ovn-nbctl --wait=sb lsp-add sw p3
 # northd created with default unixctl path successfully created port_binding entry
 check_row_count Port_Binding 1 logical_port=p3
@@ -276,10 +290,12 @@ OVS_APP_EXIT_AND_WAIT([ovsdb-server])
 as ovn-nb
 OVS_APP_EXIT_AND_WAIT([ovsdb-server])
 as northd
-OVS_APP_EXIT_AND_WAIT([ovn-northd])
+OVS_APP_EXIT_AND_WAIT([NORTHD_TYPE])
 
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- check HA_Chassis_Group propagation from NBDB to SBDB])
 ovn_start
 
@@ -605,11 +621,12 @@ wait_row_count Port_Binding 0 logical_port=sw0-pext1 'chassis!=[[]]'
 wait_row_count HA_Chassis_Group 1 name=hagrp1
 wait_row_count HA_Chassis 3
 
-# Clear ha_chassis_group for sw0-pext2
-ovn-nbctl --wait=sb clear logical_switch_port sw0-pext2 ha_chassis_group
+AS_BOX([Clear ha_chassis_group for sw0-pext2 and reset port type to normal in the same txn])
 
-wait_row_count Port_Binding 0 logical_port=sw0-pext2 'chassis!=[[]]'
+check ovn-nbctl  --wait=sb clear logical_switch_port sw0-pext2 \
+ha_chassis_group -- set logical_switch_port sw0-pext2 'type=""'
 wait_row_count HA_Chassis_Group 0
+wait_row_count Port_Binding 0 logical_port=sw0-pext2 'chassis!=[[]]'
 check_row_count HA_Chassis 0
 
 as ovn-sb
@@ -617,24 +634,26 @@ OVS_APP_EXIT_AND_WAIT([ovsdb-server])
 as ovn-nb
 OVS_APP_EXIT_AND_WAIT([ovsdb-server])
 as northd
-OVS_APP_EXIT_AND_WAIT([ovn-northd])
+OVS_APP_EXIT_AND_WAIT([NORTHD_TYPE])
 
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- ovn-northd pause and resume])
 ovn_start
 
 get_northd_status() {
-    as northd ovn-appctl -t ovn-northd is-paused
-    as northd ovn-appctl -t ovn-northd status
-    as northd-backup ovn-appctl -t ovn-northd is-paused
-    as northd-backup ovn-appctl -t ovn-northd status
+    as northd ovn-appctl -t NORTHD_TYPE is-paused
+    as northd ovn-appctl -t NORTHD_TYPE status
+    as northd-backup ovn-appctl -t NORTHD_TYPE is-paused
+    as northd-backup ovn-appctl -t NORTHD_TYPE status
 }
 
 AS_BOX([Pause the backup])
 # This forces the main northd to become active (otherwise there's no
 # guarantee, ovn_start is racy).
-check as northd-backup ovs-appctl -t ovn-northd pause
+check as northd-backup ovs-appctl -t NORTHD_TYPE pause
 OVS_WAIT_FOR_OUTPUT([get_northd_status], [0], [false
 Status: active
 true
@@ -642,7 +661,7 @@ Status: paused
 ])
 
 AS_BOX([Resume the backup])
-check as northd-backup ovs-appctl -t ovn-northd resume
+check as northd-backup ovs-appctl -t NORTHD_TYPE resume
 OVS_WAIT_FOR_OUTPUT([get_northd_status], [0], [false
 Status: active
 false
@@ -659,8 +678,8 @@ check ovn-nbctl --wait=sb ls-del sw0
 check_row_count Datapath_Binding 0
 
 AS_BOX([Pause the main northd])
-check as northd ovs-appctl -t ovn-northd pause
-check as northd-backup ovs-appctl -t ovn-northd pause
+check as northd ovs-appctl -t NORTHD_TYPE pause
+check as northd-backup ovs-appctl -t NORTHD_TYPE pause
 AT_CHECK([get_northd_status], [0], [true
 Status: paused
 true
@@ -674,8 +693,8 @@ check sleep 5
 check_row_count Datapath_Binding 0
 
 AS_BOX([Resume the main northd])
-check as northd ovs-appctl -t ovn-northd resume
-check as northd-backup ovs-appctl -t ovn-northd resume
+check as northd ovs-appctl -t NORTHD_TYPE resume
+check as northd-backup ovs-appctl -t NORTHD_TYPE resume
 OVS_WAIT_FOR_OUTPUT([get_northd_status], [0], [false
 Status: active
 false
@@ -686,7 +705,106 @@ check ovn-nbctl --wait=sb sync
 check_row_count Datapath_Binding 1
 
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
+AT_SETUP([ovn -- ovn-northd restart])
+ovn_start --no-backup-northd
+
+# Check that ovn-northd is active, by verifying that it creates and
+# destroys southbound datapaths as one would expect.
+check_row_count Datapath_Binding 0
+check ovn-nbctl --wait=sb ls-add sw0
+check_row_count Datapath_Binding 1
+
+# Kill northd.
+as northd
+OVS_APP_EXIT_AND_WAIT([NORTHD_TYPE])
+
+# With ovn-northd gone, changes to nbdb won't be reflected into sbdb.
+# Make sure.
+check ovn-nbctl ls-add sw1
+sleep 5
+check_row_count Datapath_Binding 1
+
+# Now resume ovn-northd.  Changes should catch up.
+ovn_start_northd primary
+wait_row_count Datapath_Binding 2
+
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD([
+AT_SETUP([ovn -- northbound database reconnection])
+ovn_start --no-backup-northd
+
+# Check that ovn-northd is active, by verifying that it creates and
+# destroys southbound datapaths as one would expect.
+check_row_count Datapath_Binding 0
+check ovn-nbctl --wait=sb ls-add sw0
+check_row_count Datapath_Binding 1
+lf=$(count_rows Logical_Flow)
+
+# Make nbdb ovsdb-server drop connection from ovn-northd.
+conn=$(as ovn-nb ovs-appctl -t ovsdb-server ovsdb-server/list-remotes)
+check as ovn-nb ovs-appctl -t ovsdb-server ovsdb-server/remove-remote "$conn"
+conn2=punix:`pwd`/special.sock
+check as ovn-nb ovs-appctl -t ovsdb-server ovsdb-server/add-remote "$conn2"
+
+# ovn-northd won't respond to changes (because the nbdb connection dropped).
+check ovn-nbctl --db="${conn2#p}" ls-add sw1
+sleep 5
+check_row_count Datapath_Binding 1
+check_row_count Logical_Flow $lf
+
+# Now re-enable the nbdb connection and observe ovn-northd catch up.
+#
+# It's important to check both Datapath_Binding and Logical_Flow because
+# ovn-northd-ddlog implements them in different ways that might go wrong
+# differently on reconnection.
+check as ovn-nb ovs-appctl -t ovsdb-server ovsdb-server/add-remote "$conn"
+wait_row_count Datapath_Binding 2
+wait_row_count Logical_Flow $(expr 2 \* $lf)
+
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD([
+AT_SETUP([ovn -- southbound database reconnection])
+ovn_start --no-backup-northd
+
+# Check that ovn-northd is active, by verifying that it creates and
+# destroys southbound datapaths as one would expect.
+check_row_count Datapath_Binding 0
+check ovn-nbctl --wait=sb ls-add sw0
+check_row_count Datapath_Binding 1
+lf=$(count_rows Logical_Flow)
+
+# Make sbdb ovsdb-server drop connection from ovn-northd.
+conn=$(as ovn-sb ovs-appctl -t ovsdb-server ovsdb-server/list-remotes)
+check as ovn-sb ovs-appctl -t ovsdb-server ovsdb-server/remove-remote "$conn"
+conn2=punix:`pwd`/special.sock
+check as ovn-sb ovs-appctl -t ovsdb-server ovsdb-server/add-remote "$conn2"
+
+# ovn-northd can't respond to changes (because the sbdb connection dropped).
+check ovn-nbctl ls-add sw1
+sleep 5
+OVN_SB_DB=${conn2#p} check_row_count Datapath_Binding 1
+OVN_SB_DB=${conn2#p} check_row_count Logical_Flow $lf
+
+# Now re-enable the sbdb connection and observe ovn-northd catch up.
+#
+# It's important to check both Datapath_Binding and Logical_Flow because
+# ovn-northd-ddlog implements them in different ways that might go wrong
+# differently on reconnection.
+check as ovn-sb ovs-appctl -t ovsdb-server ovsdb-server/add-remote "$conn"
+wait_row_count Datapath_Binding 2
+wait_row_count Logical_Flow $(expr 2 \* $lf)
+
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- check Redirect Chassis propagation from NB to SB])
 ovn_start
 
@@ -709,7 +827,9 @@ wait_row_count Port_Binding 1 logical_port=cr-R1-S1 options:redirect-type=bridge
 ovn-nbctl lrp-set-redirect-type R1-S1 overlay
 wait_row_count Port_Binding 1 logical_port=cr-R1-S1 options:redirect-type=overlay
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- check stateless dnat_and_snat rule])
 ovn_start
 
@@ -767,7 +887,9 @@ ovn-nbctl --wait=sb --stateless lr-nat-add R1 dnat_and_snat fd01::1 fd11::2
 check_flow_match_sets 2 0 0 0 0 2 2
 
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- check portrange dnat, snat and dnat_and_snat rules])
 ovn_start
 
@@ -817,7 +939,9 @@ AT_CHECK([grep 'ct_[s]dnat.*172\.16\.1\.2.*3000' sbflows3], [1])
 ovn-nbctl lr-nat-del R1 dnat_and_snat  172.16.1.1
 
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- check allowed/disallowed external dnat, snat and dnat_and_snat rules])
 ovn_start
 
@@ -1035,10 +1159,11 @@ AT_CHECK([ovn-sbctl dump-flows CR | grep lr_in_dnat | grep "ip4.dst == 172.16.1.
 ])
 
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- check Load balancer health check and Service Monitor sync])
-ovn_start
-
+ovn_start NORTHD_TYPE
 check ovn-nbctl lb-add lb1 10.0.0.10:80 10.0.0.3:80,20.0.0.3:80
 
 check ovn-nbctl --wait=sb set load_balancer . ip_port_mappings:10.0.0.3=sw0-p1
@@ -1077,7 +1202,7 @@ check ovn-nbctl --wait=sb ls-lb-add sw0 lb1
 AT_CAPTURE_FILE([sbflows])
 OVS_WAIT_FOR_OUTPUT(
   [ovn-sbctl dump-flows sw0 | tee sbflows | grep 'priority=120.*ct_lb' | sed 's/table=..//'], 0, [dnl
-  (ls_in_stateful     ), priority=120  , match=(ct.new && ip4.dst == 10.0.0.10 && tcp.dst == 80), action=(ct_lb(backends=10.0.0.3:80,20.0.0.3:80);)
+  (ls_in_stateful     ), priority=120  , match=(ct.new && ip4.dst == 10.0.0.10 && tcp.dst == 80), action=(reg1 = 10.0.0.10; reg2[[0..15]] = 80; ct_lb(backends=10.0.0.3:80,20.0.0.3:80);)
 ])
 
 AS_BOX([Delete the Load_Balancer_Health_Check])
@@ -1087,7 +1212,7 @@ wait_row_count Service_Monitor 0
 AT_CAPTURE_FILE([sbflows2])
 OVS_WAIT_FOR_OUTPUT(
   [ovn-sbctl dump-flows sw0 | tee sbflows2 | grep 'priority=120.*ct_lb' | sed 's/table=..//'], [0],
-[  (ls_in_stateful     ), priority=120  , match=(ct.new && ip4.dst == 10.0.0.10 && tcp.dst == 80), action=(ct_lb(backends=10.0.0.3:80,20.0.0.3:80);)
+[  (ls_in_stateful     ), priority=120  , match=(ct.new && ip4.dst == 10.0.0.10 && tcp.dst == 80), action=(reg1 = 10.0.0.10; reg2[[0..15]] = 80; ct_lb(backends=10.0.0.3:80,20.0.0.3:80);)
 ])
 
 AS_BOX([Create the Load_Balancer_Health_Check again.])
@@ -1099,7 +1224,7 @@ check ovn-nbctl --wait=sb sync
 
 ovn-sbctl dump-flows sw0 | grep ct_lb | grep priority=120 > lflows.txt
 AT_CHECK([cat lflows.txt | sed 's/table=..//'], [0], [dnl
-  (ls_in_stateful     ), priority=120  , match=(ct.new && ip4.dst == 10.0.0.10 && tcp.dst == 80), action=(ct_lb(backends=10.0.0.3:80,20.0.0.3:80);)
+  (ls_in_stateful     ), priority=120  , match=(ct.new && ip4.dst == 10.0.0.10 && tcp.dst == 80), action=(reg1 = 10.0.0.10; reg2[[0..15]] = 80; ct_lb(backends=10.0.0.3:80,20.0.0.3:80);)
 ])
 
 AS_BOX([Get the uuid of both the service_monitor])
@@ -1109,7 +1234,7 @@ sm_sw1_p1=$(fetch_column Service_Monitor _uuid logical_port=sw1-p1)
 AT_CAPTURE_FILE([sbflows3])
 OVS_WAIT_FOR_OUTPUT(
   [ovn-sbctl dump-flows sw0 | tee sbflows 3 | grep 'priority=120.*ct_lb' | sed 's/table=..//'], [0],
-[  (ls_in_stateful     ), priority=120  , match=(ct.new && ip4.dst == 10.0.0.10 && tcp.dst == 80), action=(ct_lb(backends=10.0.0.3:80,20.0.0.3:80);)
+[  (ls_in_stateful     ), priority=120  , match=(ct.new && ip4.dst == 10.0.0.10 && tcp.dst == 80), action=(reg1 = 10.0.0.10; reg2[[0..15]] = 80; ct_lb(backends=10.0.0.3:80,20.0.0.3:80);)
 ])
 
 AS_BOX([Set the service monitor for sw1-p1 to offline])
@@ -1120,7 +1245,7 @@ check ovn-nbctl --wait=sb sync
 AT_CAPTURE_FILE([sbflows4])
 OVS_WAIT_FOR_OUTPUT(
   [ovn-sbctl dump-flows sw0 | tee sbflows4 | grep 'priority=120.*ct_lb' | sed 's/table=..//'], [0],
-[  (ls_in_stateful     ), priority=120  , match=(ct.new && ip4.dst == 10.0.0.10 && tcp.dst == 80), action=(ct_lb(backends=10.0.0.3:80);)
+[  (ls_in_stateful     ), priority=120  , match=(ct.new && ip4.dst == 10.0.0.10 && tcp.dst == 80), action=(reg1 = 10.0.0.10; reg2[[0..15]] = 80; ct_lb(backends=10.0.0.3:80);)
 ])
 
 AS_BOX([Set the service monitor for sw0-p1 to offline])
@@ -1149,7 +1274,7 @@ check ovn-nbctl --wait=sb sync
 AT_CAPTURE_FILE([sbflows7])
 OVS_WAIT_FOR_OUTPUT(
   [ovn-sbctl dump-flows sw0 | tee sbflows7 | grep ct_lb | grep priority=120 | sed 's/table=..//'], 0,
-[  (ls_in_stateful     ), priority=120  , match=(ct.new && ip4.dst == 10.0.0.10 && tcp.dst == 80), action=(ct_lb(backends=10.0.0.3:80,20.0.0.3:80);)
+[  (ls_in_stateful     ), priority=120  , match=(ct.new && ip4.dst == 10.0.0.10 && tcp.dst == 80), action=(reg1 = 10.0.0.10; reg2[[0..15]] = 80; ct_lb(backends=10.0.0.3:80,20.0.0.3:80);)
 ])
 
 AS_BOX([Set the service monitor for sw1-p1 to error])
@@ -1160,7 +1285,7 @@ check ovn-nbctl --wait=sb sync
 ovn-sbctl dump-flows sw0 | grep "ip4.dst == 10.0.0.10 && tcp.dst == 80" \
 | grep priority=120 > lflows.txt
 AT_CHECK([cat lflows.txt | sed 's/table=..//'], [0], [dnl
-  (ls_in_stateful     ), priority=120  , match=(ct.new && ip4.dst == 10.0.0.10 && tcp.dst == 80), action=(ct_lb(backends=10.0.0.3:80);)
+  (ls_in_stateful     ), priority=120  , match=(ct.new && ip4.dst == 10.0.0.10 && tcp.dst == 80), action=(reg1 = 10.0.0.10; reg2[[0..15]] = 80; ct_lb(backends=10.0.0.3:80);)
 ])
 
 AS_BOX([Add one more vip to lb1])
@@ -1186,8 +1311,8 @@ AT_CAPTURE_FILE([sbflows9])
 OVS_WAIT_FOR_OUTPUT(
   [ovn-sbctl dump-flows sw0 | tee sbflows9 | grep ct_lb | grep priority=120 | sed 's/table=..//' | sort],
   0,
-[  (ls_in_stateful     ), priority=120  , match=(ct.new && ip4.dst == 10.0.0.10 && tcp.dst == 80), action=(ct_lb(backends=10.0.0.3:80);)
-  (ls_in_stateful     ), priority=120  , match=(ct.new && ip4.dst == 10.0.0.40 && tcp.dst == 1000), action=(ct_lb(backends=10.0.0.3:1000);)
+[  (ls_in_stateful     ), priority=120  , match=(ct.new && ip4.dst == 10.0.0.10 && tcp.dst == 80), action=(reg1 = 10.0.0.10; reg2[[0..15]] = 80; ct_lb(backends=10.0.0.3:80);)
+  (ls_in_stateful     ), priority=120  , match=(ct.new && ip4.dst == 10.0.0.40 && tcp.dst == 1000), action=(reg1 = 10.0.0.40; reg2[[0..15]] = 1000; ct_lb(backends=10.0.0.3:1000);)
 ])
 
 AS_BOX([Set the service monitor for sw1-p1 to online])
@@ -1200,8 +1325,8 @@ AT_CAPTURE_FILE([sbflows10])
 OVS_WAIT_FOR_OUTPUT(
   [ovn-sbctl dump-flows sw0 | tee sbflows10 | grep ct_lb | grep priority=120 | sed 's/table=..//' | sort],
   0,
-[  (ls_in_stateful     ), priority=120  , match=(ct.new && ip4.dst == 10.0.0.10 && tcp.dst == 80), action=(ct_lb(backends=10.0.0.3:80,20.0.0.3:80);)
-  (ls_in_stateful     ), priority=120  , match=(ct.new && ip4.dst == 10.0.0.40 && tcp.dst == 1000), action=(ct_lb(backends=10.0.0.3:1000,20.0.0.3:80);)
+[  (ls_in_stateful     ), priority=120  , match=(ct.new && ip4.dst == 10.0.0.10 && tcp.dst == 80), action=(reg1 = 10.0.0.10; reg2[[0..15]] = 80; ct_lb(backends=10.0.0.3:80,20.0.0.3:80);)
+  (ls_in_stateful     ), priority=120  , match=(ct.new && ip4.dst == 10.0.0.40 && tcp.dst == 1000), action=(reg1 = 10.0.0.40; reg2[[0..15]] = 1000; ct_lb(backends=10.0.0.3:1000,20.0.0.3:80);)
 ])
 
 AS_BOX([Associate lb1 to sw1])
@@ -1210,8 +1335,8 @@ AT_CAPTURE_FILE([sbflows11])
 OVS_WAIT_FOR_OUTPUT(
   [ovn-sbctl dump-flows sw1 | tee sbflows11 | grep ct_lb | grep priority=120 | sed 's/table=..//' | sort],
   0, [dnl
-  (ls_in_stateful     ), priority=120  , match=(ct.new && ip4.dst == 10.0.0.10 && tcp.dst == 80), action=(ct_lb(backends=10.0.0.3:80,20.0.0.3:80);)
-  (ls_in_stateful     ), priority=120  , match=(ct.new && ip4.dst == 10.0.0.40 && tcp.dst == 1000), action=(ct_lb(backends=10.0.0.3:1000,20.0.0.3:80);)
+  (ls_in_stateful     ), priority=120  , match=(ct.new && ip4.dst == 10.0.0.10 && tcp.dst == 80), action=(reg1 = 10.0.0.10; reg2[[0..15]] = 80; ct_lb(backends=10.0.0.3:80,20.0.0.3:80);)
+  (ls_in_stateful     ), priority=120  , match=(ct.new && ip4.dst == 10.0.0.40 && tcp.dst == 1000), action=(reg1 = 10.0.0.40; reg2[[0..15]] = 1000; ct_lb(backends=10.0.0.3:1000,20.0.0.3:80);)
 ])
 
 AS_BOX([Now create lb2 same as lb1 but udp protocol.])
@@ -1272,7 +1397,9 @@ OVS_WAIT_FOR_OUTPUT(
 ])
 
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- Load balancer VIP in NAT entries])
 AT_SKIP_IF([test $HAVE_PYTHON = no])
 ovn_start
@@ -1313,7 +1440,9 @@ AT_CHECK([test 0 = $(grep lr_in_unsnat sbflows | \
 grep "ip4 && ip4.dst == 192.168.2.6 && tcp && tcp.dst == 8080" -c) ])
 
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- DNAT force snat IP])
 ovn_start
 
@@ -1332,7 +1461,9 @@ AT_CHECK([ovn-sbctl lflow-list lr0 | grep lr_in_unsnat | sort], [0], [dnl
 ])
 
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- check reconcile stale Datapath_Binding])
 ovn_start
 
@@ -1358,7 +1489,9 @@ echo nb_uuid="$nb_uuid" lr_uuid="$lr_uuid"
 AT_CHECK([test "${nb_uuid}" = "${lr_uuid}"])
 
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- check reconcile stale tunnel keys])
 ovn_start
 
@@ -1380,7 +1513,9 @@ check_column 1 Port_Binding tunnel_key logical_port=lsp1
 check_column 2 Port_Binding tunnel_key logical_port=lsp2
 
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- check reconcile stale Ha_Chassis_Group])
 ovn_start
 
@@ -1406,7 +1541,9 @@ AT_CHECK([ovn-nbctl --wait=sb sync], [0])
 check_row_count HA_Chassis_Group 0
 
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- check NB/SB Port_Group translation (lsp add/del)])
 ovn_start
 
@@ -1454,7 +1591,9 @@ ovn-nbctl --wait=sb clear Port_Group pg_test ports
 AT_CHECK([test 0 = $(ovn-sbctl --columns _uuid list Port_Group | grep uuid -c)])
 
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- check NB/SB Port_Group translation (ls del)])
 ovn_start
 
@@ -1479,7 +1618,9 @@ wait_row_count Port_Group 1
 check_row_count Port_Group 1 name=${ls2_key}_pg_test
 
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- check router ARP/NS responder])
 ovn_start
 
@@ -1641,6 +1782,7 @@ action=(eth.dst = eth.src; eth.src = 00:00:00:00:00:02; arp.op = 2; /* ARP reply
 AT_CHECK([ovn-sbctl lflow-list | grep "xreg0\[[0..47\]]" | grep -vE 'lr_in_admission|lr_in_ip_input'], [1], [])
 
 AT_CLEANUP
+])
 
 # This test case tests that when a logical switch has load balancers associated
 # (with VIPs configured), the below logical flow is added by ovn-northd.
@@ -1654,6 +1796,7 @@ AT_CLEANUP
 # So make sure that the above lflow is added even if one load balancer has VIP
 # associated.
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- Load balancer - missing ls_out_pre_lb flows])
 ovn_start
 
@@ -1714,7 +1857,9 @@ AT_CHECK([ovn-sbctl lflow-list | grep "ls_out_pre_lb.*priority=100" | grep reg0 
 ])
 
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- ignore_lsp_down])
 ovn_start
 
@@ -1728,7 +1873,9 @@ ovn-nbctl --wait=sb set NB_Global . options:ignore_lsp_down=true
 AT_CHECK([ovn-sbctl lflow-list | grep arp | grep 10\.0\.0\.1], [0], [ignore])
 
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn-northd -- reject ACL])
 ovn_start
 
@@ -1753,10 +1900,10 @@ AT_CAPTURE_FILE([sw1flows])
 
 AT_CHECK(
   [grep -E 'ls_(in|out)_acl' sw0flows sw1flows | grep pg0 | sort], [0], [dnl
-sw0flows:  table=5 (ls_out_acl         ), priority=2003 , match=(outport == @pg0 && ip6 && udp), action=(reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=ingress,table=21); };)
-sw0flows:  table=7 (ls_in_acl          ), priority=2002 , match=(inport == @pg0 && ip4 && tcp && tcp.dst == 80), action=(reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=egress,table=6); };)
-sw1flows:  table=5 (ls_out_acl         ), priority=2003 , match=(outport == @pg0 && ip6 && udp), action=(reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=ingress,table=21); };)
-sw1flows:  table=7 (ls_in_acl          ), priority=2002 , match=(inport == @pg0 && ip4 && tcp && tcp.dst == 80), action=(reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=egress,table=6); };)
+sw0flows:  table=5 (ls_out_acl         ), priority=2003 , match=(outport == @pg0 && ip6 && udp), action=(reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=ingress,table=23); };)
+sw0flows:  table=9 (ls_in_acl          ), priority=2002 , match=(inport == @pg0 && ip4 && tcp && tcp.dst == 80), action=(reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=egress,table=6); };)
+sw1flows:  table=5 (ls_out_acl         ), priority=2003 , match=(outport == @pg0 && ip6 && udp), action=(reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=ingress,table=23); };)
+sw1flows:  table=9 (ls_in_acl          ), priority=2002 , match=(inport == @pg0 && ip4 && tcp && tcp.dst == 80), action=(reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=egress,table=6); };)
 ])
 
 AS_BOX([2])
@@ -1769,10 +1916,10 @@ ovn-sbctl dump-flows sw1 > sw1flows2
 AT_CAPTURE_FILE([sw1flows2])
 
 AT_CHECK([grep "ls_out_acl" sw0flows2 sw1flows2 | grep pg0 | sort], [0], [dnl
-sw0flows2:  table=5 (ls_out_acl         ), priority=2002 , match=(outport == @pg0 && ip4 && udp), action=(reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=ingress,table=21); };)
-sw0flows2:  table=5 (ls_out_acl         ), priority=2003 , match=(outport == @pg0 && ip6 && udp), action=(reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=ingress,table=21); };)
-sw1flows2:  table=5 (ls_out_acl         ), priority=2002 , match=(outport == @pg0 && ip4 && udp), action=(reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=ingress,table=21); };)
-sw1flows2:  table=5 (ls_out_acl         ), priority=2003 , match=(outport == @pg0 && ip6 && udp), action=(reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=ingress,table=21); };)
+sw0flows2:  table=5 (ls_out_acl         ), priority=2002 , match=(outport == @pg0 && ip4 && udp), action=(reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=ingress,table=23); };)
+sw0flows2:  table=5 (ls_out_acl         ), priority=2003 , match=(outport == @pg0 && ip6 && udp), action=(reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=ingress,table=23); };)
+sw1flows2:  table=5 (ls_out_acl         ), priority=2002 , match=(outport == @pg0 && ip4 && udp), action=(reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=ingress,table=23); };)
+sw1flows2:  table=5 (ls_out_acl         ), priority=2003 , match=(outport == @pg0 && ip6 && udp), action=(reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=ingress,table=23); };)
 ])
 
 AS_BOX([3])
@@ -1787,20 +1934,21 @@ AT_CAPTURE_FILE([sw1flows3])
 AT_CHECK([grep "ls_out_acl" sw0flows3 sw1flows3 | grep pg0 | sort], [0], [dnl
 sw0flows3:  table=5 (ls_out_acl         ), priority=2001 , match=(reg0[[7]] == 1 && (outport == @pg0 && ip)), action=(reg0[[1]] = 1; next;)
 sw0flows3:  table=5 (ls_out_acl         ), priority=2001 , match=(reg0[[8]] == 1 && (outport == @pg0 && ip)), action=(next;)
-sw0flows3:  table=5 (ls_out_acl         ), priority=2002 , match=((reg0[[10]] == 1) && outport == @pg0 && ip4 && udp), action=(ct_commit { ct_label.blocked = 1; };  reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=ingress,table=21); };)
-sw0flows3:  table=5 (ls_out_acl         ), priority=2002 , match=((reg0[[9]] == 1) && outport == @pg0 && ip4 && udp), action=(reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=ingress,table=21); };)
-sw0flows3:  table=5 (ls_out_acl         ), priority=2003 , match=((reg0[[10]] == 1) && outport == @pg0 && ip6 && udp), action=(ct_commit { ct_label.blocked = 1; };  reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=ingress,table=21); };)
-sw0flows3:  table=5 (ls_out_acl         ), priority=2003 , match=((reg0[[9]] == 1) && outport == @pg0 && ip6 && udp), action=(reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=ingress,table=21); };)
+sw0flows3:  table=5 (ls_out_acl         ), priority=2002 , match=((reg0[[10]] == 1) && outport == @pg0 && ip4 && udp), action=(ct_commit { ct_label.blocked = 1; };  reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=ingress,table=23); };)
+sw0flows3:  table=5 (ls_out_acl         ), priority=2002 , match=((reg0[[9]] == 1) && outport == @pg0 && ip4 && udp), action=(reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=ingress,table=23); };)
+sw0flows3:  table=5 (ls_out_acl         ), priority=2003 , match=((reg0[[10]] == 1) && outport == @pg0 && ip6 && udp), action=(ct_commit { ct_label.blocked = 1; };  reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=ingress,table=23); };)
+sw0flows3:  table=5 (ls_out_acl         ), priority=2003 , match=((reg0[[9]] == 1) && outport == @pg0 && ip6 && udp), action=(reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=ingress,table=23); };)
 sw1flows3:  table=5 (ls_out_acl         ), priority=2001 , match=(reg0[[7]] == 1 && (outport == @pg0 && ip)), action=(reg0[[1]] = 1; next;)
 sw1flows3:  table=5 (ls_out_acl         ), priority=2001 , match=(reg0[[8]] == 1 && (outport == @pg0 && ip)), action=(next;)
-sw1flows3:  table=5 (ls_out_acl         ), priority=2002 , match=((reg0[[10]] == 1) && outport == @pg0 && ip4 && udp), action=(ct_commit { ct_label.blocked = 1; };  reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=ingress,table=21); };)
-sw1flows3:  table=5 (ls_out_acl         ), priority=2002 , match=((reg0[[9]] == 1) && outport == @pg0 && ip4 && udp), action=(reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=ingress,table=21); };)
-sw1flows3:  table=5 (ls_out_acl         ), priority=2003 , match=((reg0[[10]] == 1) && outport == @pg0 && ip6 && udp), action=(ct_commit { ct_label.blocked = 1; };  reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=ingress,table=21); };)
-sw1flows3:  table=5 (ls_out_acl         ), priority=2003 , match=((reg0[[9]] == 1) && outport == @pg0 && ip6 && udp), action=(reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=ingress,table=21); };)
+sw1flows3:  table=5 (ls_out_acl         ), priority=2002 , match=((reg0[[10]] == 1) && outport == @pg0 && ip4 && udp), action=(ct_commit { ct_label.blocked = 1; };  reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=ingress,table=23); };)
+sw1flows3:  table=5 (ls_out_acl         ), priority=2002 , match=((reg0[[9]] == 1) && outport == @pg0 && ip4 && udp), action=(reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=ingress,table=23); };)
+sw1flows3:  table=5 (ls_out_acl         ), priority=2003 , match=((reg0[[10]] == 1) && outport == @pg0 && ip6 && udp), action=(ct_commit { ct_label.blocked = 1; };  reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=ingress,table=23); };)
+sw1flows3:  table=5 (ls_out_acl         ), priority=2003 , match=((reg0[[9]] == 1) && outport == @pg0 && ip6 && udp), action=(reg0 = 0; reject { /* eth.dst <-> eth.src; ip.dst <-> ip.src; is implicit. */ outport <-> inport; next(pipeline=ingress,table=23); };)
+])
+AT_CLEANUP
 ])
 
-AT_CLEANUP
-
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- ACL fair Meters])
 AT_KEYWORDS([acl log meter fair])
 ovn_start
@@ -1834,8 +1982,10 @@ check_acl_lflow() {
     acl_log_name=$1
     meter_name=$2
     ls=$3
-    # echo checking that logical flow for acl log $acl_log_name has $meter_name
-    AT_CHECK([ovn-sbctl lflow-list $ls | grep ls_out_acl | \
+    echo "checking that logical flow for acl log $acl_log_name has $meter_name"
+    ovn-sbctl dump-flows $ls > sbflows
+    AT_CAPTURE_FILE([sbflows])
+    AT_CHECK([grep ls_out_acl sbflows | \
               grep "\"${acl_log_name}\"" | \
               grep -c "meter=\"${meter_name}\""], [0], [1
 ])
@@ -1849,7 +1999,7 @@ check_meter_by_name() {
     done
 }
 
-# Make sure 'fair' value properly affects the Meters in SB
+AS_BOX([Make sure 'fair' value properly affects the Meters in SB])
 check_meter_by_name meter_me
 check_meter_by_name NOT meter_me__${acl1} meter_me__${acl2} meter_me__${acl3}
 
@@ -1863,23 +2013,24 @@ check_meter_by_name NOT meter_me__${acl1} meter_me__${acl2} meter_me__${acl3}
 check ovn-nbctl --wait=sb set Meter $nb_meter_uuid fair=true
 check_meter_by_name meter_me meter_me__${acl1} meter_me__${acl2} meter_me__${acl3}
 
-# Change template meter and make sure that is reflected on acl meters as well
+AS_BOX([Change template meter and make sure that is reflected on acl meters])
 template_band=$(fetch_column nb:meter bands name=meter_me)
 check ovn-nbctl --wait=sb set meter_band $template_band rate=123
-# Make sure that every Meter_Band has the right rate.  (ovn-northd
-# creates 4 identical Meter_Band rows, all identical; ovn-northd-ddlog
-# creates just 1.  It doesn't matter, they work just as well.)
+AS_BOX([Make sure that every Meter_Band has the right rate.])
+# ovn-northd creates 4 identical Meter_Band rows, all identical;
+# ovn-northd-ddlog creates just 1.  It doesn't matter, they work just
+# as well.)
 n_meter_bands=$(count_rows meter_band)
 AT_FAIL_IF([test "$n_meter_bands" != 1 && test "$n_meter_bands" != 4])
 check_row_count meter_band $n_meter_bands rate=123
 
-# Check meter in logical flows for acl logs
+AS_BOX([Check meter in logical flows for acl logs])
 check_acl_lflow acl_one meter_me__${acl1} sw0
 check_acl_lflow acl_two meter_me__${acl2} sw0
 check_acl_lflow acl_three meter_me__${acl3} sw0
 check_acl_lflow acl_three meter_me__${acl3} sw1
 
-# Stop using meter for acl1
+AS_BOX([Stop using meter for acl1])
 check ovn-nbctl --wait=sb clear acl $acl1 meter
 check_meter_by_name meter_me meter_me__${acl2}
 check_meter_by_name NOT meter_me__${acl1}
@@ -1887,16 +2038,15 @@ check_acl_lflow acl_two meter_me__${acl2} sw0
 check_acl_lflow acl_three meter_me__${acl3} sw0
 check_acl_lflow acl_three meter_me__${acl3} sw1
 
-# Remove template Meter should remove all others as well
+AS_BOX([Remove template Meter should remove all others as well])
 check ovn-nbctl --wait=sb meter-del meter_me
 check_row_count meter 0
-# Check that logical flow remains but uses non-unique meter since fair
-# attribute is lost by the removal of the Meter row.
+AS_BOX([Check that logical flow remains but uses non-unique meter])
 check_acl_lflow acl_two meter_me sw0
 check_acl_lflow acl_three meter_me sw0
 check_acl_lflow acl_three meter_me sw1
 
-# Re-add template meter and make sure acl2's meter is back in sb
+AS_BOX([Re-add template meter and make sure acl2's meter is back in sb])
 check ovn-nbctl --wait=sb --fair meter-add meter_me drop 1 pktps
 check_meter_by_name meter_me meter_me__${acl2}
 check_meter_by_name NOT meter_me__${acl1}
@@ -1904,14 +2054,16 @@ check_acl_lflow acl_two meter_me__${acl2} sw0
 check_acl_lflow acl_three meter_me__${acl3} sw0
 check_acl_lflow acl_three meter_me__${acl3} sw1
 
-# Remove acl2
+AS_BOX([Remove acl2])
 sw0=$(fetch_column nb:logical_switch _uuid name=sw0)
 check ovn-nbctl --wait=sb remove logical_switch $sw0 acls $acl2
 check_meter_by_name meter_me meter_me__${acl3}
 check_meter_by_name NOT meter_me__${acl1} meter_me__${acl2}
 
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- ACL skip hints for stateless config])
 AT_KEYWORDS([acl])
 ovn_start
@@ -1942,17 +2094,17 @@ AT_CHECK([ovn-sbctl lflow-list ls | grep -e ls_in_acl_hint -e ls_out_acl_hint -e
   table=5 (ls_out_acl         ), priority=65535, match=(!ct.est && ct.rel && !ct.new && !ct.inv && ct_label.blocked == 0), action=(next;)
   table=5 (ls_out_acl         ), priority=65535, match=(ct.est && !ct.rel && !ct.new && !ct.inv && ct.rpl && ct_label.blocked == 0), action=(next;)
   table=5 (ls_out_acl         ), priority=65535, match=(ct.inv || (ct.est && ct.rpl && ct_label.blocked == 1)), action=(drop;)
-  table=6 (ls_in_acl_hint     ), priority=1    , match=(ct.est && ct_label.blocked == 0), action=(reg0[[10]] = 1; next;)
-  table=6 (ls_in_acl_hint     ), priority=2    , match=(ct.est && ct_label.blocked == 1), action=(reg0[[9]] = 1; next;)
-  table=6 (ls_in_acl_hint     ), priority=3    , match=(!ct.est), action=(reg0[[9]] = 1; next;)
-  table=6 (ls_in_acl_hint     ), priority=4    , match=(!ct.new && ct.est && !ct.rpl && ct_label.blocked == 0), action=(reg0[[8]] = 1; reg0[[10]] = 1; next;)
-  table=6 (ls_in_acl_hint     ), priority=5    , match=(!ct.trk), action=(reg0[[8]] = 1; reg0[[9]] = 1; next;)
-  table=6 (ls_in_acl_hint     ), priority=6    , match=(!ct.new && ct.est && !ct.rpl && ct_label.blocked == 1), action=(reg0[[7]] = 1; reg0[[9]] = 1; next;)
-  table=6 (ls_in_acl_hint     ), priority=7    , match=(ct.new && !ct.est), action=(reg0[[7]] = 1; reg0[[9]] = 1; next;)
-  table=7 (ls_in_acl          ), priority=1    , match=(ip && (!ct.est || (ct.est && ct_label.blocked == 1))), action=(reg0[[1]] = 1; next;)
-  table=7 (ls_in_acl          ), priority=65535, match=(!ct.est && ct.rel && !ct.new && !ct.inv && ct_label.blocked == 0), action=(next;)
-  table=7 (ls_in_acl          ), priority=65535, match=(ct.est && !ct.rel && !ct.new && !ct.inv && ct.rpl && ct_label.blocked == 0), action=(next;)
-  table=7 (ls_in_acl          ), priority=65535, match=(ct.inv || (ct.est && ct.rpl && ct_label.blocked == 1)), action=(drop;)
+  table=8 (ls_in_acl_hint     ), priority=1    , match=(ct.est && ct_label.blocked == 0), action=(reg0[[10]] = 1; next;)
+  table=8 (ls_in_acl_hint     ), priority=2    , match=(ct.est && ct_label.blocked == 1), action=(reg0[[9]] = 1; next;)
+  table=8 (ls_in_acl_hint     ), priority=3    , match=(!ct.est), action=(reg0[[9]] = 1; next;)
+  table=8 (ls_in_acl_hint     ), priority=4    , match=(!ct.new && ct.est && !ct.rpl && ct_label.blocked == 0), action=(reg0[[8]] = 1; reg0[[10]] = 1; next;)
+  table=8 (ls_in_acl_hint     ), priority=5    , match=(!ct.trk), action=(reg0[[8]] = 1; reg0[[9]] = 1; next;)
+  table=8 (ls_in_acl_hint     ), priority=6    , match=(!ct.new && ct.est && !ct.rpl && ct_label.blocked == 1), action=(reg0[[7]] = 1; reg0[[9]] = 1; next;)
+  table=8 (ls_in_acl_hint     ), priority=7    , match=(ct.new && !ct.est), action=(reg0[[7]] = 1; reg0[[9]] = 1; next;)
+  table=9 (ls_in_acl          ), priority=1    , match=(ip && (!ct.est || (ct.est && ct_label.blocked == 1))), action=(reg0[[1]] = 1; next;)
+  table=9 (ls_in_acl          ), priority=65535, match=(!ct.est && ct.rel && !ct.new && !ct.inv && ct_label.blocked == 0), action=(next;)
+  table=9 (ls_in_acl          ), priority=65535, match=(ct.est && !ct.rel && !ct.new && !ct.inv && ct.rpl && ct_label.blocked == 0), action=(next;)
+  table=9 (ls_in_acl          ), priority=65535, match=(ct.inv || (ct.est && ct.rpl && ct_label.blocked == 1)), action=(drop;)
 ])
 
 AS_BOX([Check match ct_state with load balancer])
@@ -1974,21 +2126,23 @@ AT_CHECK([ovn-sbctl lflow-list ls | grep -e ls_in_acl_hint -e ls_out_acl_hint -e
   table=5 (ls_out_acl         ), priority=65535, match=(!ct.est && ct.rel && !ct.new && !ct.inv && ct_label.blocked == 0), action=(next;)
   table=5 (ls_out_acl         ), priority=65535, match=(ct.est && !ct.rel && !ct.new && !ct.inv && ct.rpl && ct_label.blocked == 0), action=(next;)
   table=5 (ls_out_acl         ), priority=65535, match=(ct.inv || (ct.est && ct.rpl && ct_label.blocked == 1)), action=(drop;)
-  table=6 (ls_in_acl_hint     ), priority=1    , match=(ct.est && ct_label.blocked == 0), action=(reg0[[10]] = 1; next;)
-  table=6 (ls_in_acl_hint     ), priority=2    , match=(ct.est && ct_label.blocked == 1), action=(reg0[[9]] = 1; next;)
-  table=6 (ls_in_acl_hint     ), priority=3    , match=(!ct.est), action=(reg0[[9]] = 1; next;)
-  table=6 (ls_in_acl_hint     ), priority=4    , match=(!ct.new && ct.est && !ct.rpl && ct_label.blocked == 0), action=(reg0[[8]] = 1; reg0[[10]] = 1; next;)
-  table=6 (ls_in_acl_hint     ), priority=5    , match=(!ct.trk), action=(reg0[[8]] = 1; reg0[[9]] = 1; next;)
-  table=6 (ls_in_acl_hint     ), priority=6    , match=(!ct.new && ct.est && !ct.rpl && ct_label.blocked == 1), action=(reg0[[7]] = 1; reg0[[9]] = 1; next;)
-  table=6 (ls_in_acl_hint     ), priority=7    , match=(ct.new && !ct.est), action=(reg0[[7]] = 1; reg0[[9]] = 1; next;)
-  table=7 (ls_in_acl          ), priority=1    , match=(ip && (!ct.est || (ct.est && ct_label.blocked == 1))), action=(reg0[[1]] = 1; next;)
-  table=7 (ls_in_acl          ), priority=65535, match=(!ct.est && ct.rel && !ct.new && !ct.inv && ct_label.blocked == 0), action=(next;)
-  table=7 (ls_in_acl          ), priority=65535, match=(ct.est && !ct.rel && !ct.new && !ct.inv && ct.rpl && ct_label.blocked == 0), action=(next;)
-  table=7 (ls_in_acl          ), priority=65535, match=(ct.inv || (ct.est && ct.rpl && ct_label.blocked == 1)), action=(drop;)
+  table=8 (ls_in_acl_hint     ), priority=1    , match=(ct.est && ct_label.blocked == 0), action=(reg0[[10]] = 1; next;)
+  table=8 (ls_in_acl_hint     ), priority=2    , match=(ct.est && ct_label.blocked == 1), action=(reg0[[9]] = 1; next;)
+  table=8 (ls_in_acl_hint     ), priority=3    , match=(!ct.est), action=(reg0[[9]] = 1; next;)
+  table=8 (ls_in_acl_hint     ), priority=4    , match=(!ct.new && ct.est && !ct.rpl && ct_label.blocked == 0), action=(reg0[[8]] = 1; reg0[[10]] = 1; next;)
+  table=8 (ls_in_acl_hint     ), priority=5    , match=(!ct.trk), action=(reg0[[8]] = 1; reg0[[9]] = 1; next;)
+  table=8 (ls_in_acl_hint     ), priority=6    , match=(!ct.new && ct.est && !ct.rpl && ct_label.blocked == 1), action=(reg0[[7]] = 1; reg0[[9]] = 1; next;)
+  table=8 (ls_in_acl_hint     ), priority=7    , match=(ct.new && !ct.est), action=(reg0[[7]] = 1; reg0[[9]] = 1; next;)
+  table=9 (ls_in_acl          ), priority=1    , match=(ip && (!ct.est || (ct.est && ct_label.blocked == 1))), action=(reg0[[1]] = 1; next;)
+  table=9 (ls_in_acl          ), priority=65535, match=(!ct.est && ct.rel && !ct.new && !ct.inv && ct_label.blocked == 0), action=(next;)
+  table=9 (ls_in_acl          ), priority=65535, match=(ct.est && !ct.rel && !ct.new && !ct.inv && ct.rpl && ct_label.blocked == 0), action=(next;)
+  table=9 (ls_in_acl          ), priority=65535, match=(ct.inv || (ct.est && ct.rpl && ct_label.blocked == 1)), action=(drop;)
 ])
 
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([datapath requested-tnl-key])
 AT_KEYWORDS([requested tnl tunnel key keys])
 ovn_start
@@ -2036,6 +2190,7 @@ AT_CHECK([test $ls2 = 3])
 AT_CLEANUP
 ])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([port requested-tnl-key])
 AT_KEYWORDS([requested tnl tunnel key keys])
 ovn_start
@@ -2092,7 +2247,9 @@ get_tunnel_keys
 AT_CHECK([test $lsp02 = 3 && test $ls1 = 123])
 
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- NB to SB load balancer sync])
 ovn_start
 
@@ -2175,16 +2332,48 @@ check_column "$lb0_uuid $lb1_uuid" sb:datapath_binding load_balancers external_i
 echo
 echo "__file__:__line__: Set hairpin_snat_ip on lb1 and check that SB DB is updated."
 check ovn-nbctl --wait=sb set Load_Balancer lb1 options:hairpin_snat_ip="42.42.42.42 4242::4242"
-check_column "$lb1_uuid" sb:load_balancer _uuid name=lb1 options='{hairpin_snat_ip="42.42.42.42 4242::4242"}'
+check_column "$lb1_uuid" sb:load_balancer _uuid name=lb1 options='{hairpin_orig_tuple="true", hairpin_snat_ip="42.42.42.42 4242::4242"}'
 
 echo
 echo "__file__:__line__: Delete load balancer lb1 an check that datapath sw1's load_balancers are updated accordingly."
 
 ovn-nbctl --wait=sb lb-del lb1
 check_column "$lb0_uuid" sb:datapath_binding load_balancers external_ids:name=sw1
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD([
+AT_SETUP([ovn -- LS load balancer hairpin logical flows])
+ovn_start
+
+check ovn-nbctl \
+    -- ls-add sw0 \
+    -- lb-add lb0 10.0.0.10:80 10.0.0.4:8080 \
+    -- ls-lb-add sw0 lb0
+
+check ovn-nbctl --wait=sb sync
+
+AT_CHECK([ovn-sbctl lflow-list sw0 | grep ls_in_pre_hairpin | sort], [0], [dnl
+  table=14(ls_in_pre_hairpin  ), priority=0    , match=(1), action=(next;)
+  table=14(ls_in_pre_hairpin  ), priority=100  , match=(ip && ct.trk), action=(reg0[[6]] = chk_lb_hairpin(); reg0[[12]] = chk_lb_hairpin_reply(); next;)
+])
+
+AT_CHECK([ovn-sbctl lflow-list sw0 | grep ls_in_nat_hairpin | sort], [0], [dnl
+  table=15(ls_in_nat_hairpin  ), priority=0    , match=(1), action=(next;)
+  table=15(ls_in_nat_hairpin  ), priority=100  , match=(ip && ct.est && ct.trk && reg0[[6]] == 1), action=(ct_snat;)
+  table=15(ls_in_nat_hairpin  ), priority=100  , match=(ip && ct.new && ct.trk && reg0[[6]] == 1), action=(ct_snat_to_vip; next;)
+  table=15(ls_in_nat_hairpin  ), priority=90   , match=(ip && reg0[[12]] == 1), action=(ct_snat;)
+])
+
+AT_CHECK([ovn-sbctl lflow-list sw0 | grep ls_in_hairpin | sort], [0], [dnl
+  table=16(ls_in_hairpin      ), priority=0    , match=(1), action=(next;)
+  table=16(ls_in_hairpin      ), priority=1    , match=((reg0[[6]] == 1 || reg0[[12]] == 1)), action=(eth.dst <-> eth.src; outport = inport; flags.loopback = 1; output;)
+])
 
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- logical gatapath groups])
 AT_KEYWORDS([use_logical_dp_groups])
 ovn_start
@@ -2258,7 +2447,9 @@ dnl Number of common flows should be the same.
 check_row_count Logical_Flow ${n_flows_common} logical_dp_group=${dp_group_uuid}
 
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- Router policies - ECMP reroute])
 AT_KEYWORDS([router policies ecmp reroute])
 ovn_start
@@ -2382,7 +2573,9 @@ sed 's/reg8\[[0..15\]] == [[0-9]]*/reg8\[[0..15\]] == <cleared>/' | sort], [0], 
 ])
 
 AT_CLEANUP
+])
 
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([ovn -- check BFD config propagation to SBDB])
 AT_KEYWORDS([northd-bfd])
 ovn_start
@@ -2402,57 +2595,42 @@ ovn-nbctl create bfd logical_port=r0-sw2 dst_ip=192.168.20.2 status=down min_tx=
 ovn-nbctl create bfd logical_port=r0-sw3 dst_ip=192.168.30.2 status=down
 ovn-nbctl create bfd logical_port=r0-sw4 dst_ip=192.168.40.2 status=down min_tx=0 detect_mult=0
 
-check_column 10 bfd detect_mult logical_port=r0-sw1
-check_column "192.168.10.2" bfd dst_ip logical_port=r0-sw1
-check_column 250 bfd min_rx logical_port=r0-sw1
-check_column 250 bfd min_tx logical_port=r0-sw1
-check_column admin_down bfd status logical_port=r0-sw1
-
-check_column 20 bfd detect_mult logical_port=r0-sw2
-check_column "192.168.20.2" bfd dst_ip logical_port=r0-sw2
-check_column 500 bfd min_rx logical_port=r0-sw2
-check_column 500 bfd min_tx logical_port=r0-sw2
-check_column admin_down bfd status logical_port=r0-sw2
-
-check_column 5 bfd detect_mult logical_port=r0-sw3
-check_column "192.168.30.2" bfd dst_ip logical_port=r0-sw3
-check_column 1000 bfd min_rx logical_port=r0-sw3
-check_column 1000 bfd min_tx logical_port=r0-sw3
-check_column admin_down bfd status logical_port=r0-sw3
+wait_row_count bfd 1 logical_port=r0-sw1 detect_mult=10 dst_ip=192.168.10.2 \
+                     min_rx=250 min_tx=250 status=admin_down
+wait_row_count bfd 1 logical_port=r0-sw2 detect_mult=20 dst_ip=192.168.20.2 \
+                     min_rx=500 min_tx=500 status=admin_down
+wait_row_count bfd 1 logical_port=r0-sw3 detect_mult=5 dst_ip=192.168.30.2 \
+                     min_rx=1000 min_tx=1000 status=admin_down
 
 uuid=$(fetch_column nb:bfd _uuid logical_port=r0-sw1)
-check ovn-nbctl set bfd $uuid min_tx=1000
-check ovn-nbctl set bfd $uuid min_rx=1000
-check ovn-nbctl set bfd $uuid detect_mult=100
+check ovn-nbctl set bfd $uuid min_tx=1000 min_rx=1000 detect_mult=100
 
 uuid_2=$(fetch_column nb:bfd _uuid logical_port=r0-sw2)
 check ovn-nbctl clear bfd $uuid_2 min_rx
-check_column 1000 bfd min_rx logical_port=r0-sw2
-
-check_column 1000 bfd min_tx logical_port=r0-sw1
-check_column 1000 bfd min_rx logical_port=r0-sw1
-check_column 100 bfd detect_mult logical_port=r0-sw1
+wait_row_count bfd 1 logical_port=r0-sw2 min_rx=1000
+wait_row_count bfd 1 logical_port=r0-sw1 min_rx=1000 min_tx=1000 detect_mult=100
 
 check ovn-nbctl --bfd=$uuid lr-route-add r0 100.0.0.0/8 192.168.10.2
-check_column down bfd status logical_port=r0-sw1
+wait_column down bfd status logical_port=r0-sw1
 AT_CHECK([ovn-nbctl lr-route-list r0 | grep 192.168.10.2 | grep -q bfd],[0])
 
 check ovn-nbctl --bfd lr-route-add r0 200.0.0.0/8 192.168.20.2
-check_column down bfd status logical_port=r0-sw2
+wait_column down bfd status logical_port=r0-sw2
 AT_CHECK([ovn-nbctl lr-route-list r0 | grep 192.168.20.2 | grep -q bfd],[0])
 
 check ovn-nbctl --bfd lr-route-add r0 240.0.0.0/8 192.168.50.2 r0-sw5
-check_column down bfd status logical_port=r0-sw5
+wait_column down bfd status logical_port=r0-sw5
 AT_CHECK([ovn-nbctl lr-route-list r0 | grep 192.168.50.2 | grep -q bfd],[0])
 
 route_uuid=$(fetch_column nb:logical_router_static_route _uuid ip_prefix="100.0.0.0/8")
 check ovn-nbctl clear logical_router_static_route $route_uuid bfd
-check_column admin_down bfd status logical_port=r0-sw1
+wait_column admin_down bfd status logical_port=r0-sw1
 
 ovn-nbctl destroy bfd $uuid
-check_row_count bfd 3
+wait_row_count bfd 3
 
 AT_CLEANUP
+])
 
 AT_SETUP([ovn -- check LSP attached to multiple LS])
 ovn_start
@@ -2520,3 +2698,184 @@ check ovn-sbctl set chassis hv1 other_config:port-up-notif=true
 wait_row_count nb:Logical_Switch_Port 1 up=false name=lsp1
 
 AT_CLEANUP
+
+AT_SETUP([ovn -- lb_force_snat_ip for Gateway Routers])
+ovn_start
+
+check ovn-nbctl ls-add sw0
+check ovn-nbctl ls-add sw1
+
+# Create a logical router and attach both logical switches
+check ovn-nbctl lr-add lr0
+check ovn-nbctl lrp-add lr0 lr0-sw0 00:00:00:00:ff:01 10.0.0.1/24
+check ovn-nbctl lsp-add sw0 sw0-lr0
+check ovn-nbctl lsp-set-type sw0-lr0 router
+check ovn-nbctl lsp-set-addresses sw0-lr0 00:00:00:00:ff:01
+check ovn-nbctl lsp-set-options sw0-lr0 router-port=lr0-sw0
+
+check ovn-nbctl lrp-add lr0 lr0-sw1 00:00:00:00:ff:02 20.0.0.1/24
+check ovn-nbctl lsp-add sw1 sw1-lr0
+check ovn-nbctl lsp-set-type sw1-lr0 router
+check ovn-nbctl lsp-set-addresses sw1-lr0 00:00:00:00:ff:02
+check ovn-nbctl lsp-set-options sw1-lr0 router-port=lr0-sw1
+
+check ovn-nbctl ls-add public
+check ovn-nbctl lrp-add lr0 lr0-public 00:00:20:20:12:13 172.168.0.100/24
+check ovn-nbctl lsp-add public public-lr0
+check ovn-nbctl lsp-set-type public-lr0 router
+check ovn-nbctl lsp-set-addresses public-lr0 router
+check ovn-nbctl lsp-set-options public-lr0 router-port=lr0-public
+
+check ovn-nbctl set logical_router lr0 options:chassis=ch1
+
+ovn-sbctl dump-flows lr0 > lr0flows
+AT_CAPTURE_FILE([lr0flows])
+
+AT_CHECK([grep "lr_out_snat" lr0flows | grep force_snat_for_lb | sort], [0], [dnl
+])
+
+check ovn-nbctl --wait=sb set logical_router lr0 options:lb_force_snat_ip="20.0.0.4 aef0::4"
+
+ovn-sbctl dump-flows lr0 > lr0flows
+AT_CAPTURE_FILE([lr0flows])
+
+AT_CHECK([grep "lr_out_snat" lr0flows | grep force_snat_for_lb | sort], [0], [dnl
+  table=1 (lr_out_snat        ), priority=100  , match=(flags.force_snat_for_lb == 1 && ip4), action=(ct_snat(20.0.0.4);)
+  table=1 (lr_out_snat        ), priority=100  , match=(flags.force_snat_for_lb == 1 && ip6), action=(ct_snat(aef0::4);)
+])
+
+check ovn-nbctl --wait=sb set logical_router lr0 options:lb_force_snat_ip="router_ip"
+
+ovn-sbctl dump-flows lr0 > lr0flows
+AT_CAPTURE_FILE([lr0flows])
+
+AT_CHECK([grep "lr_out_snat" lr0flows | grep force_snat_for_lb | sort], [0], [dnl
+  table=1 (lr_out_snat        ), priority=110  , match=(flags.force_snat_for_lb == 1 && ip4 && outport == "lr0-public"), action=(ct_snat(172.168.0.100);)
+  table=1 (lr_out_snat        ), priority=110  , match=(flags.force_snat_for_lb == 1 && ip4 && outport == "lr0-sw0"), action=(ct_snat(10.0.0.1);)
+  table=1 (lr_out_snat        ), priority=110  , match=(flags.force_snat_for_lb == 1 && ip4 && outport == "lr0-sw1"), action=(ct_snat(20.0.0.1);)
+])
+
+check ovn-nbctl --wait=sb remove logical_router lr0 options chassis
+
+ovn-sbctl dump-flows lr0 > lr0flows
+AT_CAPTURE_FILE([lr0flows])
+
+AT_CHECK([grep "lr_out_snat" lr0flows | grep force_snat_for_lb | sort], [0], [dnl
+])
+
+check ovn-nbctl set logical_router lr0 options:chassis=ch1
+check ovn-nbctl --wait=sb add logical_router_port lr0-sw1 networks "bef0\:\:1/64"
+
+ovn-sbctl dump-flows lr0 > lr0flows
+AT_CAPTURE_FILE([lr0flows])
+
+AT_CHECK([grep "lr_out_snat" lr0flows | grep force_snat_for_lb | sort], [0], [dnl
+  table=1 (lr_out_snat        ), priority=110  , match=(flags.force_snat_for_lb == 1 && ip4 && outport == "lr0-public"), action=(ct_snat(172.168.0.100);)
+  table=1 (lr_out_snat        ), priority=110  , match=(flags.force_snat_for_lb == 1 && ip4 && outport == "lr0-sw0"), action=(ct_snat(10.0.0.1);)
+  table=1 (lr_out_snat        ), priority=110  , match=(flags.force_snat_for_lb == 1 && ip4 && outport == "lr0-sw1"), action=(ct_snat(20.0.0.1);)
+  table=1 (lr_out_snat        ), priority=110  , match=(flags.force_snat_for_lb == 1 && ip6 && outport == "lr0-sw1"), action=(ct_snat(bef0::1);)
+])
+
+AT_CLEANUP
+
+AT_SETUP([ovn -- HA chassis group cleanup for external port ])
+ovn_start
+
+check ovn-nbctl ls-add sw0
+check ovn-nbctl lsp-add sw0 sw0-p1
+check ovn-nbctl lsp-set-type sw0-p1 external
+
+check ovn-sbctl chassis-add ch1 geneve 127.0.0.1
+check ovn-sbctl chassis-add ch2 geneve 127.0.0.2
+
+check ovn-nbctl ha-chassis-group-add hagrp1
+check ovn-nbctl ha-chassis-group-add-chassis hagrp1 ch1 20
+check ovn-nbctl --wait=sb ha-chassis-group-add-chassis hagrp1 ch2 10
+
+ha_grp1_uuid=$(fetch_column nb:ha_chassis_group _uuid)
+echo "ha grp1 uuid = $ha_grp1_uuid"
+ovn-nbctl list ha_chassis_group
+check ovn-nbctl set logical_switch_port sw0-p1 ha_chassis_group=$ha_grp1_uuid
+
+wait_row_count ha_chassis_group 1
+check ovn-nbctl clear logical_switch_port sw0-p1 ha_chassis_group
+wait_row_count ha_chassis_group 0
+
+check ovn-nbctl set logical_switch_port sw0-p1 ha_chassis_group=$ha_grp1_uuid
+wait_row_count ha_chassis_group 1
+sb_ha_grp1_uuid=$(fetch_column ha_chassis_group _uuid)
+
+echo
+echo "__file__:__line__:Check that port_binding sw0-p1 has ha_chassis_group set"
+
+check_column "$sb_ha_grp1_uuid" Port_Binding ha_chassis_group logical_port=sw0-p1
+
+AS_BOX([Clear ha_chassis_group for sw0-p1 and reset port type to normal port in the same txn])
+
+check ovn-nbctl clear logical_switch_port sw0-p1 ha_chassis_group -- set logical_switch_port sw0-p1 'type=""'
+wait_row_count ha_chassis_group 0
+check_column "" Port_Binding chassis logical_port=sw0-p1
+
+AT_CLEANUP
+
+OVN_FOR_EACH_NORTHD([
+AT_SETUP([ovn -- FDB cleanup])
+
+ovn_start
+
+ovn-nbctl ls-add sw0
+ovn-nbctl lsp-add sw0 sw0-p1
+ovn-nbctl lsp-add sw0 sw0-p2
+ovn-nbctl lsp-add sw0 sw0-p3
+
+ovn-nbctl ls-add sw1
+ovn-nbctl lsp-add sw1 sw1-p1
+ovn-nbctl lsp-add sw1 sw1-p2
+ovn-nbctl --wait=sb lsp-add sw1 sw1-p3
+
+sw0_key=$(fetch_column datapath_binding tunnel_key external_ids:name=sw0)
+sw1_key=$(fetch_column datapath_binding tunnel_key external_ids:name=sw1)
+sw0p1_key=$(fetch_column port_binding tunnel_key logical_port=sw0-p1)
+sw0p2_key=$(fetch_column port_binding tunnel_key logical_port=sw0-p2)
+sw1p1_key=$(fetch_column port_binding tunnel_key logical_port=sw1-p1)
+
+ovn-sbctl create FDB mac="00\:00\:00\:00\:00\:01" dp_key=$sw0_key port_key=$sw0p1_key
+ovn-sbctl create FDB mac="00\:00\:00\:00\:00\:02" dp_key=$sw0_key port_key=$sw0p1_key
+ovn-sbctl create FDB mac="00\:00\:00\:00\:00\:03" dp_key=$sw0_key port_key=$sw0p2_key
+ovn-sbctl create FDB mac="00\:00\:00\:00\:01\:01" dp_key=$sw1_key port_key=$sw1p1_key
+ovn-sbctl create FDB mac="00\:00\:00\:00\:01\:02" dp_key=$sw1_key port_key=$sw1p1_key
+ovn-sbctl create FDB mac="00\:00\:00\:00\:01\:03" dp_key=$sw1_key port_key=$sw1p1_key
+
+wait_row_count FDB 6
+
+ovn-sbctl create fdb mac="00\:00\:00\:00\:01\:03" dp_key=$sw1_key port_key=10
+wait_row_count FDB 6
+ovn-sbctl create fdb mac="00\:00\:00\:00\:01\:03" dp_key=4 port_key=10
+wait_row_count FDB 6
+
+ovn-nbctl --wait=sb ls-del sw1
+wait_row_count FDB 3
+
+ovn-nbctl lsp-del sw0-p3
+wait_row_count FDB 3
+
+ovn-nbctl lsp-del sw0-p1
+wait_row_count FDB 1
+
+check_column '00:00:00:00:00:03' FDB mac
+ovn-sbctl list fdb
+
+check_column $sw0_key FDB dp_key
+check_column $sw0p2_key FDB port_key
+
+ovn-nbctl --wait=sb lsp-add sw0-p1
+wait_row_count FDB 1
+
+ovn-nbctl lsp-del sw0-p2
+ovn-nbctl lsp-add sw0-p2
+wait_row_count FDB 0
+
+ovn-sbctl list FDB
+
+AT_CLEANUP
+])

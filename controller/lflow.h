@@ -61,9 +61,9 @@ struct uuid;
  * you make any changes. */
 #define OFTABLE_PHY_TO_LOG            0
 #define OFTABLE_LOG_INGRESS_PIPELINE  8 /* First of LOG_PIPELINE_LEN tables. */
-#define OFTABLE_REMOTE_OUTPUT        32
-#define OFTABLE_LOCAL_OUTPUT         33
-#define OFTABLE_CHECK_LOOPBACK       34
+#define OFTABLE_REMOTE_OUTPUT        37
+#define OFTABLE_LOCAL_OUTPUT         38
+#define OFTABLE_CHECK_LOOPBACK       39
 #define OFTABLE_LOG_EGRESS_PIPELINE  40 /* First of LOG_PIPELINE_LEN tables. */
 #define OFTABLE_SAVE_INPORT          64
 #define OFTABLE_LOG_TO_PHY           65
@@ -72,9 +72,8 @@ struct uuid;
 #define OFTABLE_CHK_LB_HAIRPIN       68
 #define OFTABLE_CHK_LB_HAIRPIN_REPLY 69
 #define OFTABLE_CT_SNAT_FOR_VIP      70
-
-/* The number of tables for the ingress and egress pipelines. */
-#define LOG_PIPELINE_LEN 24
+#define OFTABLE_GET_FDB              71
+#define OFTABLE_LOOKUP_FDB           72
 
 enum ref_type {
     REF_TYPE_ADDRSET,
@@ -137,6 +136,7 @@ struct lflow_ctx_in {
     const struct sbrec_logical_flow_table *logical_flow_table;
     const struct sbrec_logical_dp_group_table *logical_dp_group_table;
     const struct sbrec_multicast_group_table *mc_group_table;
+    const struct sbrec_fdb_table *fdb_table;
     const struct sbrec_chassis *chassis;
     const struct sbrec_load_balancer_table *lb_table;
     const struct hmap *local_datapaths;
@@ -170,6 +170,7 @@ void lflow_handle_changed_neighbors(
     const struct hmap *local_datapaths,
     struct ovn_desired_flow_table *);
 bool lflow_handle_changed_lbs(struct lflow_ctx_in *, struct lflow_ctx_out *);
+bool lflow_handle_changed_fdbs(struct lflow_ctx_in *, struct lflow_ctx_out *);
 void lflow_destroy(void);
 
 bool lflow_add_flows_for_datapath(const struct sbrec_datapath_binding *,

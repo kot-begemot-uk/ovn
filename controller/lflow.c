@@ -89,6 +89,11 @@ static void lflow_resource_destroy_lflow(struct lflow_resource_ref *,
 static bool
 lookup_port_cb(const void *aux_, const char *port_name, unsigned int *portp)
 {
+    if (!strcmp(port_name, "none")) {
+        *portp = 0;
+        return true;
+    }
+
     const struct lookup_port_aux *aux = aux_;
 
     const struct sbrec_port_binding *pb
@@ -384,22 +389,19 @@ lflow_handle_changed_flows(struct lflow_ctx_in *l_ctx_in,
     struct controller_event_options controller_event_opts;
     controller_event_opts_init(&controller_event_opts);
 
-    /* Handle flow removing first (for deleted or updated lflows), and then
-     * handle reprocessing or adding flows, so that when the flows being
-     * removed and added with same match conditions can be processed in the
-     * proper order */
-
+    /* Flood remove the flows for all the tracked lflows.  Its possible that
+     * lflow_add_flows_for_datapath() may have been called before calling
+     * this function. */
     struct hmap flood_remove_nodes = HMAP_INITIALIZER(&flood_remove_nodes);
     struct ofctrl_flood_remove_node *ofrn, *next;
     SBREC_LOGICAL_FLOW_TABLE_FOR_EACH_TRACKED (lflow,
                                                l_ctx_in->logical_flow_table) {
+        VLOG_DBG("delete lflow "UUID_FMT, UUID_ARGS(&lflow->header_.uuid));
+        ofrn = xmalloc(sizeof *ofrn);
+        ofrn->sb_uuid = lflow->header_.uuid;
+        hmap_insert(&flood_remove_nodes, &ofrn->hmap_node,
+                    uuid_hash(&ofrn->sb_uuid));
         if (!sbrec_logical_flow_is_new(lflow)) {
-            VLOG_DBG("delete lflow "UUID_FMT,
-                     UUID_ARGS(&lflow->header_.uuid));
-            ofrn = xmalloc(sizeof *ofrn);
-            ofrn->sb_uuid = lflow->header_.uuid;
-            hmap_insert(&flood_remove_nodes, &ofrn->hmap_node,
-                        uuid_hash(&ofrn->sb_uuid));
             if (lflow_cache_is_enabled(l_ctx_out->lflow_cache)) {
                 lflow_cache_delete(l_ctx_out->lflow_cache,
                                    &lflow->header_.uuid);
@@ -430,21 +432,6 @@ lflow_handle_changed_flows(struct lflow_ctx_in *l_ctx_in,
     }
     hmap_destroy(&flood_remove_nodes);
 
-    /* Now handle new lflows only. */
-    SBREC_LOGICAL_FLOW_TABLE_FOR_EACH_TRACKED (lflow,
-                                               l_ctx_in->logical_flow_table) {
-        if (sbrec_logical_flow_is_new(lflow)) {
-            VLOG_DBG("add lflow "UUID_FMT,
-                     UUID_ARGS(&lflow->header_.uuid));
-            if (!consider_logical_flow(lflow, &dhcp_opts, &dhcpv6_opts,
-                                       &nd_ra_opts, &controller_event_opts,
-                                       l_ctx_in, l_ctx_out)) {
-                ret = false;
-                l_ctx_out->conj_id_overflow = true;
-                break;
-            }
-        }
-    }
     dhcp_opts_destroy(&dhcp_opts);
     dhcp_opts_destroy(&dhcpv6_opts);
     nd_ra_opts_destroy(&nd_ra_opts);
@@ -606,6 +593,8 @@ add_matches_to_flow_table(const struct sbrec_logical_flow *lflow,
         .lb_hairpin_ptable = OFTABLE_CHK_LB_HAIRPIN,
         .lb_hairpin_reply_ptable = OFTABLE_CHK_LB_HAIRPIN_REPLY,
         .ct_snat_vip_ptable = OFTABLE_CT_SNAT_FOR_VIP,
+        .fdb_ptable = OFTABLE_GET_FDB,
+        .fdb_lookup_ptable = OFTABLE_LOOKUP_FDB,
     };
     ovnacts_encode(ovnacts->data, ovnacts->size, &ep, &ofpacts);
 
@@ -963,6 +952,18 @@ put_load(const uint8_t *data, size_t len,
 }
 
 static void
+put_load64(uint64_t value, enum mf_field_id dst, int ofs, int n_bits,
+           struct ofpbuf *ofpacts)
+{
+    struct ofpact_set_field *sf = ofpact_put_set_field(ofpacts,
+                                                       mf_from_id(dst), NULL,
+                                                       NULL);
+    ovs_be64 n_value = htonll(value);
+    bitwise_copy(&n_value, 8, 0, sf->value, sf->field->n_bytes, ofs, n_bits);
+    bitwise_one(ofpact_set_field_mask(sf), sf->field->n_bytes, ofs, n_bits);
+}
+
+static void
 consider_neighbor_flow(struct ovsdb_idl_index *sbrec_port_binding_by_name,
                        const struct hmap *local_datapaths,
                        const struct sbrec_mac_binding *b,
@@ -1227,6 +1228,12 @@ add_lb_vip_hairpin_reply_action(struct in6_addr *vip6, ovs_be32 vip,
     ofpact_finish_LEARN(ofpacts, &ol);
 }
 
+/* Adds flows to detect hairpin sessions.
+ *
+ * For backwards compatibilty with older ovn-northd versions, uses
+ * ct_nw_dst(), ct_ipv6_dst(), ct_tp_dst(), otherwise uses the
+ * original destination tuple stored by ovn-northd.
+ */
 static void
 add_lb_vip_hairpin_flows(struct ovn_controller_lb *lb,
                          struct ovn_lb_vip *lb_vip,
@@ -1242,30 +1249,59 @@ add_lb_vip_hairpin_flows(struct ovn_controller_lb *lb,
     put_load(&value, sizeof value, MFF_LOG_FLAGS,
              MLF_LOOKUP_LB_HAIRPIN_BIT, 1, &ofpacts);
 
+    /* Matching on ct_nw_dst()/ct_ipv6_dst()/ct_tp_dst() requires matching
+     * on ct_state first.
+     */
+    if (!lb->hairpin_orig_tuple) {
+        uint32_t ct_state = OVS_CS_F_TRACKED | OVS_CS_F_DST_NAT;
+        match_set_ct_state_masked(&hairpin_match, ct_state, ct_state);
+    }
+
     if (IN6_IS_ADDR_V4MAPPED(&lb_vip->vip)) {
         ovs_be32 bip4 = in6_addr_get_mapped_ipv4(&lb_backend->ip);
-        ovs_be32 vip4 = lb->hairpin_snat_ips.n_ipv4_addrs
+        ovs_be32 vip4 = in6_addr_get_mapped_ipv4(&lb_vip->vip);
+        ovs_be32 snat_vip4 = lb->hairpin_snat_ips.n_ipv4_addrs
                         ? lb->hairpin_snat_ips.ipv4_addrs[0].addr
-                        : in6_addr_get_mapped_ipv4(&lb_vip->vip);
+                        : vip4;
 
         match_set_dl_type(&hairpin_match, htons(ETH_TYPE_IP));
         match_set_nw_src(&hairpin_match, bip4);
         match_set_nw_dst(&hairpin_match, bip4);
 
-        add_lb_vip_hairpin_reply_action(NULL, vip4, lb_proto,
+        if (!lb->hairpin_orig_tuple) {
+            match_set_ct_nw_dst(&hairpin_match, vip4);
+        } else {
+            match_set_reg(&hairpin_match,
+                          MFF_LOG_LB_ORIG_DIP_IPV4 - MFF_LOG_REG0,
+                          ntohl(vip4));
+        }
+
+        add_lb_vip_hairpin_reply_action(NULL, snat_vip4, lb_proto,
                                         lb_backend->port,
                                         lb->slb->header_.uuid.parts[0],
                                         &ofpacts);
     } else {
         struct in6_addr *bip6 = &lb_backend->ip;
-        struct in6_addr *vip6 = lb->hairpin_snat_ips.n_ipv6_addrs
-                                ? &lb->hairpin_snat_ips.ipv6_addrs[0].addr
-                                : &lb_vip->vip;
+        struct in6_addr *snat_vip6 =
+            lb->hairpin_snat_ips.n_ipv6_addrs
+            ? &lb->hairpin_snat_ips.ipv6_addrs[0].addr
+            : &lb_vip->vip;
         match_set_dl_type(&hairpin_match, htons(ETH_TYPE_IPV6));
         match_set_ipv6_src(&hairpin_match, bip6);
         match_set_ipv6_dst(&hairpin_match, bip6);
 
-        add_lb_vip_hairpin_reply_action(vip6, 0, lb_proto,
+        if (!lb->hairpin_orig_tuple) {
+            match_set_ct_ipv6_dst(&hairpin_match, &lb_vip->vip);
+        } else {
+            ovs_be128 vip6_value;
+
+            memcpy(&vip6_value, &lb_vip->vip, sizeof vip6_value);
+            match_set_xxreg(&hairpin_match,
+                            MFF_LOG_LB_ORIG_DIP_IPV6 - MFF_LOG_XXREG0,
+                            ntoh128(vip6_value));
+        }
+
+        add_lb_vip_hairpin_reply_action(snat_vip6, 0, lb_proto,
                                         lb_backend->port,
                                         lb->slb->header_.uuid.parts[0],
                                         &ofpacts);
@@ -1274,6 +1310,14 @@ add_lb_vip_hairpin_flows(struct ovn_controller_lb *lb,
     if (lb_backend->port) {
         match_set_nw_proto(&hairpin_match, lb_proto);
         match_set_tp_dst(&hairpin_match, htons(lb_backend->port));
+        if (!lb->hairpin_orig_tuple) {
+            match_set_ct_nw_proto(&hairpin_match, lb_proto);
+            match_set_ct_tp_dst(&hairpin_match, htons(lb_vip->vip_port));
+        } else {
+            match_set_reg_masked(&hairpin_match,
+                                 MFF_LOG_LB_ORIG_TP_DPORT - MFF_REG0,
+                                 lb_vip->vip_port, UINT16_MAX);
+        }
     }
 
     /* In the original direction, only match on traffic that was already
@@ -1297,6 +1341,12 @@ add_lb_vip_hairpin_flows(struct ovn_controller_lb *lb,
     ofpbuf_uninit(&ofpacts);
 }
 
+/* Adds flows to perform SNAT for hairpin sessions.
+ *
+ * For backwards compatibilty with older ovn-northd versions, uses
+ * ct_nw_dst(), ct_ipv6_dst(), ct_tp_dst(), otherwise uses the
+ * original destination tuple stored by ovn-northd.
+ */
 static void
 add_lb_ct_snat_vip_flows(struct ovn_controller_lb *lb,
                          struct ovn_lb_vip *lb_vip,
@@ -1339,20 +1389,50 @@ add_lb_ct_snat_vip_flows(struct ovn_controller_lb *lb,
     ofpact_finish(&ofpacts, &ct->ofpact);
 
     struct match match = MATCH_CATCHALL_INITIALIZER;
+
+    /* Matching on ct_nw_dst()/ct_ipv6_dst()/ct_tp_dst() requires matching
+     * on ct_state first.
+     */
+    if (!lb->hairpin_orig_tuple) {
+        uint32_t ct_state = OVS_CS_F_TRACKED | OVS_CS_F_DST_NAT;
+        match_set_ct_state_masked(&match, ct_state, ct_state);
+    }
+
     if (IN6_IS_ADDR_V4MAPPED(&lb_vip->vip)) {
+        ovs_be32 vip4 = in6_addr_get_mapped_ipv4(&lb_vip->vip);
+
         match_set_dl_type(&match, htons(ETH_TYPE_IP));
-        match_set_ct_nw_dst(&match, in6_addr_get_mapped_ipv4(&lb_vip->vip));
+
+        if (!lb->hairpin_orig_tuple) {
+            match_set_ct_nw_dst(&match, vip4);
+        } else {
+            match_set_reg(&match, MFF_LOG_LB_ORIG_DIP_IPV4 - MFF_LOG_REG0,
+                          ntohl(vip4));
+        }
     } else {
         match_set_dl_type(&match, htons(ETH_TYPE_IPV6));
-        match_set_ct_ipv6_dst(&match, &lb_vip->vip);
+
+        if (!lb->hairpin_orig_tuple) {
+            match_set_ct_ipv6_dst(&match, &lb_vip->vip);
+        } else {
+            ovs_be128 vip6_value;
+
+            memcpy(&vip6_value, &lb_vip->vip, sizeof vip6_value);
+            match_set_xxreg(&match, MFF_LOG_LB_ORIG_DIP_IPV6 - MFF_LOG_XXREG0,
+                            ntoh128(vip6_value));
+        }
     }
 
     match_set_nw_proto(&match, lb_proto);
-    match_set_ct_nw_proto(&match, lb_proto);
-    match_set_ct_tp_dst(&match, htons(lb_vip->vip_port));
-
-    uint32_t ct_state = OVS_CS_F_TRACKED | OVS_CS_F_DST_NAT;
-    match_set_ct_state_masked(&match, ct_state, ct_state);
+    if (lb_vip->vip_port) {
+        if (!lb->hairpin_orig_tuple) {
+            match_set_ct_nw_proto(&match, lb_proto);
+            match_set_ct_tp_dst(&match, htons(lb_vip->vip_port));
+        } else {
+            match_set_reg_masked(&match, MFF_LOG_LB_ORIG_TP_DPORT - MFF_REG0,
+                                 lb_vip->vip_port, UINT16_MAX);
+        }
+    }
 
     for (size_t i = 0; i < lb->slb->n_datapaths; i++) {
         match_set_metadata(&match,
@@ -1459,6 +1539,61 @@ lflow_handle_changed_neighbors(
     }
 }
 
+static void
+consider_fdb_flows(const struct sbrec_fdb *fdb,
+                   const struct hmap *local_datapaths,
+                   struct ovn_desired_flow_table *flow_table)
+{
+    if (!get_local_datapath(local_datapaths, fdb->dp_key)) {
+        return;
+    }
+
+    struct eth_addr mac;
+    if (!eth_addr_from_string(fdb->mac, &mac)) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
+        VLOG_WARN_RL(&rl, "bad 'mac' %s", fdb->mac);
+        return;
+    }
+
+    struct match match = MATCH_CATCHALL_INITIALIZER;
+    match_set_metadata(&match, htonll(fdb->dp_key));
+    match_set_dl_dst(&match, mac);
+
+    uint64_t stub[1024 / 8];
+    struct ofpbuf ofpacts = OFPBUF_STUB_INITIALIZER(stub);
+    put_load64(fdb->port_key, MFF_LOG_OUTPORT, 0, 32, &ofpacts);
+    ofctrl_add_flow(flow_table, OFTABLE_GET_FDB, 100,
+                    fdb->header_.uuid.parts[0], &match, &ofpacts,
+                    &fdb->header_.uuid);
+    ofpbuf_clear(&ofpacts);
+
+    uint8_t value = 1;
+    put_load(&value, sizeof value, MFF_LOG_FLAGS,
+             MLF_LOOKUP_FDB_BIT, 1, &ofpacts);
+
+    struct match lookup_match = MATCH_CATCHALL_INITIALIZER;
+    match_set_metadata(&lookup_match, htonll(fdb->dp_key));
+    match_set_dl_src(&lookup_match, mac);
+    match_set_reg(&lookup_match, MFF_LOG_INPORT - MFF_REG0, fdb->port_key);
+    ofctrl_add_flow(flow_table, OFTABLE_LOOKUP_FDB, 100,
+                    fdb->header_.uuid.parts[0], &lookup_match, &ofpacts,
+                    &fdb->header_.uuid);
+    ofpbuf_uninit(&ofpacts);
+}
+
+/* Adds an OpenFlow flow to flow tables for each MAC binding in the OVN
+ * southbound database. */
+static void
+add_fdb_flows(const struct sbrec_fdb_table *fdb_table,
+              const struct hmap *local_datapaths,
+              struct ovn_desired_flow_table *flow_table)
+{
+    const struct sbrec_fdb *fdb;
+    SBREC_FDB_TABLE_FOR_EACH (fdb, fdb_table) {
+        consider_fdb_flows(fdb, local_datapaths, flow_table);
+    }
+}
+
 
 /* Translates logical flows in the Logical_Flow table in the OVN_SB database
  * into OpenFlow flows.  See ovn-architecture(7) for more information. */
@@ -1473,6 +1608,8 @@ lflow_run(struct lflow_ctx_in *l_ctx_in, struct lflow_ctx_out *l_ctx_out)
                        l_ctx_out->flow_table);
     add_lb_hairpin_flows(l_ctx_in->lb_table, l_ctx_in->local_datapaths,
                          l_ctx_out->flow_table);
+    add_fdb_flows(l_ctx_in->fdb_table, l_ctx_in->local_datapaths,
+                  l_ctx_out->flow_table);
 }
 
 /* Should be called at every ovn-controller iteration before IDL tracked
@@ -1637,6 +1774,40 @@ lflow_handle_changed_lbs(struct lflow_ctx_in *l_ctx_in,
                  UUID_ARGS(&lb->header_.uuid));
         consider_lb_hairpin_flows(lb, l_ctx_in->local_datapaths,
                                   l_ctx_out->flow_table);
+    }
+
+    return true;
+}
+
+bool
+lflow_handle_changed_fdbs(struct lflow_ctx_in *l_ctx_in,
+                         struct lflow_ctx_out *l_ctx_out)
+{
+    const struct sbrec_fdb *fdb;
+
+    SBREC_FDB_TABLE_FOR_EACH_TRACKED (fdb, l_ctx_in->fdb_table) {
+        if (sbrec_fdb_is_deleted(fdb)) {
+            VLOG_DBG("Remove fdb flows for deleted fdb "UUID_FMT,
+                     UUID_ARGS(&fdb->header_.uuid));
+            ofctrl_remove_flows(l_ctx_out->flow_table, &fdb->header_.uuid);
+        }
+    }
+
+    SBREC_FDB_TABLE_FOR_EACH_TRACKED (fdb, l_ctx_in->fdb_table) {
+        if (sbrec_fdb_is_deleted(fdb)) {
+            continue;
+        }
+
+        if (!sbrec_fdb_is_new(fdb)) {
+            VLOG_DBG("Remove fdb flows for updated fdb "UUID_FMT,
+                     UUID_ARGS(&fdb->header_.uuid));
+            ofctrl_remove_flows(l_ctx_out->flow_table, &fdb->header_.uuid);
+        }
+
+        VLOG_DBG("Add fdb flows for fdb "UUID_FMT,
+                 UUID_ARGS(&fdb->header_.uuid));
+        consider_fdb_flows(fdb, l_ctx_in->local_datapaths,
+                           l_ctx_out->flow_table);
     }
 
     return true;
