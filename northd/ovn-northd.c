@@ -8576,7 +8576,7 @@ get_force_snat_ip(struct ovn_datapath *od, const char *key_type,
 static void
 add_router_lb_flow(struct hmap *lflows, struct ovn_datapath *od,
                    struct ds *match, struct ds *actions, int priority,
-                   bool lb_force_snat_ip, struct ovn_lb_vip *lb_vip,
+                   bool force_snat_for_lb, struct ovn_lb_vip *lb_vip,
                    const char *proto, struct nbrec_load_balancer *lb,
                    struct shash *meter_groups, struct sset *nat_entries)
 {
@@ -8585,7 +8585,7 @@ add_router_lb_flow(struct hmap *lflows, struct ovn_datapath *od,
 
     /* A match and actions for new connections. */
     char *new_match = xasprintf("ct.new && %s", ds_cstr(match));
-    if (lb_force_snat_ip) {
+    if (force_snat_for_lb) {
         char *new_actions = xasprintf("flags.force_snat_for_lb = 1; %s",
                                       ds_cstr(actions));
         ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_DNAT, priority,
@@ -8598,7 +8598,7 @@ add_router_lb_flow(struct hmap *lflows, struct ovn_datapath *od,
 
     /* A match and actions for established connections. */
     char *est_match = xasprintf("ct.est && %s", ds_cstr(match));
-    if (lb_force_snat_ip) {
+    if (force_snat_for_lb) {
         ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_DNAT, priority,
                                 est_match,
                                 "flags.force_snat_for_lb = 1; ct_dnat;",
@@ -8675,7 +8675,7 @@ add_router_lb_flow(struct hmap *lflows, struct ovn_datapath *od,
     ds_put_format(&undnat_match, ") && outport == %s && "
                  "is_chassis_resident(%s)", od->l3dgw_port->json_key,
                  od->l3redirect_port->json_key);
-    if (lb_force_snat_ip) {
+    if (force_snat_for_lb) {
         ovn_lflow_add_with_hint(lflows, od, S_ROUTER_OUT_UNDNAT, 120,
                                 ds_cstr(&undnat_match),
                                 "flags.force_snat_for_lb = 1; ct_dnat;",
@@ -8687,6 +8687,94 @@ add_router_lb_flow(struct hmap *lflows, struct ovn_datapath *od,
     }
 
     ds_destroy(&undnat_match);
+}
+
+static void
+build_lrouter_lb_flows(struct hmap *lflows, struct ovn_datapath *od,
+                       struct hmap *lbs, struct shash *meter_groups,
+                       struct sset *nat_entries, struct ds *match,
+                       struct ds *actions)
+{
+    /* A set to hold all ips that need defragmentation and tracking. */
+    struct sset all_ips = SSET_INITIALIZER(&all_ips);
+    bool lb_force_snat_ip =
+        !lport_addresses_is_empty(&od->lb_force_snat_addrs);
+
+    for (int i = 0; i < od->nbr->n_load_balancer; i++) {
+        struct nbrec_load_balancer *nb_lb = od->nbr->load_balancer[i];
+        struct ovn_northd_lb *lb =
+            ovn_northd_lb_find(lbs, &nb_lb->header_.uuid);
+        ovs_assert(lb);
+
+        for (size_t j = 0; j < lb->n_vips; j++) {
+            struct ovn_lb_vip *lb_vip = &lb->vips[j];
+            struct ovn_northd_lb_vip *lb_vip_nb = &lb->vips_nb[j];
+            ds_clear(actions);
+            build_lb_vip_actions(lb_vip, lb_vip_nb, actions,
+                                 lb->selection_fields, false);
+
+            if (!sset_contains(&all_ips, lb_vip->vip_str)) {
+                sset_add(&all_ips, lb_vip->vip_str);
+                /* If there are any load balancing rules, we should send
+                 * the packet to conntrack for defragmentation and
+                 * tracking.  This helps with two things.
+                 *
+                 * 1. With tracking, we can send only new connections to
+                 *    pick a DNAT ip address from a group.
+                 * 2. If there are L4 ports in load balancing rules, we
+                 *    need the defragmentation to match on L4 ports. */
+                ds_clear(match);
+                if (IN6_IS_ADDR_V4MAPPED(&lb_vip->vip)) {
+                    ds_put_format(match, "ip && ip4.dst == %s",
+                                  lb_vip->vip_str);
+                } else {
+                    ds_put_format(match, "ip && ip6.dst == %s",
+                                  lb_vip->vip_str);
+                }
+                ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_DEFRAG,
+                                        100, ds_cstr(match), "ct_next;",
+                                        &nb_lb->header_);
+            }
+
+            /* Higher priority rules are added for load-balancing in DNAT
+             * table.  For every match (on a VIP[:port]), we add two flows
+             * via add_router_lb_flow().  One flow is for specific matching
+             * on ct.new with an action of "ct_lb($targets);".  The other
+             * flow is for ct.est with an action of "ct_dnat;". */
+            ds_clear(match);
+            if (IN6_IS_ADDR_V4MAPPED(&lb_vip->vip)) {
+                ds_put_format(match, "ip && ip4.dst == %s",
+                              lb_vip->vip_str);
+            } else {
+                ds_put_format(match, "ip && ip6.dst == %s",
+                              lb_vip->vip_str);
+            }
+
+            int prio = 110;
+            bool is_udp = nullable_string_is_equal(nb_lb->protocol, "udp");
+            bool is_sctp = nullable_string_is_equal(nb_lb->protocol,
+                                                    "sctp");
+            const char *proto = is_udp ? "udp" : is_sctp ? "sctp" : "tcp";
+
+            if (lb_vip->vip_port) {
+                ds_put_format(match, " && %s && %s.dst == %d", proto,
+                              proto, lb_vip->vip_port);
+                prio = 120;
+            }
+
+            if (od->l3redirect_port &&
+                (lb_vip->n_backends || !lb_vip->empty_backend_rej)) {
+                ds_put_format(match, " && is_chassis_resident(%s)",
+                              od->l3redirect_port->json_key);
+            }
+            bool force_snat_for_lb =
+                lb_force_snat_ip || od->lb_force_snat_router_ip;
+            add_router_lb_flow(lflows, od, match, actions, prio,
+                               force_snat_for_lb, lb_vip, proto,
+                               nb_lb, meter_groups, nat_entries);
+        }
+    }
+    sset_destroy(&all_ips);
 }
 
 #define ND_RA_MAX_INTERVAL_MAX 1800
@@ -9155,6 +9243,13 @@ build_lrouter_force_snat_flows_op(struct ovn_port *op,
         ds_clear(match);
         ds_clear(actions);
 
+        ds_put_format(match, "inport == %s && ip4.dst == %s",
+                      op->json_key, op->lrp_networks.ipv4_addrs[0].addr_s);
+        ovn_lflow_add(lflows, op->od, S_ROUTER_IN_UNSNAT, 110,
+                      ds_cstr(match), "ct_snat;");
+
+        ds_clear(match);
+
         /* Higher priority rules to force SNAT with the router port ip.
          * This only takes effect when the packet has already been
          * load balanced once. */
@@ -9179,6 +9274,13 @@ build_lrouter_force_snat_flows_op(struct ovn_port *op,
     if (op->lrp_networks.n_ipv6_addrs > 1) {
         ds_clear(match);
         ds_clear(actions);
+
+        ds_put_format(match, "inport == %s && ip6.dst == %s",
+                      op->json_key, op->lrp_networks.ipv6_addrs[0].addr_s);
+        ovn_lflow_add(lflows, op->od, S_ROUTER_IN_UNSNAT, 110,
+                      ds_cstr(match), "ct_snat;");
+
+        ds_clear(match);
 
         /* Higher priority rules to force SNAT with the router port ip.
          * This only takes effect when the packet has already been
@@ -10932,11 +11034,15 @@ build_lrouter_ipv4_ip_input(struct ovn_port *op,
          * also a SNAT IP. Those are dropped later, in stage
          * "lr_in_arp_resolve", if unSNAT was unsuccessful.
          *
+         * If op->pd->lb_force_snat_router_ip is true, it means the IP of the
+         * router port is also SNAT IP.
+         *
          * Priority 60.
          */
-        build_lrouter_drop_own_dest(op, S_ROUTER_IN_IP_INPUT, 60, false,
-                                    lflows);
-
+        if (!op->od->lb_force_snat_router_ip) {
+            build_lrouter_drop_own_dest(op, S_ROUTER_IN_IP_INPUT, 60, false,
+                                        lflows);
+        }
         /* ARP / ND handling for external IP addresses.
          *
          * DNAT and SNAT IP addresses are external IP addresses that need ARP
@@ -10984,6 +11090,447 @@ build_lrouter_ipv4_ip_input(struct ovn_port *op,
     }
 }
 
+static void
+build_lrouter_in_unsnat_flow(struct hmap *lflows, struct ovn_datapath *od,
+                             const struct nbrec_nat *nat, struct ds *match,
+                             struct ds *actions, bool distributed, bool is_v6)
+{
+    /* Ingress UNSNAT table: It is for already established connections'
+    * reverse traffic. i.e., SNAT has already been done in egress
+    * pipeline and now the packet has entered the ingress pipeline as
+    * part of a reply. We undo the SNAT here.
+    *
+    * Undoing SNAT has to happen before DNAT processing.  This is
+    * because when the packet was DNATed in ingress pipeline, it did
+    * not know about the possibility of eventual additional SNAT in
+    * egress pipeline. */
+    if (strcmp(nat->type, "snat") && strcmp(nat->type, "dnat_and_snat")) {
+        return;
+    }
+
+    bool stateless = lrouter_nat_is_stateless(nat);
+    if (!od->l3dgw_port) {
+        /* Gateway router. */
+        ds_clear(match);
+        ds_clear(actions);
+        ds_put_format(match, "ip && ip%s.dst == %s",
+                      is_v6 ? "6" : "4", nat->external_ip);
+        if (!strcmp(nat->type, "dnat_and_snat") && stateless) {
+            ds_put_format(actions, "ip%s.dst=%s; next;",
+                          is_v6 ? "6" : "4", nat->logical_ip);
+        } else {
+            ds_put_cstr(actions, "ct_snat;");
+        }
+
+        ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_UNSNAT,
+                                90, ds_cstr(match), ds_cstr(actions),
+                                &nat->header_);
+    } else {
+        /* Distributed router. */
+
+        /* Traffic received on l3dgw_port is subject to NAT. */
+        ds_clear(match);
+        ds_clear(actions);
+        ds_put_format(match, "ip && ip%s.dst == %s && inport == %s",
+                      is_v6 ? "6" : "4", nat->external_ip,
+                      od->l3dgw_port->json_key);
+        if (!distributed && od->l3redirect_port) {
+            /* Flows for NAT rules that are centralized are only
+            * programmed on the gateway chassis. */
+            ds_put_format(match, " && is_chassis_resident(%s)",
+                          od->l3redirect_port->json_key);
+        }
+
+        if (!strcmp(nat->type, "dnat_and_snat") && stateless) {
+            ds_put_format(actions, "ip%s.dst=%s; next;",
+                          is_v6 ? "6" : "4", nat->logical_ip);
+        } else {
+            ds_put_cstr(actions, "ct_snat;");
+        }
+
+        ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_UNSNAT,
+                                100, ds_cstr(match), ds_cstr(actions),
+                                &nat->header_);
+    }
+}
+
+static void
+build_lrouter_in_dnat_flow(struct hmap *lflows, struct ovn_datapath *od,
+                           const struct nbrec_nat *nat, struct ds *match,
+                           struct ds *actions, bool distributed,
+                           ovs_be32 mask, bool is_v6)
+{
+    /* Ingress DNAT table: Packets enter the pipeline with destination
+    * IP address that needs to be DNATted from a external IP address
+    * to a logical IP address. */
+    if (!strcmp(nat->type, "dnat") || !strcmp(nat->type, "dnat_and_snat")) {
+        bool stateless = lrouter_nat_is_stateless(nat);
+
+        if (!od->l3dgw_port) {
+            /* Gateway router. */
+            /* Packet when it goes from the initiator to destination.
+            * We need to set flags.loopback because the router can
+            * send the packet back through the same interface. */
+            ds_clear(match);
+            ds_put_format(match, "ip && ip%s.dst == %s",
+                          is_v6 ? "6" : "4", nat->external_ip);
+            ds_clear(actions);
+            if (nat->allowed_ext_ips || nat->exempted_ext_ips) {
+                lrouter_nat_add_ext_ip_match(od, lflows, match, nat,
+                                             is_v6, true, mask);
+            }
+
+            if (!lport_addresses_is_empty(&od->dnat_force_snat_addrs)) {
+                /* Indicate to the future tables that a DNAT has taken
+                * place and a force SNAT needs to be done in the
+                * Egress SNAT table. */
+                ds_put_format(actions, "flags.force_snat_for_dnat = 1; ");
+            }
+
+            if (!strcmp(nat->type, "dnat_and_snat") && stateless) {
+                ds_put_format(actions, "flags.loopback = 1; "
+                              "ip%s.dst=%s; next;",
+                              is_v6 ? "6" : "4", nat->logical_ip);
+            } else {
+                ds_put_format(actions, "flags.loopback = 1; ct_dnat(%s",
+                              nat->logical_ip);
+
+                if (nat->external_port_range[0]) {
+                    ds_put_format(actions, ",%s", nat->external_port_range);
+                }
+                ds_put_format(actions, ");");
+            }
+
+            ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_DNAT, 100,
+                                    ds_cstr(match), ds_cstr(actions),
+                                    &nat->header_);
+        } else {
+            /* Distributed router. */
+
+            /* Traffic received on l3dgw_port is subject to NAT. */
+            ds_clear(match);
+            ds_put_format(match, "ip && ip%s.dst == %s && inport == %s",
+                          is_v6 ? "6" : "4", nat->external_ip,
+                          od->l3dgw_port->json_key);
+            if (!distributed && od->l3redirect_port) {
+                /* Flows for NAT rules that are centralized are only
+                * programmed on the gateway chassis. */
+                ds_put_format(match, " && is_chassis_resident(%s)",
+                              od->l3redirect_port->json_key);
+            }
+            ds_clear(actions);
+            if (nat->allowed_ext_ips || nat->exempted_ext_ips) {
+                lrouter_nat_add_ext_ip_match(od, lflows, match, nat,
+                                             is_v6, true, mask);
+            }
+
+            if (!strcmp(nat->type, "dnat_and_snat") && stateless) {
+                ds_put_format(actions, "ip%s.dst=%s; next;",
+                              is_v6 ? "6" : "4", nat->logical_ip);
+            } else {
+                ds_put_format(actions, "ct_dnat(%s", nat->logical_ip);
+                if (nat->external_port_range[0]) {
+                    ds_put_format(actions, ",%s", nat->external_port_range);
+                }
+                ds_put_format(actions, ");");
+            }
+
+            ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_DNAT, 100,
+                                    ds_cstr(match), ds_cstr(actions),
+                                    &nat->header_);
+        }
+    }
+
+    if (!od->l3dgw_port) {
+        /* For gateway router, re-circulate every packet through
+        * the DNAT zone.  This helps with the following.
+        *
+        * Any packet that needs to be unDNATed in the reverse
+        * direction gets unDNATed. Ideally this could be done in
+        * the egress pipeline. But since the gateway router
+        * does not have any feature that depends on the source
+        * ip address being external IP address for IP routing,
+        * we can do it here, saving a future re-circulation. */
+        ovn_lflow_add(lflows, od, S_ROUTER_IN_DNAT, 50,
+                      "ip", "flags.loopback = 1; ct_dnat;");
+    }
+}
+
+static void
+build_lrouter_out_undnat_flow(struct hmap *lflows, struct ovn_datapath *od,
+                              const struct nbrec_nat *nat, struct ds *match,
+                              struct ds *actions, bool distributed,
+                              struct eth_addr mac, bool is_v6)
+{
+    /* Egress UNDNAT table: It is for already established connections'
+    * reverse traffic. i.e., DNAT has already been done in ingress
+    * pipeline and now the packet has entered the egress pipeline as
+    * part of a reply. We undo the DNAT here.
+    *
+    * Note that this only applies for NAT on a distributed router.
+    * Undo DNAT on a gateway router is done in the ingress DNAT
+    * pipeline stage. */
+    if (!od->l3dgw_port ||
+        (strcmp(nat->type, "dnat") && strcmp(nat->type, "dnat_and_snat"))) {
+        return;
+    }
+
+    ds_clear(match);
+    ds_put_format(match, "ip && ip%s.src == %s && outport == %s",
+                  is_v6 ? "6" : "4", nat->logical_ip,
+                  od->l3dgw_port->json_key);
+    if (!distributed && od->l3redirect_port) {
+        /* Flows for NAT rules that are centralized are only
+        * programmed on the gateway chassis. */
+        ds_put_format(match, " && is_chassis_resident(%s)",
+                      od->l3redirect_port->json_key);
+    }
+    ds_clear(actions);
+    if (distributed) {
+        ds_put_format(actions, "eth.src = "ETH_ADDR_FMT"; ",
+                      ETH_ADDR_ARGS(mac));
+    }
+
+    if (!strcmp(nat->type, "dnat_and_snat") &&
+        lrouter_nat_is_stateless(nat)) {
+        ds_put_format(actions, "ip%s.src=%s; next;",
+                      is_v6 ? "6" : "4", nat->external_ip);
+    } else {
+        ds_put_format(actions, "ct_dnat;");
+    }
+
+    ovn_lflow_add_with_hint(lflows, od, S_ROUTER_OUT_UNDNAT, 100,
+                            ds_cstr(match), ds_cstr(actions),
+                            &nat->header_);
+}
+
+static void
+build_lrouter_out_snat_flow(struct hmap *lflows, struct ovn_datapath *od,
+                            const struct nbrec_nat *nat, struct ds *match,
+                            struct ds *actions, bool distributed,
+                            struct eth_addr mac, ovs_be32 mask,
+                            int cidr_bits, bool is_v6)
+{
+    /* Egress SNAT table: Packets enter the egress pipeline with
+    * source ip address that needs to be SNATted to a external ip
+    * address. */
+    if (strcmp(nat->type, "snat") && strcmp(nat->type, "dnat_and_snat")) {
+        return;
+    }
+
+    bool stateless = lrouter_nat_is_stateless(nat);
+    if (!od->l3dgw_port) {
+        /* Gateway router. */
+        ds_clear(match);
+        ds_put_format(match, "ip && ip%s.src == %s",
+                      is_v6 ? "6" : "4", nat->logical_ip);
+        ds_clear(actions);
+
+        if (nat->allowed_ext_ips || nat->exempted_ext_ips) {
+            lrouter_nat_add_ext_ip_match(od, lflows, match, nat,
+                                         is_v6, false, mask);
+        }
+
+        if (!strcmp(nat->type, "dnat_and_snat") && stateless) {
+            ds_put_format(actions, "ip%s.src=%s; next;",
+                          is_v6 ? "6" : "4", nat->external_ip);
+        } else {
+            ds_put_format(actions, "ct_snat(%s", nat->external_ip);
+
+            if (nat->external_port_range[0]) {
+                ds_put_format(actions, ",%s",
+                              nat->external_port_range);
+            }
+            ds_put_format(actions, ");");
+        }
+
+        /* The priority here is calculated such that the
+        * nat->logical_ip with the longest mask gets a higher
+        * priority. */
+        ovn_lflow_add_with_hint(lflows, od, S_ROUTER_OUT_SNAT,
+                                cidr_bits + 1, ds_cstr(match),
+                                ds_cstr(actions), &nat->header_);
+    } else {
+        uint16_t priority = cidr_bits + 1;
+
+        /* Distributed router. */
+        ds_clear(match);
+        ds_put_format(match, "ip && ip%s.src == %s && outport == %s",
+                      is_v6 ? "6" : "4", nat->logical_ip,
+                      od->l3dgw_port->json_key);
+        if (!distributed && od->l3redirect_port) {
+            /* Flows for NAT rules that are centralized are only
+            * programmed on the gateway chassis. */
+            priority += 128;
+            ds_put_format(match, " && is_chassis_resident(%s)",
+                          od->l3redirect_port->json_key);
+        }
+        ds_clear(actions);
+
+        if (nat->allowed_ext_ips || nat->exempted_ext_ips) {
+            lrouter_nat_add_ext_ip_match(od, lflows, match, nat,
+                                         is_v6, false, mask);
+        }
+
+        if (distributed) {
+            ds_put_format(actions, "eth.src = "ETH_ADDR_FMT"; ",
+                          ETH_ADDR_ARGS(mac));
+        }
+
+        if (!strcmp(nat->type, "dnat_and_snat") && stateless) {
+            ds_put_format(actions, "ip%s.src=%s; next;",
+                          is_v6 ? "6" : "4", nat->external_ip);
+        } else {
+            ds_put_format(actions, "ct_snat(%s",
+                        nat->external_ip);
+            if (nat->external_port_range[0]) {
+                ds_put_format(actions, ",%s", nat->external_port_range);
+            }
+            ds_put_format(actions, ");");
+        }
+
+        /* The priority here is calculated such that the
+        * nat->logical_ip with the longest mask gets a higher
+        * priority. */
+        ovn_lflow_add_with_hint(lflows, od, S_ROUTER_OUT_SNAT,
+                                priority, ds_cstr(match),
+                                ds_cstr(actions), &nat->header_);
+    }
+}
+
+static void
+build_lrouter_ingress_flow(struct hmap *lflows, struct ovn_datapath *od,
+                           const struct nbrec_nat *nat, struct ds *match,
+                           struct ds *actions, struct eth_addr mac,
+                           bool distributed, bool is_v6)
+{
+    if (od->l3dgw_port && !strcmp(nat->type, "snat")) {
+        ds_clear(match);
+        ds_put_format(
+            match, "inport == %s && %s == %s",
+            od->l3dgw_port->json_key,
+            is_v6 ? "ip6.src" : "ip4.src", nat->external_ip);
+        ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_IP_INPUT,
+                                120, ds_cstr(match), "next;",
+                                &nat->header_);
+    }
+    /* Logical router ingress table 0:
+    * For NAT on a distributed router, add rules allowing
+    * ingress traffic with eth.dst matching nat->external_mac
+    * on the l3dgw_port instance where nat->logical_port is
+    * resident. */
+    if (distributed) {
+        /* Store the ethernet address of the port receiving the packet.
+        * This will save us from having to match on inport further
+        * down in the pipeline.
+        */
+        ds_clear(actions);
+        ds_put_format(actions, REG_INPORT_ETH_ADDR " = %s; next;",
+                    od->l3dgw_port->lrp_networks.ea_s);
+
+        ds_clear(match);
+        ds_put_format(match,
+                    "eth.dst == "ETH_ADDR_FMT" && inport == %s"
+                    " && is_chassis_resident(\"%s\")",
+                    ETH_ADDR_ARGS(mac),
+                    od->l3dgw_port->json_key,
+                    nat->logical_port);
+        ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_ADMISSION, 50,
+                                ds_cstr(match), ds_cstr(actions),
+                                &nat->header_);
+    }
+}
+
+static int
+lrouter_check_nat_entry(struct ovn_datapath *od, const struct nbrec_nat *nat,
+                        ovs_be32 *mask, bool *is_v6, int *cidr_bits,
+                        struct eth_addr *mac, bool *distributed)
+{
+    struct in6_addr ipv6, mask_v6, v6_exact = IN6ADDR_EXACT_INIT;
+    ovs_be32 ip;
+
+    if (nat->allowed_ext_ips && nat->exempted_ext_ips) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 1);
+        VLOG_WARN_RL(&rl, "NAT rule: "UUID_FMT" not applied, since "
+                    "both allowed and exempt external ips set",
+                    UUID_ARGS(&(nat->header_.uuid)));
+        return -EINVAL;
+    }
+
+    char *error = ip_parse_masked(nat->external_ip, &ip, mask);
+    *is_v6 = false;
+
+    if (error || *mask != OVS_BE32_MAX) {
+        free(error);
+        error = ipv6_parse_masked(nat->external_ip, &ipv6, &mask_v6);
+        if (error || memcmp(&mask_v6, &v6_exact, sizeof(mask_v6))) {
+            /* Invalid for both IPv4 and IPv6 */
+            static struct vlog_rate_limit rl =
+                VLOG_RATE_LIMIT_INIT(5, 1);
+            VLOG_WARN_RL(&rl, "bad external ip %s for nat",
+                        nat->external_ip);
+            free(error);
+            return -EINVAL;
+        }
+        /* It was an invalid IPv4 address, but valid IPv6.
+        * Treat the rest of the handling of this NAT rule
+        * as IPv6. */
+        *is_v6 = true;
+    }
+
+    /* Check the validity of nat->logical_ip. 'logical_ip' can
+    * be a subnet when the type is "snat". */
+    if (*is_v6) {
+        error = ipv6_parse_masked(nat->logical_ip, &ipv6, &mask_v6);
+        *cidr_bits = ipv6_count_cidr_bits(&mask_v6);
+    } else {
+        error = ip_parse_masked(nat->logical_ip, &ip, mask);
+        *cidr_bits = ip_count_cidr_bits(*mask);
+    }
+    if (!strcmp(nat->type, "snat")) {
+        if (error) {
+            /* Invalid for both IPv4 and IPv6 */
+            static struct vlog_rate_limit rl =
+                VLOG_RATE_LIMIT_INIT(5, 1);
+            VLOG_WARN_RL(&rl, "bad ip network or ip %s for snat "
+                        "in router "UUID_FMT"",
+                        nat->logical_ip, UUID_ARGS(&od->key));
+            free(error);
+            return -EINVAL;
+        }
+    } else {
+        if (error || (*is_v6 == false && *mask != OVS_BE32_MAX)
+            || (*is_v6 && memcmp(&mask_v6, &v6_exact,
+                                sizeof mask_v6))) {
+            /* Invalid for both IPv4 and IPv6 */
+            static struct vlog_rate_limit rl =
+                VLOG_RATE_LIMIT_INIT(5, 1);
+            VLOG_WARN_RL(&rl, "bad ip %s for dnat in router "
+                ""UUID_FMT"", nat->logical_ip, UUID_ARGS(&od->key));
+            free(error);
+            return -EINVAL;
+        }
+    }
+
+    /* For distributed router NAT, determine whether this NAT rule
+     * satisfies the conditions for distributed NAT processing. */
+    *distributed = false;
+    if (od->l3dgw_port && !strcmp(nat->type, "dnat_and_snat") &&
+        nat->logical_port && nat->external_mac) {
+        if (eth_addr_from_string(nat->external_mac, mac)) {
+            *distributed = true;
+        } else {
+            static struct vlog_rate_limit rl =
+                VLOG_RATE_LIMIT_INIT(5, 1);
+            VLOG_WARN_RL(&rl, "bad mac %s for dnat in router "
+                ""UUID_FMT"", nat->external_mac, UUID_ARGS(&od->key));
+            return -EINVAL;
+        }
+    }
+
+    return 0;
+}
+
 /* NAT, Defrag and load balancing. */
 static void
 build_lrouter_nat_defrag_and_lb(struct ovn_datapath *od,
@@ -10992,658 +11539,196 @@ build_lrouter_nat_defrag_and_lb(struct ovn_datapath *od,
                                 struct hmap *lbs,
                                 struct ds *match, struct ds *actions)
 {
-    if (od->nbr) {
+    if (!od->nbr) {
+        return;
+    }
 
-        /* Packets are allowed by default. */
-        ovn_lflow_add(lflows, od, S_ROUTER_IN_DEFRAG, 0, "1", "next;");
-        ovn_lflow_add(lflows, od, S_ROUTER_IN_UNSNAT, 0, "1", "next;");
-        ovn_lflow_add(lflows, od, S_ROUTER_OUT_SNAT, 0, "1", "next;");
-        ovn_lflow_add(lflows, od, S_ROUTER_IN_DNAT, 0, "1", "next;");
-        ovn_lflow_add(lflows, od, S_ROUTER_OUT_UNDNAT, 0, "1", "next;");
-        ovn_lflow_add(lflows, od, S_ROUTER_OUT_EGR_LOOP, 0, "1", "next;");
-        ovn_lflow_add(lflows, od, S_ROUTER_IN_ECMP_STATEFUL, 0, "1", "next;");
+    /* Packets are allowed by default. */
+    ovn_lflow_add(lflows, od, S_ROUTER_IN_DEFRAG, 0, "1", "next;");
+    ovn_lflow_add(lflows, od, S_ROUTER_IN_UNSNAT, 0, "1", "next;");
+    ovn_lflow_add(lflows, od, S_ROUTER_OUT_SNAT, 0, "1", "next;");
+    ovn_lflow_add(lflows, od, S_ROUTER_IN_DNAT, 0, "1", "next;");
+    ovn_lflow_add(lflows, od, S_ROUTER_OUT_UNDNAT, 0, "1", "next;");
+    ovn_lflow_add(lflows, od, S_ROUTER_OUT_EGR_LOOP, 0, "1", "next;");
+    ovn_lflow_add(lflows, od, S_ROUTER_IN_ECMP_STATEFUL, 0, "1", "next;");
 
-        /* Send the IPv6 NS packets to next table. When ovn-controller
-         * generates IPv6 NS (for the action - nd_ns{}), the injected
-         * packet would go through conntrack - which is not required. */
-        ovn_lflow_add(lflows, od, S_ROUTER_OUT_SNAT, 120, "nd_ns", "next;");
+    /* Send the IPv6 NS packets to next table. When ovn-controller
+     * generates IPv6 NS (for the action - nd_ns{}), the injected
+     * packet would go through conntrack - which is not required. */
+    ovn_lflow_add(lflows, od, S_ROUTER_OUT_SNAT, 120, "nd_ns", "next;");
 
-        /* NAT rules are only valid on Gateway routers and routers with
-         * l3dgw_port (router has a port with gateway chassis
-         * specified). */
-        if (!smap_get(&od->nbr->options, "chassis") && !od->l3dgw_port) {
-            return;
+    /* NAT rules are only valid on Gateway routers and routers with
+     * l3dgw_port (router has a port with gateway chassis
+     * specified). */
+    if (!smap_get(&od->nbr->options, "chassis") && !od->l3dgw_port) {
+        return;
+    }
+
+    struct sset nat_entries = SSET_INITIALIZER(&nat_entries);
+
+    bool dnat_force_snat_ip =
+        !lport_addresses_is_empty(&od->dnat_force_snat_addrs);
+    bool lb_force_snat_ip =
+        !lport_addresses_is_empty(&od->lb_force_snat_addrs);
+
+    for (int i = 0; i < od->nbr->n_nat; i++) {
+        const struct nbrec_nat *nat = nat = od->nbr->nat[i];
+        struct eth_addr mac = eth_addr_broadcast;
+        bool is_v6, distributed;
+        ovs_be32 mask;
+        int cidr_bits;
+
+        if (lrouter_check_nat_entry(od, nat, &mask, &is_v6, &cidr_bits,
+                                    &mac, &distributed) < 0) {
+            continue;
         }
 
-        struct sset nat_entries = SSET_INITIALIZER(&nat_entries);
+        /* S_ROUTER_IN_UNSNAT */
+        build_lrouter_in_unsnat_flow(lflows, od, nat, match, actions, distributed,
+                                     is_v6);
+        /* S_ROUTER_IN_DNAT */
+        build_lrouter_in_dnat_flow(lflows, od, nat, match, actions, distributed,
+                                   mask, is_v6);
 
-        bool dnat_force_snat_ip =
-            !lport_addresses_is_empty(&od->dnat_force_snat_addrs);
-        bool lb_force_snat_ip =
-            !lport_addresses_is_empty(&od->lb_force_snat_addrs);
-
-        for (int i = 0; i < od->nbr->n_nat; i++) {
-            const struct nbrec_nat *nat;
-
-            nat = od->nbr->nat[i];
-
-            ovs_be32 ip, mask;
-            struct in6_addr ipv6, mask_v6, v6_exact = IN6ADDR_EXACT_INIT;
-            bool is_v6 = false;
-            bool stateless = lrouter_nat_is_stateless(nat);
-            struct nbrec_address_set *allowed_ext_ips =
-                                      nat->allowed_ext_ips;
-            struct nbrec_address_set *exempted_ext_ips =
-                                      nat->exempted_ext_ips;
-
-            if (allowed_ext_ips && exempted_ext_ips) {
-                static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 1);
-                VLOG_WARN_RL(&rl, "NAT rule: "UUID_FMT" not applied, since "
-                             "both allowed and exempt external ips set",
-                             UUID_ARGS(&(nat->header_.uuid)));
-                continue;
-            }
-
-            char *error = ip_parse_masked(nat->external_ip, &ip, &mask);
-            if (error || mask != OVS_BE32_MAX) {
-                free(error);
-                error = ipv6_parse_masked(nat->external_ip, &ipv6, &mask_v6);
-                if (error || memcmp(&mask_v6, &v6_exact, sizeof(mask_v6))) {
-                    /* Invalid for both IPv4 and IPv6 */
-                    static struct vlog_rate_limit rl =
-                        VLOG_RATE_LIMIT_INIT(5, 1);
-                    VLOG_WARN_RL(&rl, "bad external ip %s for nat",
-                                 nat->external_ip);
-                    free(error);
-                    continue;
-                }
-                /* It was an invalid IPv4 address, but valid IPv6.
-                 * Treat the rest of the handling of this NAT rule
-                 * as IPv6. */
-                is_v6 = true;
-            }
-
-            /* Check the validity of nat->logical_ip. 'logical_ip' can
-             * be a subnet when the type is "snat". */
-            int cidr_bits;
-            if (is_v6) {
-                error = ipv6_parse_masked(nat->logical_ip, &ipv6, &mask_v6);
-                cidr_bits = ipv6_count_cidr_bits(&mask_v6);
-            } else {
-                error = ip_parse_masked(nat->logical_ip, &ip, &mask);
-                cidr_bits = ip_count_cidr_bits(mask);
-            }
-            if (!strcmp(nat->type, "snat")) {
-                if (error) {
-                    /* Invalid for both IPv4 and IPv6 */
-                    static struct vlog_rate_limit rl =
-                        VLOG_RATE_LIMIT_INIT(5, 1);
-                    VLOG_WARN_RL(&rl, "bad ip network or ip %s for snat "
-                                 "in router "UUID_FMT"",
-                                 nat->logical_ip, UUID_ARGS(&od->key));
-                    free(error);
-                    continue;
-                }
-            } else {
-                if (error || (!is_v6 && mask != OVS_BE32_MAX)
-                    || (is_v6 && memcmp(&mask_v6, &v6_exact,
-                                        sizeof mask_v6))) {
-                    /* Invalid for both IPv4 and IPv6 */
-                    static struct vlog_rate_limit rl =
-                        VLOG_RATE_LIMIT_INIT(5, 1);
-                    VLOG_WARN_RL(&rl, "bad ip %s for dnat in router "
-                        ""UUID_FMT"", nat->logical_ip, UUID_ARGS(&od->key));
-                    free(error);
-                    continue;
-                }
-            }
-
-            /* For distributed router NAT, determine whether this NAT rule
-             * satisfies the conditions for distributed NAT processing. */
-            bool distributed = false;
-            struct eth_addr mac;
-            if (od->l3dgw_port && !strcmp(nat->type, "dnat_and_snat") &&
-                nat->logical_port && nat->external_mac) {
-                if (eth_addr_from_string(nat->external_mac, &mac)) {
-                    distributed = true;
-                } else {
-                    static struct vlog_rate_limit rl =
-                        VLOG_RATE_LIMIT_INIT(5, 1);
-                    VLOG_WARN_RL(&rl, "bad mac %s for dnat in router "
-                        ""UUID_FMT"", nat->external_mac, UUID_ARGS(&od->key));
-                    continue;
-                }
-            }
-
-            /* Ingress UNSNAT table: It is for already established connections'
-             * reverse traffic. i.e., SNAT has already been done in egress
-             * pipeline and now the packet has entered the ingress pipeline as
-             * part of a reply. We undo the SNAT here.
-             *
-             * Undoing SNAT has to happen before DNAT processing.  This is
-             * because when the packet was DNATed in ingress pipeline, it did
-             * not know about the possibility of eventual additional SNAT in
-             * egress pipeline. */
-            if (!strcmp(nat->type, "snat")
-                || !strcmp(nat->type, "dnat_and_snat")) {
-                if (!od->l3dgw_port) {
-                    /* Gateway router. */
-                    ds_clear(match);
-                    ds_clear(actions);
-                    ds_put_format(match, "ip && ip%s.dst == %s",
-                                  is_v6 ? "6" : "4",
-                                  nat->external_ip);
-                    if (!strcmp(nat->type, "dnat_and_snat") && stateless) {
-                       ds_put_format(actions, "ip%s.dst=%s; next;",
-                                     is_v6 ? "6" : "4", nat->logical_ip);
-                    } else {
-                       ds_put_cstr(actions, "ct_snat;");
-                    }
-
-                    ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_UNSNAT,
-                                            90, ds_cstr(match),
-                                            ds_cstr(actions),
-                                            &nat->header_);
-                } else {
-                    /* Distributed router. */
-
-                    /* Traffic received on l3dgw_port is subject to NAT. */
-                    ds_clear(match);
-                    ds_clear(actions);
-                    ds_put_format(match, "ip && ip%s.dst == %s"
-                                          " && inport == %s",
-                                  is_v6 ? "6" : "4",
-                                  nat->external_ip,
-                                  od->l3dgw_port->json_key);
-                    if (!distributed && od->l3redirect_port) {
-                        /* Flows for NAT rules that are centralized are only
-                         * programmed on the gateway chassis. */
-                        ds_put_format(match, " && is_chassis_resident(%s)",
-                                      od->l3redirect_port->json_key);
-                    }
-
-                    if (!strcmp(nat->type, "dnat_and_snat") && stateless) {
-                        ds_put_format(actions, "ip%s.dst=%s; next;",
-                                      is_v6 ? "6" : "4", nat->logical_ip);
-                    } else {
-                        ds_put_cstr(actions, "ct_snat;");
-                    }
-
-                    ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_UNSNAT,
-                                            100,
-                                            ds_cstr(match), ds_cstr(actions),
-                                            &nat->header_);
-                }
-            }
-
-            /* Ingress DNAT table: Packets enter the pipeline with destination
-             * IP address that needs to be DNATted from a external IP address
-             * to a logical IP address. */
-            if (!strcmp(nat->type, "dnat")
-                || !strcmp(nat->type, "dnat_and_snat")) {
-                if (!od->l3dgw_port) {
-                    /* Gateway router. */
-                    /* Packet when it goes from the initiator to destination.
-                     * We need to set flags.loopback because the router can
-                     * send the packet back through the same interface. */
-                    ds_clear(match);
-                    ds_put_format(match, "ip && ip%s.dst == %s",
-                                  is_v6 ? "6" : "4",
-                                  nat->external_ip);
-                    ds_clear(actions);
-                    if (allowed_ext_ips || exempted_ext_ips) {
-                        lrouter_nat_add_ext_ip_match(od, lflows, match, nat,
-                                                     is_v6, true, mask);
-                    }
-
-                    if (dnat_force_snat_ip) {
-                        /* Indicate to the future tables that a DNAT has taken
-                         * place and a force SNAT needs to be done in the
-                         * Egress SNAT table. */
-                        ds_put_format(actions,
-                                      "flags.force_snat_for_dnat = 1; ");
-                    }
-
-                    if (!strcmp(nat->type, "dnat_and_snat") && stateless) {
-                        ds_put_format(actions, "flags.loopback = 1; "
-                                      "ip%s.dst=%s; next;",
-                                      is_v6 ? "6" : "4", nat->logical_ip);
-                    } else {
-                        ds_put_format(actions, "flags.loopback = 1; "
-                                      "ct_dnat(%s", nat->logical_ip);
-
-                        if (nat->external_port_range[0]) {
-                            ds_put_format(actions, ",%s",
-                                          nat->external_port_range);
-                        }
-                        ds_put_format(actions, ");");
-                    }
-
-                    ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_DNAT, 100,
-                                            ds_cstr(match), ds_cstr(actions),
-                                            &nat->header_);
-                } else {
-                    /* Distributed router. */
-
-                    /* Traffic received on l3dgw_port is subject to NAT. */
-                    ds_clear(match);
-                    ds_put_format(match, "ip && ip%s.dst == %s"
-                                          " && inport == %s",
-                                  is_v6 ? "6" : "4",
-                                  nat->external_ip,
-                                  od->l3dgw_port->json_key);
-                    if (!distributed && od->l3redirect_port) {
-                        /* Flows for NAT rules that are centralized are only
-                         * programmed on the gateway chassis. */
-                        ds_put_format(match, " && is_chassis_resident(%s)",
-                                      od->l3redirect_port->json_key);
-                    }
-                    ds_clear(actions);
-                    if (allowed_ext_ips || exempted_ext_ips) {
-                        lrouter_nat_add_ext_ip_match(od, lflows, match, nat,
-                                                     is_v6, true, mask);
-                    }
-
-                    if (!strcmp(nat->type, "dnat_and_snat") && stateless) {
-                        ds_put_format(actions, "ip%s.dst=%s; next;",
-                                      is_v6 ? "6" : "4", nat->logical_ip);
-                    } else {
-                        ds_put_format(actions, "ct_dnat(%s", nat->logical_ip);
-                        if (nat->external_port_range[0]) {
-                            ds_put_format(actions, ",%s",
-                                          nat->external_port_range);
-                        }
-                        ds_put_format(actions, ");");
-                    }
-
-                    ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_DNAT, 100,
-                                            ds_cstr(match), ds_cstr(actions),
-                                            &nat->header_);
-                }
-            }
-
-            /* ARP resolve for NAT IPs. */
-            if (od->l3dgw_port) {
-                if (!strcmp(nat->type, "snat")) {
-                    ds_clear(match);
-                    ds_put_format(
-                        match, "inport == %s && %s == %s",
-                        od->l3dgw_port->json_key,
-                        is_v6 ? "ip6.src" : "ip4.src", nat->external_ip);
-                    ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_IP_INPUT,
-                                            120, ds_cstr(match), "next;",
-                                            &nat->header_);
-                }
-
-                if (!sset_contains(&nat_entries, nat->external_ip)) {
-                    ds_clear(match);
-                    ds_put_format(
-                        match, "outport == %s && %s == %s",
-                        od->l3dgw_port->json_key,
-                        is_v6 ? REG_NEXT_HOP_IPV6 : REG_NEXT_HOP_IPV4,
-                        nat->external_ip);
-                    ds_clear(actions);
-                    ds_put_format(
-                        actions, "eth.dst = %s; next;",
-                        distributed ? nat->external_mac :
-                        od->l3dgw_port->lrp_networks.ea_s);
-                    ovn_lflow_add_with_hint(lflows, od,
-                                            S_ROUTER_IN_ARP_RESOLVE,
-                                            100, ds_cstr(match),
-                                            ds_cstr(actions),
-                                            &nat->header_);
-                    sset_add(&nat_entries, nat->external_ip);
-                }
-            } else {
-                /* Add the NAT external_ip to the nat_entries even for
-                 * gateway routers. This is required for adding load balancer
-                 * flows.*/
+        /* ARP resolve for NAT IPs. */
+        if (od->l3dgw_port) {
+            if (!sset_contains(&nat_entries, nat->external_ip)) {
+                ds_clear(match);
+                ds_put_format(
+                    match, "outport == %s && %s == %s",
+                    od->l3dgw_port->json_key,
+                    is_v6 ? REG_NEXT_HOP_IPV6 : REG_NEXT_HOP_IPV4,
+                    nat->external_ip);
+                ds_clear(actions);
+                ds_put_format(
+                    actions, "eth.dst = %s; next;",
+                    distributed ? nat->external_mac :
+                    od->l3dgw_port->lrp_networks.ea_s);
+                ovn_lflow_add_with_hint(lflows, od,
+                                        S_ROUTER_IN_ARP_RESOLVE,
+                                        100, ds_cstr(match),
+                                        ds_cstr(actions),
+                                        &nat->header_);
                 sset_add(&nat_entries, nat->external_ip);
             }
+        } else {
+            /* Add the NAT external_ip to the nat_entries even for
+             * gateway routers. This is required for adding load balancer
+             * flows.*/
+            sset_add(&nat_entries, nat->external_ip);
+        }
 
-            /* Egress UNDNAT table: It is for already established connections'
-             * reverse traffic. i.e., DNAT has already been done in ingress
-             * pipeline and now the packet has entered the egress pipeline as
-             * part of a reply. We undo the DNAT here.
-             *
-             * Note that this only applies for NAT on a distributed router.
-             * Undo DNAT on a gateway router is done in the ingress DNAT
-             * pipeline stage. */
-            if (od->l3dgw_port && (!strcmp(nat->type, "dnat")
-                || !strcmp(nat->type, "dnat_and_snat"))) {
-                ds_clear(match);
-                ds_put_format(match, "ip && ip%s.src == %s"
-                                      " && outport == %s",
-                              is_v6 ? "6" : "4",
-                              nat->logical_ip,
-                              od->l3dgw_port->json_key);
-                if (!distributed && od->l3redirect_port) {
-                    /* Flows for NAT rules that are centralized are only
-                     * programmed on the gateway chassis. */
-                    ds_put_format(match, " && is_chassis_resident(%s)",
-                                  od->l3redirect_port->json_key);
-                }
-                ds_clear(actions);
-                if (distributed) {
-                    ds_put_format(actions, "eth.src = "ETH_ADDR_FMT"; ",
-                                  ETH_ADDR_ARGS(mac));
-                }
+        /* S_ROUTER_OUT_UNDNAT */
+        build_lrouter_out_undnat_flow(lflows, od, nat, match, actions, distributed,
+                                      mac, is_v6);
+        /* S_ROUTER_OUT_SNAT */
+        build_lrouter_out_snat_flow(lflows, od, nat, match, actions, distributed,
+                                    mac, mask, cidr_bits, is_v6);
 
-                if (!strcmp(nat->type, "dnat_and_snat") && stateless) {
-                    ds_put_format(actions, "ip%s.src=%s; next;",
-                                  is_v6 ? "6" : "4", nat->external_ip);
-                } else {
-                    ds_put_format(actions, "ct_dnat;");
-                }
+        /* S_ROUTER_IN_ADMISSION - S_ROUTER_IN_IP_INPUT */
+        build_lrouter_ingress_flow(lflows, od, nat, match, actions,
+                                   mac, distributed, is_v6);
 
-                ovn_lflow_add_with_hint(lflows, od, S_ROUTER_OUT_UNDNAT, 100,
-                                        ds_cstr(match), ds_cstr(actions),
-                                        &nat->header_);
-            }
+        /* Ingress Gateway Redirect Table: For NAT on a distributed
+         * router, add flows that are specific to a NAT rule.  These
+         * flows indicate the presence of an applicable NAT rule that
+         * can be applied in a distributed manner.
+         * In particulr REG_SRC_IPV4/REG_SRC_IPV6 and eth.src are set to
+         * NAT external IP and NAT external mac so the ARP request
+         * generated in the following stage is sent out with proper IP/MAC
+         * src addresses.
+         */
+        if (distributed) {
+            ds_clear(match);
+            ds_clear(actions);
+            ds_put_format(match,
+                          "ip%s.src == %s && outport == %s && "
+                          "is_chassis_resident(\"%s\")",
+                          is_v6 ? "6" : "4", nat->logical_ip,
+                          od->l3dgw_port->json_key, nat->logical_port);
+            ds_put_format(actions, "eth.src = %s; %s = %s; next;",
+                          nat->external_mac,
+                          is_v6 ? REG_SRC_IPV6 : REG_SRC_IPV4,
+                          nat->external_ip);
+            ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_GW_REDIRECT,
+                                    100, ds_cstr(match),
+                                    ds_cstr(actions), &nat->header_);
+        }
 
-            /* Egress SNAT table: Packets enter the egress pipeline with
-             * source ip address that needs to be SNATted to a external ip
-             * address. */
-            if (!strcmp(nat->type, "snat")
-                || !strcmp(nat->type, "dnat_and_snat")) {
-                if (!od->l3dgw_port) {
-                    /* Gateway router. */
-                    ds_clear(match);
-                    ds_put_format(match, "ip && ip%s.src == %s",
-                                  is_v6 ? "6" : "4",
-                                  nat->logical_ip);
-                    ds_clear(actions);
-
-                    if (allowed_ext_ips || exempted_ext_ips) {
-                        lrouter_nat_add_ext_ip_match(od, lflows, match, nat,
-                                                     is_v6, false, mask);
-                    }
-
-                    if (!strcmp(nat->type, "dnat_and_snat") && stateless) {
-                        ds_put_format(actions, "ip%s.src=%s; next;",
-                                      is_v6 ? "6" : "4", nat->external_ip);
-                    } else {
-                        ds_put_format(actions, "ct_snat(%s",
-                                      nat->external_ip);
-
-                        if (nat->external_port_range[0]) {
-                            ds_put_format(actions, ",%s",
-                                          nat->external_port_range);
-                        }
-                        ds_put_format(actions, ");");
-                    }
-
-                    /* The priority here is calculated such that the
-                     * nat->logical_ip with the longest mask gets a higher
-                     * priority. */
-                    ovn_lflow_add_with_hint(lflows, od, S_ROUTER_OUT_SNAT,
-                                            cidr_bits + 1,
-                                            ds_cstr(match), ds_cstr(actions),
-                                            &nat->header_);
-                } else {
-                    uint16_t priority = cidr_bits + 1;
-
-                    /* Distributed router. */
-                    ds_clear(match);
-                    ds_put_format(match, "ip && ip%s.src == %s"
-                                          " && outport == %s",
-                                  is_v6 ? "6" : "4",
-                                  nat->logical_ip,
-                                  od->l3dgw_port->json_key);
-                    if (!distributed && od->l3redirect_port) {
-                        /* Flows for NAT rules that are centralized are only
-                         * programmed on the gateway chassis. */
-                        priority += 128;
-                        ds_put_format(match, " && is_chassis_resident(%s)",
-                                      od->l3redirect_port->json_key);
-                    }
-                    ds_clear(actions);
-
-                    if (allowed_ext_ips || exempted_ext_ips) {
-                        lrouter_nat_add_ext_ip_match(od, lflows, match, nat,
-                                                     is_v6, false, mask);
-                    }
-
-                    if (distributed) {
-                        ds_put_format(actions, "eth.src = "ETH_ADDR_FMT"; ",
-                                      ETH_ADDR_ARGS(mac));
-                    }
-
-                    if (!strcmp(nat->type, "dnat_and_snat") && stateless) {
-                        ds_put_format(actions, "ip%s.src=%s; next;",
-                                      is_v6 ? "6" : "4", nat->external_ip);
-                    } else {
-                        ds_put_format(actions, "ct_snat(%s",
-                                      nat->external_ip);
-                        if (nat->external_port_range[0]) {
-                            ds_put_format(actions, ",%s",
-                                          nat->external_port_range);
-                        }
-                        ds_put_format(actions, ");");
-                    }
-
-                    /* The priority here is calculated such that the
-                     * nat->logical_ip with the longest mask gets a higher
-                     * priority. */
-                    ovn_lflow_add_with_hint(lflows, od, S_ROUTER_OUT_SNAT,
-                                            priority, ds_cstr(match),
-                                            ds_cstr(actions),
-                                            &nat->header_);
-                }
-            }
-
-            /* Logical router ingress table 0:
-             * For NAT on a distributed router, add rules allowing
-             * ingress traffic with eth.dst matching nat->external_mac
-             * on the l3dgw_port instance where nat->logical_port is
-             * resident. */
-            if (distributed) {
-                /* Store the ethernet address of the port receiving the packet.
-                 * This will save us from having to match on inport further
-                 * down in the pipeline.
-                 */
-                ds_clear(actions);
-                ds_put_format(actions, REG_INPORT_ETH_ADDR " = %s; next;",
-                              od->l3dgw_port->lrp_networks.ea_s);
-
-                ds_clear(match);
-                ds_put_format(match,
-                              "eth.dst == "ETH_ADDR_FMT" && inport == %s"
-                              " && is_chassis_resident(\"%s\")",
-                              ETH_ADDR_ARGS(mac),
-                              od->l3dgw_port->json_key,
+        /* Egress Loopback table: For NAT on a distributed router.
+         * If packets in the egress pipeline on the distributed
+         * gateway port have ip.dst matching a NAT external IP, then
+         * loop a clone of the packet back to the beginning of the
+         * ingress pipeline with inport = outport. */
+        if (od->l3dgw_port) {
+            /* Distributed router. */
+            ds_clear(match);
+            ds_put_format(match, "ip%s.dst == %s && outport == %s",
+                          is_v6 ? "6" : "4",
+                          nat->external_ip,
+                          od->l3dgw_port->json_key);
+            if (!distributed) {
+                ds_put_format(match, " && is_chassis_resident(%s)",
+                              od->l3redirect_port->json_key);
+            } else {
+                ds_put_format(match, " && is_chassis_resident(\"%s\")",
                               nat->logical_port);
-                ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_ADMISSION, 50,
-                                        ds_cstr(match), ds_cstr(actions),
-                                        &nat->header_);
             }
 
-            /* Ingress Gateway Redirect Table: For NAT on a distributed
-             * router, add flows that are specific to a NAT rule.  These
-             * flows indicate the presence of an applicable NAT rule that
-             * can be applied in a distributed manner.
-             * In particulr REG_SRC_IPV4/REG_SRC_IPV6 and eth.src are set to
-             * NAT external IP and NAT external mac so the ARP request
-             * generated in the following stage is sent out with proper IP/MAC
-             * src addresses.
-             */
-            if (distributed) {
-                ds_clear(match);
-                ds_clear(actions);
-                ds_put_format(match,
-                              "ip%s.src == %s && outport == %s && "
-                              "is_chassis_resident(\"%s\")",
-                              is_v6 ? "6" : "4", nat->logical_ip,
-                              od->l3dgw_port->json_key, nat->logical_port);
-                ds_put_format(actions, "eth.src = %s; %s = %s; next;",
-                              nat->external_mac,
-                              is_v6 ? REG_SRC_IPV6 : REG_SRC_IPV4,
-                              nat->external_ip);
-                ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_GW_REDIRECT,
-                                        100, ds_cstr(match),
-                                        ds_cstr(actions), &nat->header_);
+            ds_clear(actions);
+            ds_put_format(actions,
+                          "clone { ct_clear; "
+                          "inport = outport; outport = \"\"; "
+                          "flags = 0; flags.loopback = 1; ");
+            for (int j = 0; j < MFF_N_LOG_REGS; j++) {
+                ds_put_format(actions, "reg%d = 0; ", j);
             }
-
-            /* Egress Loopback table: For NAT on a distributed router.
-             * If packets in the egress pipeline on the distributed
-             * gateway port have ip.dst matching a NAT external IP, then
-             * loop a clone of the packet back to the beginning of the
-             * ingress pipeline with inport = outport. */
-            if (od->l3dgw_port) {
-                /* Distributed router. */
-                ds_clear(match);
-                ds_put_format(match, "ip%s.dst == %s && outport == %s",
-                              is_v6 ? "6" : "4",
-                              nat->external_ip,
-                              od->l3dgw_port->json_key);
-                if (!distributed) {
-                    ds_put_format(match, " && is_chassis_resident(%s)",
-                                  od->l3redirect_port->json_key);
-                } else {
-                    ds_put_format(match, " && is_chassis_resident(\"%s\")",
-                                  nat->logical_port);
-                }
-
-                ds_clear(actions);
-                ds_put_format(actions,
-                              "clone { ct_clear; "
-                              "inport = outport; outport = \"\"; "
-                              "flags = 0; flags.loopback = 1; ");
-                for (int j = 0; j < MFF_N_LOG_REGS; j++) {
-                    ds_put_format(actions, "reg%d = 0; ", j);
-                }
-                ds_put_format(actions, REGBIT_EGRESS_LOOPBACK" = 1; "
-                              "next(pipeline=ingress, table=%d); };",
-                              ovn_stage_get_table(S_ROUTER_IN_ADMISSION));
-                ovn_lflow_add_with_hint(lflows, od, S_ROUTER_OUT_EGR_LOOP, 100,
-                                        ds_cstr(match), ds_cstr(actions),
-                                        &nat->header_);
-            }
+            ds_put_format(actions, REGBIT_EGRESS_LOOPBACK" = 1; "
+                          "next(pipeline=ingress, table=%d); };",
+                          ovn_stage_get_table(S_ROUTER_IN_ADMISSION));
+            ovn_lflow_add_with_hint(lflows, od, S_ROUTER_OUT_EGR_LOOP, 100,
+                                    ds_cstr(match), ds_cstr(actions),
+                                    &nat->header_);
         }
-
-        /* Handle force SNAT options set in the gateway router. */
-        if (!od->l3dgw_port) {
-            if (dnat_force_snat_ip) {
-                if (od->dnat_force_snat_addrs.n_ipv4_addrs) {
-                    build_lrouter_force_snat_flows(lflows, od, "4",
-                        od->dnat_force_snat_addrs.ipv4_addrs[0].addr_s,
-                        "dnat");
-                }
-                if (od->dnat_force_snat_addrs.n_ipv6_addrs) {
-                    build_lrouter_force_snat_flows(lflows, od, "6",
-                        od->dnat_force_snat_addrs.ipv6_addrs[0].addr_s,
-                        "dnat");
-                }
-            }
-            if (lb_force_snat_ip) {
-                if (od->lb_force_snat_addrs.n_ipv4_addrs) {
-                    build_lrouter_force_snat_flows(lflows, od, "4",
-                        od->lb_force_snat_addrs.ipv4_addrs[0].addr_s, "lb");
-                }
-                if (od->lb_force_snat_addrs.n_ipv6_addrs) {
-                    build_lrouter_force_snat_flows(lflows, od, "6",
-                        od->lb_force_snat_addrs.ipv6_addrs[0].addr_s, "lb");
-                }
-            }
-
-            /* For gateway router, re-circulate every packet through
-            * the DNAT zone.  This helps with the following.
-            *
-            * Any packet that needs to be unDNATed in the reverse
-            * direction gets unDNATed. Ideally this could be done in
-            * the egress pipeline. But since the gateway router
-            * does not have any feature that depends on the source
-            * ip address being external IP address for IP routing,
-            * we can do it here, saving a future re-circulation. */
-            ovn_lflow_add(lflows, od, S_ROUTER_IN_DNAT, 50,
-                          "ip", "flags.loopback = 1; ct_dnat;");
-        }
-
-        /* Load balancing and packet defrag are only valid on
-         * Gateway routers or router with gateway port. */
-        if (!smap_get(&od->nbr->options, "chassis") && !od->l3dgw_port) {
-            sset_destroy(&nat_entries);
-            return;
-        }
-
-        /* A set to hold all ips that need defragmentation and tracking. */
-        struct sset all_ips = SSET_INITIALIZER(&all_ips);
-
-        for (int i = 0; i < od->nbr->n_load_balancer; i++) {
-            struct nbrec_load_balancer *nb_lb = od->nbr->load_balancer[i];
-            struct ovn_northd_lb *lb =
-                ovn_northd_lb_find(lbs, &nb_lb->header_.uuid);
-            ovs_assert(lb);
-
-            for (size_t j = 0; j < lb->n_vips; j++) {
-                struct ovn_lb_vip *lb_vip = &lb->vips[j];
-                struct ovn_northd_lb_vip *lb_vip_nb = &lb->vips_nb[j];
-                ds_clear(actions);
-                build_lb_vip_actions(lb_vip, lb_vip_nb, actions,
-                                     lb->selection_fields, false);
-
-                if (!sset_contains(&all_ips, lb_vip->vip_str)) {
-                    sset_add(&all_ips, lb_vip->vip_str);
-                    /* If there are any load balancing rules, we should send
-                     * the packet to conntrack for defragmentation and
-                     * tracking.  This helps with two things.
-                     *
-                     * 1. With tracking, we can send only new connections to
-                     *    pick a DNAT ip address from a group.
-                     * 2. If there are L4 ports in load balancing rules, we
-                     *    need the defragmentation to match on L4 ports. */
-                    ds_clear(match);
-                    if (IN6_IS_ADDR_V4MAPPED(&lb_vip->vip)) {
-                        ds_put_format(match, "ip && ip4.dst == %s",
-                                      lb_vip->vip_str);
-                    } else {
-                        ds_put_format(match, "ip && ip6.dst == %s",
-                                      lb_vip->vip_str);
-                    }
-                    ovn_lflow_add_with_hint(lflows, od, S_ROUTER_IN_DEFRAG,
-                                            100, ds_cstr(match), "ct_next;",
-                                            &nb_lb->header_);
-                }
-
-                /* Higher priority rules are added for load-balancing in DNAT
-                 * table.  For every match (on a VIP[:port]), we add two flows
-                 * via add_router_lb_flow().  One flow is for specific matching
-                 * on ct.new with an action of "ct_lb($targets);".  The other
-                 * flow is for ct.est with an action of "ct_dnat;". */
-                ds_clear(match);
-                if (IN6_IS_ADDR_V4MAPPED(&lb_vip->vip)) {
-                    ds_put_format(match, "ip && ip4.dst == %s",
-                                  lb_vip->vip_str);
-                } else {
-                    ds_put_format(match, "ip && ip6.dst == %s",
-                                  lb_vip->vip_str);
-                }
-
-                int prio = 110;
-                bool is_udp = nullable_string_is_equal(nb_lb->protocol, "udp");
-                bool is_sctp = nullable_string_is_equal(nb_lb->protocol,
-                                                        "sctp");
-                const char *proto = is_udp ? "udp" : is_sctp ? "sctp" : "tcp";
-
-                if (lb_vip->vip_port) {
-                    ds_put_format(match, " && %s && %s.dst == %d", proto,
-                                  proto, lb_vip->vip_port);
-                    prio = 120;
-                }
-
-                if (od->l3redirect_port &&
-                    (lb_vip->n_backends || !lb_vip->empty_backend_rej)) {
-                    ds_put_format(match, " && is_chassis_resident(%s)",
-                                  od->l3redirect_port->json_key);
-                }
-                add_router_lb_flow(lflows, od, match, actions, prio,
-                                   lb_force_snat_ip, lb_vip, proto,
-                                   nb_lb, meter_groups, &nat_entries);
-            }
-        }
-        sset_destroy(&all_ips);
-        sset_destroy(&nat_entries);
     }
+
+    /* Handle force SNAT options set in the gateway router. */
+    if (!od->l3dgw_port) {
+        if (dnat_force_snat_ip) {
+            if (od->dnat_force_snat_addrs.n_ipv4_addrs) {
+                build_lrouter_force_snat_flows(lflows, od, "4",
+                    od->dnat_force_snat_addrs.ipv4_addrs[0].addr_s,
+                    "dnat");
+            }
+            if (od->dnat_force_snat_addrs.n_ipv6_addrs) {
+                build_lrouter_force_snat_flows(lflows, od, "6",
+                    od->dnat_force_snat_addrs.ipv6_addrs[0].addr_s,
+                    "dnat");
+            }
+        }
+        if (lb_force_snat_ip) {
+            if (od->lb_force_snat_addrs.n_ipv4_addrs) {
+                build_lrouter_force_snat_flows(lflows, od, "4",
+                    od->lb_force_snat_addrs.ipv4_addrs[0].addr_s, "lb");
+            }
+            if (od->lb_force_snat_addrs.n_ipv6_addrs) {
+                build_lrouter_force_snat_flows(lflows, od, "6",
+                    od->lb_force_snat_addrs.ipv6_addrs[0].addr_s, "lb");
+            }
+        }
+    }
+
+    /* Load balancing and packet defrag are only valid on
+     * Gateway routers or router with gateway port. */
+    if (!smap_get(&od->nbr->options, "chassis") && !od->l3dgw_port) {
+        sset_destroy(&nat_entries);
+        return;
+    }
+
+    build_lrouter_lb_flows(lflows, od, lbs, meter_groups, &nat_entries,
+                           match, actions);
+
+    sset_destroy(&nat_entries);
 }
 
 
@@ -13236,7 +13321,7 @@ static const char *rbac_chassis_auth[] =
     {"name"};
 static const char *rbac_chassis_update[] =
     {"nb_cfg", "external_ids", "encaps", "vtep_logical_switches",
-     "other_config"};
+     "other_config", "transport_zones"};
 
 static const char *rbac_chassis_private_auth[] =
     {"name"};
@@ -13248,10 +13333,21 @@ static const char *rbac_encap_auth[] =
 static const char *rbac_encap_update[] =
     {"type", "options", "ip"};
 
+static const char *rbac_controller_event_auth[] =
+    {""};
+static const char *rbac_controller_event_update[] =
+    {"chassis", "event_info", "event_type", "seq_num"};
+
+
+static const char *rbac_fdb_auth[] =
+    {""};
+static const char *rbac_fdb_update[] =
+    {"dp_key", "mac", "port_key"};
+
 static const char *rbac_port_binding_auth[] =
     {""};
 static const char *rbac_port_binding_update[] =
-    {"chassis", "up"};
+    {"chassis", "encap", "up", "virtual_parent"};
 
 static const char *rbac_mac_binding_auth[] =
     {""};
@@ -13293,12 +13389,28 @@ static struct rbac_perm_cfg {
         .n_update = ARRAY_SIZE(rbac_chassis_private_update),
         .row = NULL
     },{
+        .table = "Controller_Event",
+        .auth = rbac_controller_event_auth,
+        .n_auth = ARRAY_SIZE(rbac_controller_event_auth),
+        .insdel = true,
+        .update = rbac_controller_event_update,
+        .n_update = ARRAY_SIZE(rbac_controller_event_update),
+        .row = NULL
+    },{
         .table = "Encap",
         .auth = rbac_encap_auth,
         .n_auth = ARRAY_SIZE(rbac_encap_auth),
         .insdel = true,
         .update = rbac_encap_update,
         .n_update = ARRAY_SIZE(rbac_encap_update),
+        .row = NULL
+    },{
+        .table = "FDB",
+        .auth = rbac_fdb_auth,
+        .n_auth = ARRAY_SIZE(rbac_fdb_auth),
+        .insdel = true,
+        .update = rbac_fdb_update,
+        .n_update = ARRAY_SIZE(rbac_fdb_update),
         .row = NULL
     },{
         .table = "Port_Binding",

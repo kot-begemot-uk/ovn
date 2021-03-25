@@ -61,6 +61,10 @@ static unixctl_cb_func ovn_northd_resume;
 static unixctl_cb_func ovn_northd_is_paused;
 static unixctl_cb_func ovn_northd_status;
 
+static unixctl_cb_func ovn_northd_enable_cpu_profiling;
+static unixctl_cb_func ovn_northd_disable_cpu_profiling;
+static unixctl_cb_func ovn_northd_profile;
+
 /* --ddlog-record: The name of a file to which to record DDlog commands for
  * later replay.  Useful for debugging.  If null (by default), DDlog commands
  * are not recorded. */
@@ -81,27 +85,29 @@ static void init_table_ids(void)
     NB_CFG_TIMESTAMP_ID = ddlog_get_table_id("NbCfgTimestamp");
 }
 
-/*
- * Accumulates DDlog delta to be sent to OVSDB.
- *
- * FIXME: There is currently no global northd state descriptor shared by NB and
- * SB connections.  We should probably introduce it and move this variable there
- * instead of declaring it as a global variable.
- */
-static ddlog_delta *delta;
-
-
 struct northd_ctx {
+    /* Shared between NB and SB database contexts. */
     ddlog_prog ddlog;
-    char *prefix;
+    ddlog_delta *delta;         /* Accumulated delta to send to OVSDB. */
+
+    /* Database info.
+     *
+     * The '*_relations' vectors are arrays of strings that contain DDlog
+     * relation names, terminated by a null pointer.  'prefix' is the prefix
+     * for the DDlog module that contains the relations. */
+    char *prefix;               /* e.g. "OVN_Northbound::" */
     const char **input_relations;
     const char **output_relations;
     const char **output_only_relations;
 
+    /* Whether this is the database that has the 'nb_cfg_timestamp' and
+     * 'sb_cfg_timestamp' columns in NB_Global.  True for the northbound
+     * database, false for the southbound database. */
     bool has_timestamp_columns;
 
+    /* OVSDB connection. */
     struct ovsdb_cs *cs;
-    struct json *request_id;
+    struct json *request_id; /* JSON request ID for outstanding txn if any.  */
     enum {
         /* Initial state, before the output-only data (if any) has been
          * requested. */
@@ -116,7 +122,7 @@ struct northd_ctx {
     } state;
 
     /* Database info. */
-    const char *db_name;
+    const char *db_name;        /* e.g. "OVN_Northbound". */
     struct json *output_only_data;
     const char *lock_name;      /* Name of lock we need, NULL if none. */
     bool paused;
@@ -150,7 +156,7 @@ static struct northd_ctx *
 northd_ctx_create(const char *server, const char *database,
                   const char *unixctl_command_prefix,
                   const char *lock_name,
-                  ddlog_prog ddlog,
+                  ddlog_prog ddlog, ddlog_delta *delta,
                   const char **input_relations,
                   const char **output_relations,
                   const char **output_only_relations)
@@ -158,6 +164,7 @@ northd_ctx_create(const char *server, const char *database,
     struct northd_ctx *ctx = xmalloc(sizeof *ctx);
     *ctx = (struct northd_ctx) {
         .ddlog = ddlog,
+        .delta = delta,
         .prefix = xasprintf("%s::", database),
         .input_relations = input_relations,
         .output_relations = output_relations,
@@ -193,6 +200,7 @@ northd_ctx_destroy(struct northd_ctx *ctx)
     if (ctx) {
         ovsdb_cs_destroy(ctx->cs);
         json_destroy(ctx->output_only_data);
+        free(ctx->prefix);
         free(ctx);
     }
 }
@@ -313,10 +321,10 @@ warning_cb(uintptr_t arg OVS_UNUSED,
 }
 
 static int
-ddlog_commit(ddlog_prog ddlog)
+ddlog_commit(ddlog_prog ddlog, ddlog_delta *delta)
 {
     ddlog_delta *new_delta = ddlog_transaction_commit_dump_changes(ddlog);
-    if (!delta) {
+    if (!new_delta) {
         VLOG_WARN("Transaction commit failed");
         return -1;
     }
@@ -428,7 +436,7 @@ northd_parse_update(struct northd_ctx *ctx,
     }
 
     /* Commit changes to DDlog. */
-    if (ddlog_commit(ctx->ddlog)) {
+    if (ddlog_commit(ctx->ddlog, ctx->delta)) {
         goto error;
     }
     old_nb_cfg = new_nb_cfg;
@@ -571,8 +579,9 @@ northd_update_probe_interval(struct northd_ctx *nb, struct northd_ctx *sb)
      * database. */
     int probe_interval = 0;
     table_id tid = ddlog_get_table_id("Northd_Probe_Interval");
-    ddlog_delta *probe_delta = ddlog_delta_get_table(delta, tid);
+    ddlog_delta *probe_delta = ddlog_delta_remove_table(nb->delta, tid);
     ddlog_delta_enumerate(probe_delta, northd_update_probe_interval_cb, (uintptr_t) &probe_interval);
+    ddlog_free_delta(probe_delta);
 
     ovsdb_cs_set_probe_interval(nb->cs, probe_interval);
     ovsdb_cs_set_probe_interval(sb->cs, probe_interval);
@@ -591,7 +600,7 @@ northd_wait(struct northd_ctx *ctx)
 /* Generate OVSDB update command for delta-plus, delta-minus, and delta-update
  * tables. */
 static void
-ddlog_table_update_deltas(struct ds *ds, ddlog_prog ddlog,
+ddlog_table_update_deltas(struct ds *ds, ddlog_prog ddlog, ddlog_delta *delta,
                           const char *db, const char *table)
 {
     int error;
@@ -615,7 +624,7 @@ ddlog_table_update_deltas(struct ds *ds, ddlog_prog ddlog,
 
 /* Generate OVSDB update command for a output-only table. */
 static void
-ddlog_table_update_output(struct ds *ds, ddlog_prog ddlog,
+ddlog_table_update_output(struct ds *ds, ddlog_prog ddlog, ddlog_delta *delta,
                           const char *db, const char *table)
 {
     int error;
@@ -853,7 +862,8 @@ get_database_ops(struct northd_ctx *ctx)
     size_t start_len = ops_s.length;
 
     for (const char **p = ctx->output_relations; *p; p++) {
-        ddlog_table_update_deltas(&ops_s, ctx->ddlog, ctx->db_name, *p);
+        ddlog_table_update_deltas(&ops_s, ctx->ddlog, ctx->delta,
+                                  ctx->db_name, *p);
     }
 
     if (ctx->output_only_data) {
@@ -932,7 +942,8 @@ get_database_ops(struct northd_ctx *ctx)
             /* Discard any queued output to this table, since we just
              * did a full sync to it. */
             struct ds tmp = DS_EMPTY_INITIALIZER;
-            ddlog_table_update_output(&tmp, ctx->ddlog, ctx->db_name, table);
+            ddlog_table_update_output(&tmp, ctx->ddlog, ctx->delta,
+                                      ctx->db_name, table);
             ds_destroy(&tmp);
         }
 
@@ -940,7 +951,8 @@ get_database_ops(struct northd_ctx *ctx)
         ctx->output_only_data = NULL;
     } else {
         for (const char **p = ctx->output_only_relations; *p; p++) {
-            ddlog_table_update_output(&ops_s, ctx->ddlog, ctx->db_name, *p);
+            ddlog_table_update_output(&ops_s, ctx->ddlog, ctx->delta,
+                                      ctx->db_name, *p);
         }
     }
 
@@ -956,7 +968,8 @@ get_database_ops(struct northd_ctx *ctx)
     int64_t new_sb_cfg = old_sb_cfg;
     if (ctx->has_timestamp_columns) {
         table_id sb_cfg_tid = ddlog_get_table_id("SbCfg");
-        ddlog_delta *sb_cfg_delta = ddlog_delta_get_table(delta, sb_cfg_tid);
+        ddlog_delta *sb_cfg_delta = ddlog_delta_remove_table(ctx->delta,
+                                                             sb_cfg_tid);
         ddlog_delta_enumerate(sb_cfg_delta, northd_update_sb_cfg_cb,
                               (uintptr_t) &new_sb_cfg);
         ddlog_free_delta(sb_cfg_delta);
@@ -1130,10 +1143,17 @@ main(int argc, char *argv[])
 
 
     ddlog_prog ddlog;
+    ddlog_delta *delta;
     ddlog = ddlog_run(1, false, ddlog_print_error, &delta);
     if (!ddlog) {
         ovs_fatal(0, "DDlog instance could not be created");
     }
+
+    unixctl_command_register("enable-cpu-profiling", "", 0, 0,
+                             ovn_northd_enable_cpu_profiling, ddlog);
+    unixctl_command_register("disable-cpu-profiling", "", 0, 0,
+                             ovn_northd_disable_cpu_profiling, ddlog);
+    unixctl_command_register("profile", "", 0, 0, ovn_northd_profile, ddlog);
 
     int replay_fd = -1;
     if (record_file) {
@@ -1149,10 +1169,10 @@ main(int argc, char *argv[])
     }
 
     struct northd_ctx *nb_ctx = northd_ctx_create(
-        ovnnb_db, "OVN_Northbound", "nb", NULL, ddlog,
+        ovnnb_db, "OVN_Northbound", "nb", NULL, ddlog, delta,
         nb_input_relations, nb_output_relations, nb_output_only_relations);
     struct northd_ctx *sb_ctx = northd_ctx_create(
-        ovnsb_db, "OVN_Southbound", "sb", "ovn_northd", ddlog,
+        ovnsb_db, "OVN_Southbound", "sb", "ovn_northd", ddlog, delta,
         sb_input_relations, sb_output_relations, sb_output_only_relations);
 
     unixctl_command_register("pause", "", 0, 0, ovn_northd_pause, sb_ctx);
@@ -1220,6 +1240,7 @@ main(int argc, char *argv[])
     northd_ctx_destroy(nb_ctx);
     northd_ctx_destroy(sb_ctx);
 
+    ddlog_free_delta(delta);
     ddlog_stop(ddlog);
 
     if (replay_fd >= 0) {
@@ -1283,4 +1304,33 @@ ovn_northd_status(struct unixctl_conn *conn, int argc OVS_UNUSED,
                         : "standby");
     unixctl_command_reply(conn, s);
     free(s);
+}
+
+static void
+ovn_northd_enable_cpu_profiling(struct unixctl_conn *conn, int argc OVS_UNUSED,
+                                const char *argv[] OVS_UNUSED, void *prog_)
+{
+    ddlog_prog prog = prog_;
+    ddlog_enable_cpu_profiling(prog, true);
+    unixctl_command_reply(conn, NULL);
+}
+
+static void
+ovn_northd_disable_cpu_profiling(struct unixctl_conn *conn,
+                                 int argc OVS_UNUSED,
+                                 const char *argv[] OVS_UNUSED, void *prog_)
+{
+    ddlog_prog prog = prog_;
+    ddlog_enable_cpu_profiling(prog, false);
+    unixctl_command_reply(conn, NULL);
+}
+
+static void
+ovn_northd_profile(struct unixctl_conn *conn, int argc OVS_UNUSED,
+                   const char *argv[] OVS_UNUSED, void *prog_)
+{
+    ddlog_prog prog = prog_;
+    char *profile = ddlog_profile(prog);
+    unixctl_command_reply(conn, profile);
+    free(profile);
 }
