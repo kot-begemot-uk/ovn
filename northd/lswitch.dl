@@ -242,12 +242,11 @@ function ipv6_parse_prefix(s: string): Option<in6_addr> {
                         None
                     },
                     Right{(subnet, mask)} -> {
-                        if (ip_count_cidr_bits(mask) == Some{32}
-                            or not ip_is_cidr(mask)) {
+                        if (mask.cidr_bits() == Some{32} or not mask.is_cidr()) {
                             warn("bad 'subnet' ${subnet_str}");
                             None
                         } else {
-                            Some{(subnet, mask, (iptohl(subnet) & iptohl(mask)) + 1, ~iptohl(mask))}
+                            Some{(subnet, mask, (subnet.a & mask.a) + 1, ~mask.a)}
                         }
                     }
                 }
@@ -258,7 +257,7 @@ function ipv6_parse_prefix(s: string): Option<in6_addr> {
             None -> None,
             Some{prefix} -> ipv6_parse_prefix(prefix)
         },
-    var is_vlan_transparent = map_get_bool_def(ls.other_config, "vlan-passthru", false).
+    var is_vlan_transparent = ls.other_config.get_bool_def("vlan-passthru", false).
 
 /* SwitchLB: many-to-many relation between logical switches and nb::LB */
 relation SwitchLB(sw_uuid: uuid, lb: Ref<nb::Load_Balancer>)
@@ -494,7 +493,7 @@ SwitchPortUp0(lsp) :-
     nb::Logical_Switch_Port(._uuid = lsp, .name = lsp_name, .__type = __type),
     sb::Port_Binding(.logical_port = lsp_name, .up = up, .chassis = Some{chassis_uuid}),
     sb::Chassis(._uuid = chassis_uuid, .other_config = other_config),
-    if (map_get_bool_def(other_config, oVN_FEATURE_PORT_UP_NOTIF(), false)) {
+    if (other_config.get_bool_def(oVN_FEATURE_PORT_UP_NOTIF(), false)) {
         up == Some{true}
     } else {
         true
@@ -623,7 +622,7 @@ relation &SwitchPort(
         var dynamic_address_request = None;
         for (addr in lsp.addresses) {
             dynamic_address_request = parse_dynamic_address_request(addr);
-            if (is_some(dynamic_address_request)) {
+            if (dynamic_address_request.is_some()) {
                 break
             }
         };
@@ -633,19 +632,18 @@ relation &SwitchPort(
             None -> (None, None, None, false)
         }
     },
-    var needs_dynamic_ipv4address = has_dyn_lsp_addr and is_none(peer) and is_some(subnet) and
-                                    is_none(static_dynamic_ipv4),
-    var needs_dynamic_macaddress = has_dyn_lsp_addr and is_none(peer) and is_none(static_dynamic_mac) and
-                                   (is_some(subnet) or is_some(ipv6_prefix) or
+    var needs_dynamic_ipv4address = has_dyn_lsp_addr and peer == None and subnet.is_some() and
+                                    static_dynamic_ipv4 == None,
+    var needs_dynamic_macaddress = has_dyn_lsp_addr and peer == None and static_dynamic_mac == None and
+                                   (subnet.is_some() or ipv6_prefix.is_some() or
                                     other_config.get("mac_only") == Some{"true"}),
-    var needs_dynamic_ipv6address = has_dyn_lsp_addr and is_none(peer) and is_some(ipv6_prefix) and is_none(static_dynamic_ipv6),
+    var needs_dynamic_ipv6address = has_dyn_lsp_addr and peer == None and ipv6_prefix.is_some() and static_dynamic_ipv6 == None,
     var parent_name = match (lsp.parent_name) {
         None -> None,
         Some{pname} -> if (pname == "") { None } else { Some{pname} }
     },
     /* Port needs dynamic tag if it has a parent and its `tag_request` is 0. */
-    var needs_dynamic_tag = is_some(parent_name) and
-                            lsp.tag_request == Some{0},
+    var needs_dynamic_tag = parent_name.is_some() and lsp.tag_request == Some{0},
     SwitchPortHAChassisGroup(.lsp_uuid = lsp._uuid,
                              .hac_group_uuid = hac_group_uuid).
 
@@ -733,7 +731,7 @@ function get_svc_monitor_mac(options: Map<string,string>, uuid: uuid)
     };
     match (existing_mac) {
         Some{mac} -> mac,
-        None -> eth_addr_from_uint64(pseudorandom_mac(uuid, 'h5678))
+        None -> eth_addr_pseudorandom(uuid, 'h5678)
     }
 }
 function put_svc_monitor_mac(options: Map<string,string>,

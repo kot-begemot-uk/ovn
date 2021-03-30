@@ -86,12 +86,14 @@ PeerLogicalRouter(lrp_uuid, peer._uuid) :-
 relation FirstHopLogicalRouter(lrouter: uuid, lswitch: uuid)
 FirstHopLogicalRouter(lrouter, lswitch) :-
   LogicalRouterPort(lrp_uuid, lrouter),
-  lrp in nb::Logical_Router_Port(._uuid = lrp_uuid),
-  LogicalSwitchPort(lsp_uuid, lswitch),
-  lsp in nb::Logical_Switch_Port(._uuid = lsp_uuid),
-  lsp.__type == "router",
-  lsp.options.get("router-port") == Some{lrp.name},
-  is_none(lrp.peer).
+  lrp in nb::Logical_Router_Port(._uuid = lrp_uuid, .peer = None),
+  LogicalSwitchRouterPort(lsp_uuid, lrp.name, lswitch).
+
+relation LogicalSwitchRouterPort(lsp: uuid, lsp_router_port: string, ls: uuid)
+LogicalSwitchRouterPort(lsp, lsp_router_port, ls) :-
+  LogicalSwitchPort(lsp, ls),
+  nb::Logical_Switch_Port(._uuid = lsp, .__type = "router", .options = options),
+  Some{var lsp_router_port} = options.get("router-port").
 
 /*
  * Reachable routers.
@@ -118,7 +120,7 @@ ReachableLogicalRouter(a, a) :- ReachableLogicalRouter(a, _).
 // ha_chassis_group and gateway_chassis may not both be present.
 Warning[message] :-
     lrp in nb::Logical_Router_Port(),
-    is_some(lrp.ha_chassis_group),
+    lrp.ha_chassis_group.is_some(),
     not lrp.gateway_chassis.is_empty(),
     var message = "Both ha_chassis_group and gateway_chassis configured on "
     "port ${lrp.name}; ignoring the latter".
@@ -126,7 +128,7 @@ Warning[message] :-
 // A distributed gateway port cannot also be an L3 gateway router.
 Warning[message] :-
     lrp in nb::Logical_Router_Port(),
-    is_some(lrp.ha_chassis_group) or not lrp.gateway_chassis.is_empty(),
+    lrp.ha_chassis_group.is_some() or not lrp.gateway_chassis.is_empty(),
     lrp.options.contains_key("chassis"),
     var message = "Bad configuration: distributed gateway port configured on "
     "port ${lrp.name} on L3 gateway router".
@@ -143,7 +145,7 @@ DistributedGatewayPortCandidate(lr_uuid, lrp_uuid) :-
     LogicalRouterPort(lrp_uuid, lr._uuid),
     lrp in nb::Logical_Router_Port(._uuid = lrp_uuid),
     not lrp.options.contains_key("chassis"),
-    var has_hcg = is_some(lrp.ha_chassis_group),
+    var has_hcg = lrp.ha_chassis_group.is_some(),
     var has_gc = not lrp.gateway_chassis.is_empty(),
     has_hcg or has_gc.
 Warning[message] :-
@@ -185,7 +187,7 @@ relation HAChassis(hacg_uuid: uuid,
 HAChassis(ha_chassis_group_uuid(lrp._uuid), gw_chassis_uuid,
           chassis_name, priority, external_ids) :-
     DistributedGatewayPort(.lrp = lrp),
-    is_none(lrp.ha_chassis_group),
+    lrp.ha_chassis_group == None,
     var gw_chassis_uuid = FlatMap(lrp.gateway_chassis),
     nb::Gateway_Chassis(._uuid = gw_chassis_uuid,
                        .chassis_name = chassis_name,
@@ -219,7 +221,7 @@ relation HAChassisGroup(uuid: uuid,
                         external_ids: Map<string,string>)
 HAChassisGroup(ha_chassis_group_uuid(lrp._uuid), lrp.name, map_empty()) :-
     DistributedGatewayPort(.lrp = lrp),
-    is_none(lrp.ha_chassis_group),
+    lrp.ha_chassis_group == None,
     not lrp.gateway_chassis.is_empty().
 HAChassisGroup(ha_chassis_group_uuid(hac_group_uuid),
                name, external_ids) :-
@@ -236,7 +238,7 @@ relation LogicalRouterHAChassisGroup(lr_uuid: uuid,
                                      hacg_uuid: uuid)
 LogicalRouterHAChassisGroup(lr_uuid, ha_chassis_group_uuid(lrp._uuid)) :-
     DistributedGatewayPort(lrp, lr_uuid),
-    is_none(lrp.ha_chassis_group),
+    lrp.ha_chassis_group == None,
     lrp.gateway_chassis.size() > 0.
 LogicalRouterHAChassisGroup(lr_uuid,
                             ha_chassis_group_uuid(hac_group_uuid)) :-
@@ -300,16 +302,16 @@ Warning["Bad MAC address ${s} in nat configuration for router ${lr_name}."] :-
 relation LogicalRouterNAT(lr: uuid, nat: NAT)
 LogicalRouterNAT(lr, NAT{nat, external_ip, external_mac, None}) :-
     LogicalRouterNAT0(lr, nat, external_ip, external_mac),
-    nat.allowed_ext_ips.is_none(),
-    nat.exempted_ext_ips.is_none().
+    nat.allowed_ext_ips == None,
+    nat.exempted_ext_ips == None.
 LogicalRouterNAT(lr, NAT{nat, external_ip, external_mac, Some{AllowedExtIps{__as}}}) :-
     LogicalRouterNAT0(lr, nat, external_ip, external_mac),
-    nat.exempted_ext_ips.is_none(),
+    nat.exempted_ext_ips == None,
     Some{var __as_uuid} = nat.allowed_ext_ips,
     __as in &AddressSetRef[nb::Address_Set{._uuid = __as_uuid}].
 LogicalRouterNAT(lr, NAT{nat, external_ip, external_mac, Some{ExemptedExtIps{__as}}}) :-
     LogicalRouterNAT0(lr, nat, external_ip, external_mac),
-    nat.allowed_ext_ips.is_none(),
+    nat.allowed_ext_ips == None,
     Some{var __as_uuid} = nat.exempted_ext_ips,
     __as in &AddressSetRef[nb::Address_Set{._uuid = __as_uuid}].
 Warning["NAT rule: ${nat._uuid} not applied, since"
@@ -449,7 +451,7 @@ relation &Router(
                 Some{rport} -> json_string_escape(chassis_redirect_name(rport.name)),
                 _ -> ""
             },
-        .is_gateway = is_some(lr.options.get("chassis")),
+        .is_gateway = lr.options.contains_key("chassis"),
         .nats       = nats,
         .snat_ips   = snat_ips,
         .lbs        = lbs,
@@ -463,7 +465,7 @@ relation &Router(
     LogicalRouterLBs(lr._uuid, lbs),
     LogicalRouterSnatIPs(lr._uuid, snat_ips),
     mcast_cfg in &McastRouterCfg(.datapath = lr._uuid),
-    var learn_from_arp_request = map_get_bool_def(lr.options, "always_learn_from_arp_request", true),
+    var learn_from_arp_request = lr.options.get_bool_def("always_learn_from_arp_request", true),
     var force_lb_snat = lb_force_snat_router_ip(lr.options).
 
 /* RouterLB: many-to-many relation between logical routers and nb::LB */
@@ -653,7 +655,7 @@ relation &StaticRoute(lrsr: nb::Logical_Router_Static_Route,
         (IPv6{_}, IPv6{_}) -> true,
         _ -> false
     },
-    var esr = map_get_bool_def(lrsr.options, "ecmp_symmetric_reply", false).
+    var esr = lrsr.options.get_bool_def("ecmp_symmetric_reply", false).
 
 /* Returns the IP address of the router port 'op' that
  * overlaps with 'ip'.  If one is not found, returns None. */
@@ -662,7 +664,7 @@ function find_lrp_member_ip(networks: lport_addresses, ip: v46_ip): Option<v46_i
     match (ip) {
         IPv4{ip4} -> {
             for (na in networks.ipv4_addrs) {
-                if (ip_same_network((na.addr, ip4), ipv4_netaddr_mask(na))) {
+                if ((na.addr, ip4).same_network(na.netmask())) {
                     /* There should be only 1 interface that matches the
                      * supplied IP.  Otherwise, it's a configuration error,
                      * because subnets of a router's interfaces should NOT
@@ -674,7 +676,7 @@ function find_lrp_member_ip(networks: lport_addresses, ip: v46_ip): Option<v46_i
         },
         IPv6{ip6} -> {
             for (na in networks.ipv6_addrs) {
-                if (ipv6_same_network((na.addr, ip6), ipv6_netaddr_mask(na))) {
+                if ((na.addr, ip6).same_network(na.netmask())) {
                     /* There should be only 1 interface that matches the
                      * supplied IP.  Otherwise, it's a configuration error,
                      * because subnets of a router's interfaces should NOT
@@ -719,17 +721,14 @@ relation RouterStaticRoute(
     dsts        : Set<route_dst>)
 
 RouterStaticRoute(router, key, dsts) :-
-    RouterStaticRoute_(.router = router,
-                       .key = key,
-                       .nexthop = nexthop,
-                       .output_port = None,
-                       .ecmp_symmetric_reply = ecmp_symmetric_reply),
+    rsr in RouterStaticRoute_(.router = router, .output_port = None),
     /* output_port is not specified, find the
      * router port matching the next hop. */
     port in &RouterPort(.router = &Router{.lr = nb::Logical_Router{._uuid = router.lr._uuid}},
                         .networks = networks),
-    Some{var src_ip} = find_lrp_member_ip(networks, nexthop),
-    var dst = RouteDst{nexthop, src_ip, port, ecmp_symmetric_reply},
+    Some{var src_ip} = find_lrp_member_ip(networks, rsr.nexthop),
+    var dst = RouteDst{rsr.nexthop, src_ip, port, rsr.ecmp_symmetric_reply},
+    var key = rsr.key,
     var dsts = dst.group_by((router, key)).to_set().
 
 RouterStaticRoute(router, key, dsts) :-
