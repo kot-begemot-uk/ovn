@@ -30,6 +30,7 @@
 #include "lib/ovn-nb-idl.h"
 #include "lib/ovn-util.h"
 #include "memory.h"
+#include "ovn-dbctl.h"
 #include "packets.h"
 #include "openvswitch/poll-loop.h"
 #include "process.h"
@@ -48,83 +49,110 @@
 
 VLOG_DEFINE_THIS_MODULE(nbctl);
 
-/* --db: The database server to contact. */
-static const char *db;
-
-/* --oneline: Write each command's output as a single line? */
-static bool oneline;
-
-/* --dry-run: Do not commit any changes. */
-static bool dry_run;
-
-/* --wait=TYPE: Wait for configuration change to take effect? */
-enum nbctl_wait_type {
-    NBCTL_WAIT_NONE,            /* Do not wait. */
-    NBCTL_WAIT_SB,              /* Wait for southbound database updates. */
-    NBCTL_WAIT_HV               /* Wait for hypervisors to catch up. */
-};
-static enum nbctl_wait_type wait_type = NBCTL_WAIT_NONE;
-
-static bool print_wait_time = false;
-
 /* Should we wait (if specified by 'wait_type') even if the commands don't
  * change the database at all? */
 static bool force_wait = false;
 
-/* --timeout: Time to wait for a connection to 'db'. */
-static unsigned int timeout;
+static void
+nbctl_add_base_prerequisites(struct ovsdb_idl *idl,
+                             enum nbctl_wait_type wait_type)
+{
+    force_wait = false;
 
-/* Format for table output. */
-static struct table_style table_style = TABLE_STYLE_DEFAULT;
+    ovsdb_idl_add_table(idl, &nbrec_table_nb_global);
+    if (wait_type != NBCTL_WAIT_NONE) {
+        ovsdb_idl_add_column(idl, &nbrec_nb_global_col_sb_cfg);
+        ovsdb_idl_add_column(idl, &nbrec_nb_global_col_sb_cfg_timestamp);
+        if (wait_type == NBCTL_WAIT_HV) {
+            ovsdb_idl_add_column(idl, &nbrec_nb_global_col_hv_cfg);
+            ovsdb_idl_add_column(idl, &nbrec_nb_global_col_hv_cfg_timestamp);
+        }
+    }
+}
 
-/* The IDL we're using and the current transaction, if any.
- * This is for use by nbctl_exit() only, to allow it to clean up.
- * Other code should use its context arguments. */
-static struct ovsdb_idl *the_idl;
-static struct ovsdb_idl_txn *the_idl_txn;
-OVS_NO_RETURN static void nbctl_exit(int status);
+static void
+nbctl_pre_execute(struct ovsdb_idl *idl, struct ovsdb_idl_txn *txn,
+                  enum nbctl_wait_type wait_type)
+{
+    const struct nbrec_nb_global *nb = nbrec_nb_global_first(idl);
+    if (!nb) {
+        /* XXX add verification that table is empty */
+        nb = nbrec_nb_global_insert(txn);
+    }
 
-/* --leader-only, --no-leader-only: Only accept the leader in a cluster. */
-static int leader_only = true;
+    /* Deal with potential overflows. */
+    if (nb->nb_cfg == LLONG_MAX) {
+        nbrec_nb_global_set_nb_cfg(nb, 0);
+    }
 
-/* --shuffle-remotes, --no-shuffle-remotes: Shuffle the order of remotes that
- * are specified in the connetion method string. */
-static int shuffle_remotes = true;
+    if (wait_type != NBCTL_WAIT_NONE) {
+        ovsdb_idl_txn_increment(txn, &nb->header_, &nbrec_nb_global_col_nb_cfg,
+                                force_wait);
+    }
+}
 
-/* --unixctl-path: Path to use for unixctl server socket, for daemon mode. */
-static char *unixctl_path;
+static char *
+nbctl_post_execute(struct ovsdb_idl *idl, struct ovsdb_idl_txn *txn,
+                   enum ovsdb_idl_txn_status status,
+                   enum nbctl_wait_type wait_type,
+                   const struct timer *wait_timeout, long long int start_time,
+                   bool print_wait_time)
+{
+    if (wait_type == NBCTL_WAIT_NONE) {
+        if (force_wait) {
+            VLOG_INFO("\"sync\" command has no effect without --wait");
+        }
+        return NULL;
+    }
+    if (status == TXN_UNCHANGED) {
+        return NULL;
+    }
 
-static unixctl_cb_func server_cmd_exit;
-static unixctl_cb_func server_cmd_run;
+    ovs_assert(status == TXN_SUCCESS);
+    int64_t next_cfg = ovsdb_idl_txn_get_increment_new_value(txn);
+    ovsdb_idl_enable_reconnect(idl);
+    for (;;) {
+        ovsdb_idl_run(idl);
 
-static void nbctl_cmd_init(void);
-OVS_NO_RETURN static void usage(void);
-static struct option *get_all_options(void);
-static bool has_option(const struct ovs_cmdl_parsed_option *, size_t n,
-                       int option);
-static void nbctl_client(const char *socket_name,
-                         const struct ovs_cmdl_parsed_option *, size_t n,
-                         int argc, char *argv[]);
-static bool will_detach(const struct ovs_cmdl_parsed_option *, size_t n);
-static void apply_options_direct(const struct ovs_cmdl_parsed_option *,
-                                 size_t n, struct shash *local_options);
-static char * OVS_WARN_UNUSED_RESULT run_prerequisites(struct ctl_command[],
-                                                       size_t n_commands,
-                                                       struct ovsdb_idl *);
-static char * OVS_WARN_UNUSED_RESULT do_nbctl(const char *args,
-                                              struct ctl_command *, size_t n,
-                                              struct ovsdb_idl *,
-                                              const struct timer *,
-                                              bool *retry);
+        const struct nbrec_nb_global *nb;
+        NBREC_NB_GLOBAL_FOR_EACH (nb, idl) {
+            int64_t cur_cfg = (wait_type == NBCTL_WAIT_SB
+                               ? nb->sb_cfg
+                               : MIN(nb->sb_cfg, nb->hv_cfg));
+            if (cur_cfg >= next_cfg) {
+                if (print_wait_time) {
+                    printf("Time spent on processing nb_cfg %"PRId64":\n",
+                           next_cfg);
+
+                    long long int nb_timestamp = nb->nb_cfg_timestamp;
+                    long long int sb_timestamp = nb->sb_cfg_timestamp;
+                    long long int hv_timestamp = nb->hv_cfg_timestamp;
+                    printf("\tovn-northd delay before processing:"
+                           "\t%lldms\n", nb_timestamp - start_time);
+                    printf("\tovn-northd completion:"
+                           "\t\t\t%lldms\n", sb_timestamp - start_time);
+                    if (wait_type == NBCTL_WAIT_HV) {
+                        printf("\tovn-controller(s) completion:"
+                               "\t\t%lldms\n", hv_timestamp - start_time);
+                    }
+                }
+                return NULL;
+            }
+        }
+        ovsdb_idl_wait(idl);
+        if (wait_timeout) {
+            timer_wait(wait_timeout);
+        }
+        poll_block();
+        if (wait_timeout && timer_expired(wait_timeout)) {
+            return xstrdup("timeout expired");
+        }
+    }
+}
+
 static char * OVS_WARN_UNUSED_RESULT dhcp_options_get(
     struct ctl_context *ctx, const char *id, bool must_exist,
     const struct nbrec_dhcp_options **);
-static char * OVS_WARN_UNUSED_RESULT main_loop(const char *args,
-                                               struct ctl_command *commands,
-                                               size_t n_commands,
-                                               struct ovsdb_idl *idl,
-                                               const struct timer *);
-static void server_loop(struct ovsdb_idl *idl, int argc, char *argv[]);
 
 /* A context for keeping track of which switch/router certain ports are
  * connected to.
@@ -134,35 +162,55 @@ static void server_loop(struct ovsdb_idl *idl, int argc, char *argv[]);
  * until transaction is committed and updates received from the server. */
 struct nbctl_context {
     struct ctl_context base;
+
+    bool context_valid;
     struct shash lsp_to_ls_map;
     struct shash lrp_to_lr_map;
-    bool context_valid;
 };
 
-static void
-nbctl_context_init(struct nbctl_context *nbctx)
+static struct ctl_context *
+nbctl_ctx_create(void)
 {
-    nbctx->context_valid = false;
-    shash_init(&nbctx->lsp_to_ls_map);
-    shash_init(&nbctx->lrp_to_lr_map);
+    struct nbctl_context *nbctx = xmalloc(sizeof *nbctx);
+    *nbctx = (struct nbctl_context) {
+        .context_valid = false,
+        .lsp_to_ls_map = SHASH_INITIALIZER(&nbctx->lsp_to_ls_map),
+        .lrp_to_lr_map = SHASH_INITIALIZER(&nbctx->lrp_to_lr_map),
+    };
+    return &nbctx->base;
 }
 
 static void
-nbctl_context_destroy(struct nbctl_context *nbctx)
+nbctl_ctx_destroy(struct ctl_context *base)
 {
+    struct nbctl_context *nbctx
+        = CONTAINER_OF(base, struct nbctl_context, base);
     nbctx->context_valid = false;
     shash_destroy(&nbctx->lsp_to_ls_map);
     shash_destroy(&nbctx->lrp_to_lr_map);
+    free(nbctx);
+}
+
+static void
+nbctl_pre_context(struct ctl_context *base)
+{
+    ovsdb_idl_add_column(base->idl, &nbrec_logical_switch_col_name);
+    ovsdb_idl_add_column(base->idl, &nbrec_logical_switch_col_ports);
+
+    ovsdb_idl_add_column(base->idl, &nbrec_logical_switch_port_col_name);
+
+    ovsdb_idl_add_column(base->idl, &nbrec_logical_router_col_name);
+    ovsdb_idl_add_column(base->idl, &nbrec_logical_router_col_ports);
+
+    ovsdb_idl_add_column(base->idl, &nbrec_logical_router_port_col_name);
 }
 
 /* Casts 'base' into 'struct nbctl_context' and initializes it if needed. */
 static struct nbctl_context *
 nbctl_context_get(struct ctl_context *base)
 {
-    struct nbctl_context *nbctx;
-
-    nbctx = CONTAINER_OF(base, struct nbctl_context, base);
-
+    struct nbctl_context *nbctx
+        = CONTAINER_OF(base, struct nbctl_context, base);
     if (nbctx->context_valid) {
         return nbctx;
     }
@@ -185,466 +233,8 @@ nbctl_context_get(struct ctl_context *base)
     return nbctx;
 }
 
-int
-main(int argc, char *argv[])
-{
-    struct ovsdb_idl *idl;
-    struct shash local_options;
-
-    ovn_set_program_name(argv[0]);
-    fatal_ignore_sigpipe();
-    vlog_set_levels(NULL, VLF_CONSOLE, VLL_WARN);
-    vlog_set_levels_from_string_assert("reconnect:warn");
-
-    nbctl_cmd_init();
-
-    /* Check if options are set via env var. */
-    char **argv_ = ovs_cmdl_env_parse_all(&argc, argv,
-                                          getenv("OVN_NBCTL_OPTIONS"));
-
-    /* ovn-nbctl has three operation modes:
-     *
-     *    - Direct: Executes commands by contacting ovsdb-server directly.
-     *
-     *    - Server: Runs in the background as a daemon waiting for requests
-     *      from ovn-nbctl running in client mode.
-     *
-     *    - Client: Executes commands by passing them to an ovn-nbctl running
-     *      in the server mode.
-     *
-     * At this point we don't know what mode we're running in.  The mode partly
-     * depends on the command line.  So, for now we transform the command line
-     * into a parsed form, and figure out what to do with it later.
-     */
-    struct ovs_cmdl_parsed_option *parsed_options;
-    size_t n_parsed_options;
-    char *error_s = ovs_cmdl_parse_all(argc, argv_, get_all_options(),
-                                       &parsed_options, &n_parsed_options);
-    if (error_s) {
-        ctl_fatal("%s", error_s);
-    }
-
-    /* Now figure out the operation mode:
-     *
-     *    - A --detach option implies server mode.
-     *
-     *    - An OVN_NB_DAEMON environment variable implies client mode.
-     *
-     *    - Otherwise, we're in direct mode. */
-    char *socket_name = unixctl_path ?: getenv("OVN_NB_DAEMON");
-    if (((socket_name && socket_name[0])
-         || has_option(parsed_options, n_parsed_options, 'u'))
-        && !will_detach(parsed_options, n_parsed_options)) {
-        nbctl_client(socket_name, parsed_options, n_parsed_options,
-                     argc, argv_);
-    }
-
-    /* Parse command line. */
-    shash_init(&local_options);
-    apply_options_direct(parsed_options, n_parsed_options, &local_options);
-    free(parsed_options);
-
-    bool daemon_mode = false;
-    if (get_detach()) {
-        if (argc != optind) {
-            ctl_fatal("non-option arguments not supported with --detach "
-                      "(use --help for help)");
-        }
-        daemon_mode = true;
-    }
-    /* Initialize IDL. */
-    idl = the_idl = ovsdb_idl_create_unconnected(&nbrec_idl_class, true);
-    ovsdb_idl_set_shuffle_remotes(idl, shuffle_remotes);
-    /* "retry" is true iff in daemon mode. */
-    ovsdb_idl_set_remote(idl, db, daemon_mode);
-    ovsdb_idl_set_leader_only(idl, leader_only);
-
-    if (daemon_mode) {
-        server_loop(idl, argc, argv_);
-    } else {
-        struct ctl_command *commands;
-        size_t n_commands;
-        char *error;
-
-        error = ctl_parse_commands(argc - optind, argv_ + optind,
-                                   &local_options, &commands, &n_commands);
-        if (error) {
-            ctl_fatal("%s", error);
-        }
-
-        char *args = process_escape_args(argv_);
-        VLOG(ctl_might_write_to_db(commands, n_commands) ? VLL_INFO : VLL_DBG,
-             "Called as %s", args);
-
-        ctl_timeout_setup(timeout);
-
-        error = run_prerequisites(commands, n_commands, idl);
-        if (error) {
-            goto cleanup;
-        }
-
-        error = main_loop(args, commands, n_commands, idl, NULL);
-
-cleanup:
-        free(args);
-
-        struct ctl_command *c;
-        for (c = commands; c < &commands[n_commands]; c++) {
-            ds_destroy(&c->output);
-            table_destroy(c->table);
-            free(c->table);
-            shash_destroy_free_data(&c->options);
-        }
-        free(commands);
-        if (error) {
-            ctl_fatal("%s", error);
-        }
-    }
-
-    ovsdb_idl_destroy(idl);
-    idl = the_idl = NULL;
-
-    for (int i = 0; i < argc; i++) {
-        free(argv_[i]);
-    }
-    free(argv_);
-    exit(EXIT_SUCCESS);
-}
-
-static char *
-main_loop(const char *args, struct ctl_command *commands, size_t n_commands,
-          struct ovsdb_idl *idl, const struct timer *wait_timeout)
-{
-    unsigned int seqno;
-    bool idl_ready;
-
-    /* Execute the commands.
-     *
-     * 'seqno' is the database sequence number for which we last tried to
-     * execute our transaction.  There's no point in trying to commit more than
-     * once for any given sequence number, because if the transaction fails
-     * it's because the database changed and we need to obtain an up-to-date
-     * view of the database before we try the transaction again. */
-    seqno = ovsdb_idl_get_seqno(idl);
-
-    /* IDL might have already obtained the database copy during previous
-     * invocation. If so, we can't expect the sequence number to change before
-     * we issue any new requests. */
-    idl_ready = ovsdb_idl_has_ever_connected(idl);
-    for (;;) {
-        ovsdb_idl_run(idl);
-        if (!ovsdb_idl_is_alive(idl)) {
-            int retval = ovsdb_idl_get_last_error(idl);
-            ctl_fatal("%s: database connection failed (%s)",
-                      db, ovs_retval_to_string(retval));
-        }
-
-        if (idl_ready || seqno != ovsdb_idl_get_seqno(idl)) {
-            idl_ready = false;
-            seqno = ovsdb_idl_get_seqno(idl);
-
-            bool retry;
-            char *error = do_nbctl(args, commands, n_commands, idl,
-                                   wait_timeout, &retry);
-            if (error) {
-                return error;
-            }
-            if (!retry) {
-                return NULL;
-            }
-        }
-
-        if (seqno == ovsdb_idl_get_seqno(idl)) {
-            ovsdb_idl_wait(idl);
-            poll_block();
-        }
-    }
-
-    return NULL;
-}
-
-/* All options that affect the main loop and are not external. */
-#define MAIN_LOOP_OPTION_ENUMS                  \
-        OPT_NO_WAIT,                            \
-        OPT_WAIT,                               \
-        OPT_PRINT_WAIT_TIME,                    \
-        OPT_DRY_RUN,                            \
-        OPT_ONELINE
-
-#define MAIN_LOOP_LONG_OPTIONS                                          \
-        {"no-wait", no_argument, NULL, OPT_NO_WAIT},                    \
-        {"wait", required_argument, NULL, OPT_WAIT},                    \
-        {"print-wait-time", no_argument, NULL, OPT_PRINT_WAIT_TIME},    \
-        {"dry-run", no_argument, NULL, OPT_DRY_RUN},                    \
-        {"oneline", no_argument, NULL, OPT_ONELINE},                    \
-        {"timeout", required_argument, NULL, 't'}
-
-enum {
-    OPT_DB = UCHAR_MAX + 1,
-    OPT_NO_SYSLOG,
-    OPT_LOCAL,
-    OPT_COMMANDS,
-    OPT_OPTIONS,
-    OPT_LEADER_ONLY,
-    OPT_NO_LEADER_ONLY,
-    OPT_SHUFFLE_REMOTES,
-    OPT_NO_SHUFFLE_REMOTES,
-    OPT_BOOTSTRAP_CA_CERT,
-    MAIN_LOOP_OPTION_ENUMS,
-    OVN_DAEMON_OPTION_ENUMS,
-    VLOG_OPTION_ENUMS,
-    TABLE_OPTION_ENUMS,
-    SSL_OPTION_ENUMS,
-};
-
-static char * OVS_WARN_UNUSED_RESULT
-handle_main_loop_option(int opt, const char *arg, bool *handled)
-{
-    ovs_assert(handled);
-    *handled = true;
-
-    switch (opt) {
-    case OPT_ONELINE:
-        oneline = true;
-        break;
-
-    case OPT_NO_WAIT:
-        wait_type = NBCTL_WAIT_NONE;
-        break;
-
-    case OPT_WAIT:
-        if (!strcmp(arg, "none")) {
-            wait_type = NBCTL_WAIT_NONE;
-        } else if (!strcmp(arg, "sb")) {
-            wait_type = NBCTL_WAIT_SB;
-        } else if (!strcmp(arg, "hv")) {
-            wait_type = NBCTL_WAIT_HV;
-        } else {
-            return xstrdup("argument to --wait must be "
-                           "\"none\", \"sb\", or \"hv\"");
-        }
-        break;
-
-    case OPT_PRINT_WAIT_TIME:
-        print_wait_time = true;
-        break;
-
-    case OPT_DRY_RUN:
-        dry_run = true;
-        break;
-
-    case 't':
-        if (!str_to_uint(arg, 10, &timeout) || !timeout) {
-            return xasprintf("value %s on -t or --timeout is invalid", arg);
-        }
-        break;
-
-    default:
-        *handled = false;
-        break;
-    }
-
-    return NULL;
-}
-
-static char * OVS_WARN_UNUSED_RESULT
-build_short_options(const struct option *long_options, bool print_errors)
-{
-    char *tmp, *short_options;
-
-    tmp = ovs_cmdl_long_options_to_short_options(long_options);
-    short_options = xasprintf("+%s%s", print_errors ? "" : ":", tmp);
-    free(tmp);
-
-    return short_options;
-}
-
-static struct option * OVS_WARN_UNUSED_RESULT
-append_command_options(const struct option *options, int opt_val)
-{
-    struct option *o;
-    size_t n_allocated;
-    size_t n_existing;
-    int i;
-
-    for (i = 0; options[i].name; i++) {
-        ;
-    }
-    n_allocated = i + 1;
-    n_existing = i;
-
-    /* We want to parse both global and command-specific options here, but
-     * getopt_long() isn't too convenient for the job.  We copy our global
-     * options into a dynamic array, then append all of the command-specific
-     * options. */
-    o = xmemdup(options, n_allocated * sizeof *options);
-    ctl_add_cmd_options(&o, &n_existing, &n_allocated, opt_val);
-
-    return o;
-}
-
-static struct option *
-get_all_options(void)
-{
-    static const struct option global_long_options[] = {
-        {"db", required_argument, NULL, OPT_DB},
-        {"no-syslog", no_argument, NULL, OPT_NO_SYSLOG},
-        {"help", no_argument, NULL, 'h'},
-        {"commands", no_argument, NULL, OPT_COMMANDS},
-        {"options", no_argument, NULL, OPT_OPTIONS},
-        {"leader-only", no_argument, NULL, OPT_LEADER_ONLY},
-        {"no-leader-only", no_argument, NULL, OPT_NO_LEADER_ONLY},
-        {"shuffle-remotes", no_argument, NULL, OPT_SHUFFLE_REMOTES},
-        {"no-shuffle-remotes", no_argument, NULL, OPT_NO_SHUFFLE_REMOTES},
-        {"version", no_argument, NULL, 'V'},
-        {"unixctl", required_argument, NULL, 'u'},
-        MAIN_LOOP_LONG_OPTIONS,
-        OVN_DAEMON_LONG_OPTIONS,
-        VLOG_LONG_OPTIONS,
-        STREAM_SSL_LONG_OPTIONS,
-        {"bootstrap-ca-cert", required_argument, NULL, OPT_BOOTSTRAP_CA_CERT},
-        TABLE_LONG_OPTIONS,
-        {NULL, 0, NULL, 0},
-    };
-
-    static struct option *options;
-    if (!options) {
-        options = append_command_options(global_long_options, OPT_LOCAL);
-    }
-
-    return options;
-}
-
-static bool
-has_option(const struct ovs_cmdl_parsed_option *parsed_options, size_t n,
-           int option)
-{
-    for (const struct ovs_cmdl_parsed_option *po = parsed_options;
-         po < &parsed_options[n]; po++) {
-        if (po->o->val == option) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool
-will_detach(const struct ovs_cmdl_parsed_option *parsed_options, size_t n)
-{
-    return has_option(parsed_options, n, OVN_OPT_DETACH);
-}
-
-static char * OVS_WARN_UNUSED_RESULT
-add_local_option(const char *name, const char *arg,
-                 struct shash *local_options)
-{
-    char *full_name = xasprintf("--%s", name);
-    if (shash_find(local_options, full_name)) {
-        char *error = xasprintf("'%s' option specified multiple times",
-                                full_name);
-        free(full_name);
-        return error;
-    }
-    shash_add_nocopy(local_options, full_name, nullable_xstrdup(arg));
-    return NULL;
-}
-
 static void
-apply_options_direct(const struct ovs_cmdl_parsed_option *parsed_options,
-                     size_t n, struct shash *local_options)
-{
-    for (const struct ovs_cmdl_parsed_option *po = parsed_options;
-         po < &parsed_options[n]; po++) {
-        bool handled;
-        char *error = handle_main_loop_option(po->o->val, po->arg, &handled);
-        if (error) {
-            ctl_fatal("%s", error);
-        }
-        if (handled) {
-            continue;
-        }
-
-        optarg = po->arg;
-        switch (po->o->val) {
-        case OPT_DB:
-            db = po->arg;
-            break;
-
-        case OPT_NO_SYSLOG:
-            vlog_set_levels(&this_module, VLF_SYSLOG, VLL_WARN);
-            break;
-
-        case OPT_LOCAL:
-            error = add_local_option(po->o->name, po->arg, local_options);
-            if (error) {
-                ctl_fatal("%s", error);
-            }
-            break;
-
-        case 'h':
-            usage();
-            exit(EXIT_SUCCESS);
-
-        case OPT_COMMANDS:
-            ctl_print_commands();
-            /* fall through */
-
-        case OPT_OPTIONS:
-            ctl_print_options(get_all_options());
-            /* fall through */
-
-        case OPT_LEADER_ONLY:
-            leader_only = true;
-            break;
-
-        case OPT_NO_LEADER_ONLY:
-            leader_only = false;
-            break;
-
-        case OPT_SHUFFLE_REMOTES:
-            shuffle_remotes = true;
-            break;
-
-        case OPT_NO_SHUFFLE_REMOTES:
-            shuffle_remotes = false;
-            break;
-
-        case 'u':
-            unixctl_path = optarg;
-            break;
-
-        case 'V':
-            ovn_print_version(0, 0);
-            printf("DB Schema %s\n", nbrec_get_db_version());
-            exit(EXIT_SUCCESS);
-
-        OVN_DAEMON_OPTION_HANDLERS
-        VLOG_OPTION_HANDLERS
-        TABLE_OPTION_HANDLERS(&table_style)
-        STREAM_SSL_OPTION_HANDLERS
-
-        case OPT_BOOTSTRAP_CA_CERT:
-            stream_ssl_set_ca_cert_file(po->arg, true);
-            break;
-
-        case '?':
-            exit(EXIT_FAILURE);
-
-        default:
-            abort();
-
-        case 0:
-            break;
-        }
-    }
-
-    if (!db) {
-        db = default_nb_db();
-    }
-}
-
-static void
-usage(void)
+nbctl_usage(void)
 {
     printf("\
 %s: OVN northbound DB management utility\n\
@@ -1212,18 +802,47 @@ nbctl_init(struct ctl_context *ctx OVS_UNUSED)
 }
 
 static void
-nbctl_pre_sync(struct ctl_context *ctx OVS_UNUSED)
+nbctl_pre_sync(struct ctl_context *base OVS_UNUSED)
 {
-    if (wait_type != NBCTL_WAIT_NONE) {
-        force_wait = true;
-    } else {
-        VLOG_INFO("\"sync\" command has no effect without --wait");
-    }
+    force_wait = true;
 }
 
 static void
 nbctl_sync(struct ctl_context *ctx OVS_UNUSED)
 {
+}
+
+static void
+nbctl_pre_show(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_external_ids);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_ports);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_external_ids);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_type);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_parent_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_tag);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_addresses);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_options);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_external_ids);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_ports);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_nat);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_port_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_port_col_mac);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_port_col_networks);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_port_col_gateway_chassis);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_gateway_chassis_col_chassis_name);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_nat_col_external_ip);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_nat_col_external_port_range);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_nat_col_logical_ip);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_nat_col_type);
 }
 
 static void
@@ -1261,6 +880,12 @@ nbctl_show(struct ctl_context *ctx)
             print_lr(lr, &ctx->output);
         }
     }
+}
+
+static void
+nbctl_pre_ls_add(struct ctl_context *ctx)
+{
+    nbctl_pre_context(ctx);
 }
 
 static void
@@ -1306,6 +931,12 @@ nbctl_ls_add(struct ctl_context *ctx)
 }
 
 static void
+nbctl_pre_ls_del(struct ctl_context *ctx)
+{
+    nbctl_pre_context(ctx);
+}
+
+static void
 nbctl_ls_del(struct ctl_context *ctx)
 {
     bool must_exist = !shash_find(&ctx->options, "--if-exists");
@@ -1328,6 +959,12 @@ nbctl_ls_del(struct ctl_context *ctx)
     }
 
     nbrec_logical_switch_delete(ls);
+}
+
+static void
+nbctl_pre_ls_list(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_name);
 }
 
 static void
@@ -1410,6 +1047,19 @@ ls_get_name(const struct nbrec_logical_switch *ls,
     }
     snprintf(uuid_s, uuid_s_size, UUID_FMT, UUID_ARGS(&ls->header_.uuid));
     return uuid_s;
+}
+
+static void
+nbctl_pre_lsp_add(struct ctl_context *ctx)
+{
+    nbctl_pre_context(ctx);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_ports);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_parent_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_tag_request);
 }
 
 static void
@@ -1518,6 +1168,17 @@ nbctl_lsp_add(struct ctl_context *ctx)
     shash_add(&nbctx->lsp_to_ls_map, lsp_name, ls);
 }
 
+static void
+nbctl_pre_lsp_del(struct ctl_context *ctx)
+{
+    nbctl_pre_context(ctx);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_ports);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_name);
+}
+
 /* Removes logical switch port 'lsp' from the logical switch 'ls'. */
 static void
 remove_lsp(struct ctl_context *ctx,
@@ -1568,6 +1229,15 @@ nbctl_lsp_del(struct ctl_context *ctx)
 }
 
 static void
+nbctl_pre_lsp_list(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_ports);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_name);
+}
+
+static void
 nbctl_lsp_list(struct ctl_context *ctx)
 {
     const char *id = ctx->argv[1];
@@ -1597,6 +1267,13 @@ nbctl_lsp_list(struct ctl_context *ctx)
 }
 
 static void
+nbctl_pre_lsp_get_parent(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_parent_name);
+}
+
+static void
 nbctl_lsp_get_parent(struct ctl_context *ctx)
 {
     const struct nbrec_logical_switch_port *lsp = NULL;
@@ -1612,6 +1289,13 @@ nbctl_lsp_get_parent(struct ctl_context *ctx)
 }
 
 static void
+nbctl_pre_lsp_get_tag(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_tag);
+}
+
+static void
 nbctl_lsp_get_tag(struct ctl_context *ctx)
 {
     const struct nbrec_logical_switch_port *lsp = NULL;
@@ -1624,6 +1308,19 @@ nbctl_lsp_get_tag(struct ctl_context *ctx)
     if (lsp->n_tag > 0) {
         ds_put_format(&ctx->output, "%"PRId64"\n", lsp->tag[0]);
     }
+}
+
+static void
+nbctl_pre_lsp_set_addresses(struct ctl_context *ctx)
+{
+    nbctl_pre_context(ctx);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_ports);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_addresses);
+    ovsdb_idl_add_column(ctx->idl,
+                         &nbrec_logical_switch_port_col_dynamic_addresses);
 }
 
 static char *
@@ -1752,6 +1449,13 @@ nbctl_lsp_set_addresses(struct ctl_context *ctx)
 }
 
 static void
+nbctl_pre_lsp_get_addresses(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_addresses);
+}
+
+static void
 nbctl_lsp_get_addresses(struct ctl_context *ctx)
 {
     const char *id = ctx->argv[1];
@@ -1775,6 +1479,14 @@ nbctl_lsp_get_addresses(struct ctl_context *ctx)
         ds_put_format(&ctx->output, "%s\n", mac);
     }
     svec_destroy(&addresses);
+}
+
+static void
+nbctl_pre_lsp_port_security(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_name);
+    ovsdb_idl_add_column(ctx->idl,
+                         &nbrec_logical_switch_port_col_port_security);
 }
 
 static void
@@ -1818,6 +1530,13 @@ nbctl_lsp_get_port_security(struct ctl_context *ctx)
 }
 
 static void
+nbctl_pre_lsp_get_up(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_up);
+}
+
+static void
 nbctl_lsp_get_up(struct ctl_context *ctx)
 {
     const char *id = ctx->argv[1];
@@ -1830,6 +1549,13 @@ nbctl_lsp_get_up(struct ctl_context *ctx)
     }
     ds_put_format(&ctx->output,
                   "%s\n", (lsp->up && *lsp->up) ? "up" : "down");
+}
+
+static void
+nbctl_pre_lsp_enabled(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_enabled);
 }
 
 static char * OVS_WARN_UNUSED_RESULT
@@ -1885,6 +1611,13 @@ nbctl_lsp_get_enabled(struct ctl_context *ctx)
 }
 
 static void
+nbctl_pre_lsp_type(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_type);
+}
+
+static void
 nbctl_lsp_set_type(struct ctl_context *ctx)
 {
     const char *id = ctx->argv[1];
@@ -1917,6 +1650,13 @@ nbctl_lsp_get_type(struct ctl_context *ctx)
         return;
     }
     ds_put_format(&ctx->output, "%s\n", lsp->type);
+}
+
+static void
+nbctl_pre_lsp_options(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_options);
 }
 
 static void
@@ -1965,6 +1705,16 @@ nbctl_lsp_get_options(struct ctl_context *ctx)
 }
 
 static void
+nbctl_pre_lsp_dhcpv4_options(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_name);
+    ovsdb_idl_add_column(ctx->idl,
+                         &nbrec_logical_switch_port_col_dhcpv4_options);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_dhcp_options_col_cidr);
+}
+
+static void
 nbctl_lsp_set_dhcpv4_options(struct ctl_context *ctx)
 {
     const char *id = ctx->argv[1];
@@ -1996,6 +1746,16 @@ nbctl_lsp_set_dhcpv4_options(struct ctl_context *ctx)
         }
     }
     nbrec_logical_switch_port_set_dhcpv4_options(lsp, dhcp_opt);
+}
+
+static void
+nbctl_pre_lsp_dhcpv6_options(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_name);
+    ovsdb_idl_add_column(ctx->idl,
+                         &nbrec_logical_switch_port_col_dhcpv6_options);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_dhcp_options_col_cidr);
 }
 
 static void
@@ -2066,6 +1826,15 @@ nbctl_lsp_get_dhcpv6_options(struct ctl_context *ctx)
                       UUID_ARGS(&lsp->dhcpv6_options->header_.uuid),
                       lsp->dhcpv6_options->cidr);
     }
+}
+
+static void
+nbctl_pre_lsp_get_ls(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_ports);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_name);
 }
 
 static void
@@ -2276,6 +2045,32 @@ parse_priority(const char *arg, int64_t *priority_p)
 }
 
 static void
+nbctl_pre_acl(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_port_group_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_port_group_col_acls);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_acls);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_acl_col_direction);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_acl_col_priority);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_acl_col_match);
+}
+
+static void
+nbctl_pre_acl_list(struct ctl_context *ctx)
+{
+    nbctl_pre_acl(ctx);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_acl_col_action);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_acl_col_log);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_acl_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_acl_col_severity);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_acl_col_meter);
+}
+
+static void
 nbctl_acl_add(struct ctl_context *ctx)
 {
     const struct nbrec_logical_switch *ls = NULL;
@@ -2303,9 +2098,11 @@ nbctl_acl_add(struct ctl_context *ctx)
 
     /* Validate action. */
     if (strcmp(action, "allow") && strcmp(action, "allow-related")
-        && strcmp(action, "drop") && strcmp(action, "reject")) {
+        && strcmp(action, "allow-stateless") && strcmp(action, "drop")
+        && strcmp(action, "reject")) {
         ctl_error(ctx, "%s: action must be one of \"allow\", "
-                  "\"allow-related\", \"drop\", and \"reject\"", action);
+                  "\"allow-related\", \"allow-stateless\", \"drop\", "
+                  "and \"reject\"", action);
         return;
     }
 
@@ -2439,6 +2236,19 @@ nbctl_acl_del(struct ctl_context *ctx)
 }
 
 static void
+nbctl_pre_qos_list(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_qos_rules);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_qos_col_direction);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_qos_col_priority);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_qos_col_match);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_qos_col_bandwidth);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_qos_col_action);
+}
+
+static void
 nbctl_qos_list(struct ctl_context *ctx)
 {
     const struct nbrec_logical_switch *ls;
@@ -2485,6 +2295,17 @@ nbctl_qos_list(struct ctl_context *ctx)
     }
 
     free(qos_rules);
+}
+
+static void
+nbctl_pre_qos_add(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_qos_rules);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_qos_col_direction);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_qos_col_priority);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_qos_col_match);
 }
 
 static void
@@ -2586,6 +2407,17 @@ nbctl_qos_add(struct ctl_context *ctx)
 
     /* Insert the qos rule the logical switch. */
     nbrec_logical_switch_update_qos_rules_addvalue(ls, qos);
+}
+
+static void
+nbctl_pre_qos_del(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_qos_rules);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_qos_col_direction);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_qos_col_priority);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_qos_col_match);
 }
 
 static void
@@ -2691,6 +2523,19 @@ meter_cmp(const void *meter1_, const void *meter2_)
 }
 
 static void
+nbctl_pre_meter_list(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_meter_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_meter_col_fair);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_meter_col_bands);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_meter_col_unit);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_meter_band_col_action);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_meter_band_col_rate);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_meter_band_col_burst_size);
+}
+
+static void
 nbctl_meter_list(struct ctl_context *ctx)
 {
     const struct nbrec_meter **meters = NULL;
@@ -2736,6 +2581,12 @@ nbctl_meter_list(struct ctl_context *ctx)
     }
 
     free(meters);
+}
+
+static void
+nbctl_pre_meter_add(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_meter_col_name);
 }
 
 static void
@@ -2804,6 +2655,12 @@ nbctl_meter_add(struct ctl_context *ctx)
 }
 
 static void
+nbctl_pre_meter_del(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_meter_col_name);
+}
+
+static void
 nbctl_meter_del(struct ctl_context *ctx)
 {
     const struct nbrec_meter *meter, *next;
@@ -2825,6 +2682,14 @@ nbctl_meter_del(struct ctl_context *ctx)
         nbrec_meter_delete(meter);
         return;
     }
+}
+
+static void
+nbctl_pre_lb_add(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_load_balancer_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_load_balancer_col_protocol);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_load_balancer_col_vips);
 }
 
 static void
@@ -2972,6 +2837,13 @@ out:
 }
 
 static void
+nbctl_pre_lb_del(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_load_balancer_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_load_balancer_col_vips);
+}
+
+static void
 nbctl_lb_del(struct ctl_context *ctx)
 {
     const char *id = ctx->argv[1];
@@ -3009,6 +2881,14 @@ nbctl_lb_del(struct ctl_context *ctx)
         return;
     }
     nbrec_load_balancer_delete(lb);
+}
+
+static void
+nbctl_pre_lb_list(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_load_balancer_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_load_balancer_col_protocol);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_load_balancer_col_vips);
 }
 
 static void
@@ -3114,6 +2994,15 @@ nbctl_lb_list(struct ctl_context *ctx)
 }
 
 static void
+nbctl_pre_lr_lb_add(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_load_balancer);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_load_balancer_col_name);
+}
+
+static void
 nbctl_lr_lb_add(struct ctl_context *ctx)
 {
     const struct nbrec_logical_router *lr = NULL;
@@ -3147,6 +3036,15 @@ nbctl_lr_lb_add(struct ctl_context *ctx)
 
     /* Insert the load balancer into the logical router. */
     nbrec_logical_router_update_load_balancer_addvalue(lr, new_lb);
+}
+
+static void
+nbctl_pre_lr_lb_del(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_load_balancer);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_load_balancer_col_name);
 }
 
 static void
@@ -3193,6 +3091,17 @@ nbctl_lr_lb_del(struct ctl_context *ctx)
 }
 
 static void
+nbctl_pre_lr_lb_list(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_load_balancer);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_load_balancer_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_load_balancer_col_protocol);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_load_balancer_col_vips);
+}
+
+static void
 nbctl_lr_lb_list(struct ctl_context *ctx)
 {
     const char *lr_name = ctx->argv[1];
@@ -3218,6 +3127,15 @@ nbctl_lr_lb_list(struct ctl_context *ctx)
 
     lb_info_print(ctx, &lbs, vip_width);
     smap_destroy(&lbs);
+}
+
+static void
+nbctl_pre_ls_lb_add(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_load_balancer);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_load_balancer_col_name);
 }
 
 static void
@@ -3254,6 +3172,15 @@ nbctl_ls_lb_add(struct ctl_context *ctx)
 
     /* Insert the load balancer into the logical switch. */
     nbrec_logical_switch_update_load_balancer_addvalue(ls, new_lb);
+}
+
+static void
+nbctl_pre_ls_lb_del(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_load_balancer);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_load_balancer_col_name);
 }
 
 static void
@@ -3300,6 +3227,17 @@ nbctl_ls_lb_del(struct ctl_context *ctx)
 }
 
 static void
+nbctl_pre_ls_lb_list(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_load_balancer);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_load_balancer_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_load_balancer_col_protocol);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_load_balancer_col_vips);
+}
+
+static void
 nbctl_ls_lb_list(struct ctl_context *ctx)
 {
     const char *ls_name = ctx->argv[1];
@@ -3325,6 +3263,12 @@ nbctl_ls_lb_list(struct ctl_context *ctx)
 
     lb_info_print(ctx, &lbs, vip_width);
     smap_destroy(&lbs);
+}
+
+static void
+nbctl_pre_lr_add(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_name);
 }
 
 static void
@@ -3370,6 +3314,14 @@ nbctl_lr_add(struct ctl_context *ctx)
 }
 
 static void
+nbctl_pre_lr_del(struct ctl_context *ctx)
+{
+    nbctl_pre_context(ctx);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_name);
+}
+
+static void
 nbctl_lr_del(struct ctl_context *ctx)
 {
     bool must_exist = !shash_find(&ctx->options, "--if-exists");
@@ -3392,6 +3344,12 @@ nbctl_lr_del(struct ctl_context *ctx)
     }
 
     nbrec_logical_router_delete(lr);
+}
+
+static void
+nbctl_pre_lr_list(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_name);
 }
 
 static void
@@ -3470,6 +3428,12 @@ nbctl_dhcp_options_create(struct ctl_context *ctx)
 }
 
 static void
+nbctl_pre_dhcp_options_options(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_dhcp_options_col_options);
+}
+
+static void
 nbctl_dhcp_options_set_options(struct ctl_context *ctx)
 {
     const struct nbrec_dhcp_options *dhcp_opts;
@@ -3511,6 +3475,12 @@ nbctl_dhcp_options_get_options(struct ctl_context *ctx)
 }
 
 static void
+nbctl_pre_dhcp_options_del(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_table(ctx->idl, &nbrec_table_dhcp_options);
+}
+
+static void
 nbctl_dhcp_options_del(struct ctl_context *ctx)
 {
     bool must_exist = !shash_find(&ctx->options, "--if-exists");
@@ -3527,6 +3497,12 @@ nbctl_dhcp_options_del(struct ctl_context *ctx)
     }
 
     nbrec_dhcp_options_delete(dhcp_opts);
+}
+
+static void
+nbctl_pre_dhcp_options_list(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_dhcp_options_col_cidr);
 }
 
 static void
@@ -3628,6 +3604,16 @@ normalize_addr_str(const char *orig_addr)
         ret = normalize_ipv6_addr_str(orig_addr);
     }
     return ret;
+}
+
+static void
+nbctl_pre_lr_policy_add(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_policies);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_policy_col_priority);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_policy_col_match);
 }
 
 static void
@@ -3771,6 +3757,16 @@ nbctl_lr_policy_add(struct ctl_context *ctx)
 }
 
 static void
+nbctl_pre_lr_policy_del(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_policies);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_policy_col_priority);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_policy_col_match);
+}
+
+static void
 nbctl_lr_policy_del(struct ctl_context *ctx)
 {
     const struct nbrec_logical_router *lr;
@@ -3865,11 +3861,15 @@ static void
 print_routing_policy(const struct nbrec_logical_router_policy *policy,
                      struct ds *s)
 {
-    if (policy->nexthop != NULL) {
-        char *next_hop = normalize_prefix_str(policy->nexthop);
-        ds_put_format(s, "%10"PRId64" %50s %15s %25s", policy->priority,
-                      policy->match, policy->action, next_hop);
-        free(next_hop);
+    if (policy->n_nexthops) {
+        ds_put_format(s, "%10"PRId64" %50s %15s", policy->priority,
+                      policy->match, policy->action);
+        for (int i = 0; i < policy->n_nexthops; i++) {
+            char *next_hop = normalize_prefix_str(policy->nexthops[i]);
+            char *fmt = i ? ", %s" : " %25s";
+            ds_put_format(s, fmt, next_hop);
+            free(next_hop);
+        }
     } else {
         ds_put_format(s, "%10"PRId64" %50s %15s", policy->priority,
                       policy->match, policy->action);
@@ -3885,6 +3885,19 @@ print_routing_policy(const struct nbrec_logical_router_policy *policy,
     }
 
     ds_put_char(s, '\n');
+}
+
+static void
+nbctl_pre_lr_policy_list(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_policies);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_policy_col_priority);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_policy_col_match);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_policy_col_nexthops);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_policy_col_action);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_policy_col_options);
 }
 
 static void
@@ -3956,8 +3969,29 @@ nbctl_lr_get_route(const struct nbrec_logical_router *lr, char *prefix,
     }
     return NULL;
 }
-
 
+static void
+nbctl_pre_lr_route_add(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_static_routes);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_bfd_col_dst_ip);
+
+    ovsdb_idl_add_column(ctx->idl,
+                         &nbrec_logical_router_static_route_col_ip_prefix);
+    ovsdb_idl_add_column(ctx->idl,
+                         &nbrec_logical_router_static_route_col_nexthop);
+    ovsdb_idl_add_column(ctx->idl,
+                         &nbrec_logical_router_static_route_col_output_port);
+    ovsdb_idl_add_column(ctx->idl,
+                         &nbrec_logical_router_static_route_col_policy);
+    ovsdb_idl_add_column(ctx->idl,
+                         &nbrec_logical_router_static_route_col_bfd);
+    ovsdb_idl_add_column(ctx->idl,
+                         &nbrec_logical_router_static_route_col_options);
+}
+
 static void
 nbctl_lr_route_add(struct ctl_context *ctx)
 {
@@ -3971,6 +4005,7 @@ nbctl_lr_route_add(struct ctl_context *ctx)
 
     const char *policy = shash_find_data(&ctx->options, "--policy");
     bool is_src_route = false;
+
     if (policy) {
         if (!strcmp(policy, "src-ip")) {
             is_src_route = true;
@@ -3991,13 +4026,18 @@ nbctl_lr_route_add(struct ctl_context *ctx)
         return;
     }
 
-    next_hop = v6_prefix
-        ? normalize_ipv6_addr_str(ctx->argv[3])
-        : normalize_ipv4_addr_str(ctx->argv[3]);
-    if (!next_hop) {
-        ctl_error(ctx, "bad %s nexthop argument: %s",
-                  v6_prefix ? "IPv6" : "IPv4", ctx->argv[3]);
-        goto cleanup;
+    bool is_discard_route = !strcmp(ctx->argv[3], "discard");
+    if (is_discard_route) {
+        next_hop = xasprintf("discard");
+    } else {
+        next_hop = v6_prefix
+            ? normalize_ipv6_addr_str(ctx->argv[3])
+            : normalize_ipv4_addr_str(ctx->argv[3]);
+        if (!next_hop) {
+            ctl_error(ctx, "bad %s nexthop argument: %s",
+                      v6_prefix ? "IPv6" : "IPv4", ctx->argv[3]);
+            goto cleanup;
+        }
     }
 
     struct shash_node *bfd = shash_find(&ctx->options, "--bfd");
@@ -4030,6 +4070,25 @@ nbctl_lr_route_add(struct ctl_context *ctx)
                 ecmp_symmetric_reply;
     struct nbrec_logical_router_static_route *route =
         nbctl_lr_get_route(lr, prefix, next_hop, is_src_route, ecmp);
+
+    /* Validations for nexthop = "discard" */
+    if (is_discard_route) {
+        if (ecmp) {
+            ctl_error(ctx, "ecmp is not valid for discard routes.");
+            goto cleanup;
+        }
+        if (bfd) {
+            ctl_error(ctx, "bfd dst_ip cannot be discard.");
+            goto cleanup;
+        }
+        if (ctx->argc == 5) {
+            if (is_discard_route) {
+                ctl_error(ctx, "outport is not valid for discard routes.");
+                goto cleanup;
+            }
+        }
+    }
+
     if (!ecmp) {
         if (route) {
             if (!may_exist) {
@@ -4067,7 +4126,16 @@ nbctl_lr_route_add(struct ctl_context *ctx)
             goto cleanup;
         }
     } else if (route) {
-        ctl_error(ctx, "duplicate nexthop for the same ECMP route");
+        if (!may_exist) {
+            ctl_error(ctx, "duplicate nexthop for the same ECMP route");
+        }
+        goto cleanup;
+    }
+
+    struct nbrec_logical_router_static_route *discard_route =
+        nbctl_lr_get_route(lr, prefix, "discard", is_src_route, true);
+    if (discard_route) {
+        ctl_error(ctx, "discard nexthop for the same ECMP route exists.");
         goto cleanup;
     }
 
@@ -4108,6 +4176,23 @@ cleanup:
 }
 
 static void
+nbctl_pre_lr_route_del(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_static_routes);
+
+    ovsdb_idl_add_column(ctx->idl,
+                         &nbrec_logical_router_static_route_col_policy);
+    ovsdb_idl_add_column(ctx->idl,
+                         &nbrec_logical_router_static_route_col_ip_prefix);
+    ovsdb_idl_add_column(ctx->idl,
+                         &nbrec_logical_router_static_route_col_nexthop);
+    ovsdb_idl_add_column(ctx->idl,
+                         &nbrec_logical_router_static_route_col_output_port);
+
+}
+
+static void
 nbctl_lr_route_del(struct ctl_context *ctx)
 {
     const struct nbrec_logical_router *lr;
@@ -4145,10 +4230,14 @@ nbctl_lr_route_del(struct ctl_context *ctx)
 
     char *nexthop = NULL;
     if (ctx->argc >= 4) {
-        nexthop = normalize_prefix_str(ctx->argv[3]);
-        if (!nexthop) {
-            ctl_error(ctx, "bad nexthop argument: %s", ctx->argv[3]);
-            return;
+        if (!strcmp(ctx->argv[3], "discard")) {
+            nexthop = xasprintf("discard");
+        } else {
+            nexthop = normalize_prefix_str(ctx->argv[3]);
+            if (!nexthop) {
+                ctl_error(ctx, "bad nexthop argument: %s", ctx->argv[3]);
+                return;
+            }
         }
     }
 
@@ -4189,8 +4278,9 @@ nbctl_lr_route_del(struct ctl_context *ctx)
 
         /* Compare nexthop, if specified. */
         if (nexthop) {
-            char *rt_nexthop =
-                normalize_prefix_str(lr->static_routes[i]->nexthop);
+            char *rt_nexthop = !strcmp(lr->static_routes[i]->nexthop, "discard")
+                ? xasprintf("discard")
+                : normalize_prefix_str(lr->static_routes[i]->nexthop);
             if (!rt_nexthop) {
                 /* Ignore existing nexthop we couldn't parse. */
                 continue;
@@ -4282,6 +4372,22 @@ is_valid_port_range(const char *port_range)
 done:
     free(tokstr);
     return ret;
+}
+
+static void
+nbctl_pre_lr_nat_add(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_nat);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_name);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_nat_col_external_ip);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_nat_col_logical_ip);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_nat_col_type);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_nat_col_logical_port);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_nat_col_external_mac);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_nat_col_options);
 }
 
 static void
@@ -4503,6 +4609,17 @@ cleanup:
 }
 
 static void
+nbctl_pre_lr_nat_del(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_nat);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_nat_col_type);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_nat_col_logical_ip);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_nat_col_external_ip);
+}
+
+static void
 nbctl_lr_nat_del(struct ctl_context *ctx)
 {
     const struct nbrec_logical_router *lr = NULL;
@@ -4576,6 +4693,20 @@ cleanup:
 }
 
 static void
+nbctl_pre_lr_nat_list(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_nat);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_nat_col_type);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_nat_col_external_ip);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_nat_col_external_port_range);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_nat_col_logical_ip);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_nat_col_external_mac);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_nat_col_logical_port);
+}
+
+static void
 nbctl_lr_nat_list(struct ctl_context *ctx)
 {
     const struct nbrec_logical_router *lr;
@@ -4616,6 +4747,21 @@ nbctl_lr_nat_list(struct ctl_context *ctx)
         free(nodes);
     }
     smap_destroy(&lr_nats);
+}
+
+static void
+nbctl_pre_lr_nat_set_ext_ips(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_nat);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_nat_col_logical_ip);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_nat_col_external_ip);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_nat_col_type);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_nat_col_exempted_ext_ips);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_nat_col_allowed_ext_ips);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_address_set_col_name);
 }
 
 static void
@@ -4788,6 +4934,17 @@ gc_by_name_or_uuid(struct ctl_context *ctx, const char *id, bool must_exist,
 }
 
 static void
+nbctl_pre_lrp_set_gateway_chassis(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_port_col_name);
+    ovsdb_idl_add_column(ctx->idl,
+                         &nbrec_logical_router_port_col_gateway_chassis);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_gateway_chassis_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_gateway_chassis_col_priority);
+}
+
+static void
 nbctl_lrp_set_gateway_chassis(struct ctl_context *ctx)
 {
     char *gc_name;
@@ -4837,6 +4994,16 @@ nbctl_lrp_set_gateway_chassis(struct ctl_context *ctx)
     /* Insert the logical gateway chassis into the logical router port. */
     nbrec_logical_router_port_update_gateway_chassis_addvalue(lrp, gc);
     free(gc_name);
+}
+
+static void
+nbctl_pre_lrp_del_gateway_chassis(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_port_col_name);
+    ovsdb_idl_add_column(ctx->idl,
+                         &nbrec_logical_router_port_col_gateway_chassis);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_gateway_chassis_col_chassis_name);
 }
 
 /* Removes logical router port 'lrp->gateway_chassis[idx]'. */
@@ -4890,6 +5057,17 @@ nbctl_lrp_del_gateway_chassis(struct ctl_context *ctx)
               chassis_name, ctx->argv[1]);
 }
 
+static void
+nbctl_pre_lrp_get_gateway_chassis(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_port_col_name);
+    ovsdb_idl_add_column(ctx->idl,
+                         &nbrec_logical_router_port_col_gateway_chassis);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_gateway_chassis_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_gateway_chassis_col_priority);
+}
+
 /* Print a list of gateway chassis. */
 static void
 nbctl_lrp_get_gateway_chassis(struct ctl_context *ctx)
@@ -4930,6 +5108,20 @@ lrp_network_sset(const char **networks, int n_networks)
         sset_add_and_free(network_set, norm);
     }
     return network_set;
+}
+
+static void
+nbctl_pre_lrp_add(struct ctl_context *ctx)
+{
+    nbctl_pre_context(ctx);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_ports);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_port_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_port_col_networks);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_port_col_mac);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_port_col_peer);
 }
 
 static void
@@ -5114,6 +5306,16 @@ remove_lrp(struct ctl_context *ctx,
 }
 
 static void
+nbctl_pre_lrp_del(struct ctl_context *ctx)
+{
+    nbctl_pre_context(ctx);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_port_col_name);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_ports);
+}
+
+static void
 nbctl_lrp_del(struct ctl_context *ctx)
 {
     bool must_exist = !shash_find(&ctx->options, "--if-exists");
@@ -5137,6 +5339,15 @@ nbctl_lrp_del(struct ctl_context *ctx)
         return;
     }
     remove_lrp(ctx, lr, lrp);
+}
+
+static void
+nbctl_pre_lrp_list(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_ports);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_port_col_name);
 }
 
 /* Print a list of logical router ports. */
@@ -5167,6 +5378,13 @@ nbctl_lrp_list(struct ctl_context *ctx)
     }
     smap_destroy(&lrps);
     free(nodes);
+}
+
+static void
+nbctl_pre_lrp_enabled(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_port_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_port_col_enabled);
 }
 
 /* Set the logical router port admin-enabled state. */
@@ -5214,6 +5432,13 @@ nbctl_lrp_get_enabled(struct ctl_context *ctx)
     ds_put_format(&ctx->output, "%s\n",
                   !lrp->enabled ||
                   *lrp->enabled ? "enabled" : "disabled");
+}
+
+static void
+nbctl_pre_lrp_redirect_type(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_port_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_port_col_options);
 }
 
 /* Set the logical router port redirect type. */
@@ -5324,6 +5549,20 @@ fwd_group_to_logical_switch(struct ctl_context *ctx,
 }
 
 static void
+nbctl_pre_fwd_group_add(struct ctl_context *ctx)
+{
+    nbctl_pre_context(ctx);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_forwarding_group_col_name);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_name);
+    ovsdb_idl_add_column(ctx->idl,
+                         &nbrec_logical_switch_col_forwarding_groups);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_name);
+}
+
+static void
 nbctl_fwd_group_add(struct ctl_context *ctx)
 {
     if (ctx->argc <= 5) {
@@ -5412,6 +5651,21 @@ nbctl_fwd_group_add(struct ctl_context *ctx)
 }
 
 static void
+nbctl_pre_fwd_group_del(struct ctl_context *ctx)
+{
+    nbctl_pre_context(ctx);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_forwarding_group_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_forwarding_group_col_child_port);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_name);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_name);
+    ovsdb_idl_add_column(ctx->idl,
+                         &nbrec_logical_switch_col_forwarding_groups);
+}
+
+static void
 nbctl_fwd_group_del(struct ctl_context *ctx)
 {
     const char *id = ctx->argv[1];
@@ -5436,6 +5690,21 @@ nbctl_fwd_group_del(struct ctl_context *ctx)
             return;
         }
     }
+}
+
+static void
+nbctl_pre_fwd_group_list(struct ctl_context *ctx)
+{
+    nbctl_pre_context(ctx);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_col_name);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_name);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_forwarding_group_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_forwarding_group_col_child_port);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_forwarding_group_col_vip);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_forwarding_group_col_vmac);
 }
 
 static void
@@ -5578,7 +5847,9 @@ print_route(const struct nbrec_logical_router_static_route *route,
 {
 
     char *prefix = normalize_prefix_str(route->ip_prefix);
-    char *next_hop = normalize_prefix_str(route->nexthop);
+    char *next_hop = !strcmp(route->nexthop, "discard")
+        ? xasprintf("discard")
+        : normalize_prefix_str(route->nexthop);
     ds_put_format(s, "%25s %25s", prefix, next_hop);
     free(prefix);
     free(next_hop);
@@ -5610,6 +5881,28 @@ print_route(const struct nbrec_logical_router_static_route *route,
     }
 
     ds_put_char(s, '\n');
+}
+
+static void
+nbctl_pre_lr_route_list(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_col_static_routes);
+
+    ovsdb_idl_add_column(ctx->idl,
+                         &nbrec_logical_router_static_route_col_policy);
+    ovsdb_idl_add_column(ctx->idl,
+                         &nbrec_logical_router_static_route_col_ip_prefix);
+    ovsdb_idl_add_column(ctx->idl,
+                         &nbrec_logical_router_static_route_col_nexthop);
+    ovsdb_idl_add_column(ctx->idl,
+                         &nbrec_logical_router_static_route_col_output_port);
+    ovsdb_idl_add_column(ctx->idl,
+                         &nbrec_logical_router_static_route_col_external_ids);
+    ovsdb_idl_add_column(ctx->idl,
+                         &nbrec_logical_router_static_route_col_options);
+    ovsdb_idl_add_column(ctx->idl,
+                         &nbrec_logical_router_static_route_col_bfd);
 }
 
 static void
@@ -5927,6 +6220,12 @@ out:
 }
 
 static void
+cmd_pre_pg_add(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_name);
+}
+
+static void
 cmd_pg_add(struct ctl_context *ctx)
 {
     const struct nbrec_port_group *pg;
@@ -5936,6 +6235,15 @@ cmd_pg_add(struct ctl_context *ctx)
     if (ctx->argc > 2) {
         ctx->error = set_ports_on_pg(ctx, pg, ctx->argv + 2, ctx->argc - 2);
     }
+}
+
+static void
+cmd_pre_pg_set_ports(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_name);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_port_group_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_port_group_col_ports);
 }
 
 static void
@@ -5951,6 +6259,12 @@ cmd_pg_set_ports(struct ctl_context *ctx)
     }
 
     ctx->error = set_ports_on_pg(ctx, pg, ctx->argv + 2, ctx->argc - 2);
+}
+
+static void
+cmd_pre_pg_del(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_port_group_col_name);
 }
 
 static void
@@ -6008,6 +6322,12 @@ cmd_ha_ch_grp_add(struct ctl_context *ctx)
 }
 
 static void
+pre_ha_ch_grp_del(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_ha_chassis_group_col_name);
+}
+
+static void
 cmd_ha_ch_grp_del(struct ctl_context *ctx)
 {
     const char *name_or_id = ctx->argv[1];
@@ -6018,6 +6338,16 @@ cmd_ha_ch_grp_del(struct ctl_context *ctx)
     if (ha_ch_grp) {
         nbrec_ha_chassis_group_delete(ha_ch_grp);
     }
+}
+
+static void
+pre_ha_ch_grp_list(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_ha_chassis_group_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_ha_chassis_group_col_ha_chassis);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_ha_chassis_col_chassis_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_ha_chassis_col_priority);
 }
 
 static void
@@ -6039,6 +6369,16 @@ cmd_ha_ch_grp_list(struct ctl_context *ctx)
         }
         ds_put_cstr(&ctx->output, "\n");
     }
+}
+
+static void
+pre_ha_ch_grp_add_chassis(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_ha_chassis_group_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_ha_chassis_group_col_ha_chassis);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_ha_chassis_col_chassis_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_ha_chassis_col_priority);
 }
 
 static void
@@ -6080,6 +6420,15 @@ cmd_ha_ch_grp_add_chassis(struct ctl_context *ctx)
 }
 
 static void
+pre_ha_ch_grp_remove_chassis(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_ha_chassis_group_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_ha_chassis_group_col_ha_chassis);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_ha_chassis_col_chassis_name);
+}
+
+static void
 cmd_ha_ch_grp_remove_chassis(struct ctl_context *ctx)
 {
     const struct nbrec_ha_chassis_group *ha_ch_grp =
@@ -6106,6 +6455,16 @@ cmd_ha_ch_grp_remove_chassis(struct ctl_context *ctx)
 
     nbrec_ha_chassis_group_update_ha_chassis_delvalue(ha_ch_grp, ha_chassis);
     nbrec_ha_chassis_delete(ha_chassis);
+}
+
+static void
+pre_ha_ch_grp_set_chassis_prio(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_ha_chassis_group_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_ha_chassis_group_col_ha_chassis);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_ha_chassis_col_chassis_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_ha_chassis_col_priority);
 }
 
 static void
@@ -6204,470 +6563,198 @@ static const struct ctl_table_class tables[NBREC_N_TABLES] = {
     = {&nbrec_connection_col_target, NULL, NULL},
 };
 
-static char *
-run_prerequisites(struct ctl_command *commands, size_t n_commands,
-                  struct ovsdb_idl *idl)
-{
-    ovsdb_idl_add_table(idl, &nbrec_table_nb_global);
-    if (wait_type == NBCTL_WAIT_SB) {
-        ovsdb_idl_add_column(idl, &nbrec_nb_global_col_sb_cfg);
-        ovsdb_idl_add_column(idl, &nbrec_nb_global_col_sb_cfg_timestamp);
-    } else if (wait_type == NBCTL_WAIT_HV) {
-        ovsdb_idl_add_column(idl, &nbrec_nb_global_col_hv_cfg);
-        ovsdb_idl_add_column(idl, &nbrec_nb_global_col_hv_cfg_timestamp);
-    }
-
-    for (struct ctl_command *c = commands; c < &commands[n_commands]; c++) {
-        if (c->syntax->prerequisites) {
-            struct ctl_context ctx;
-
-            ds_init(&c->output);
-            c->table = NULL;
-
-            ctl_context_init(&ctx, c, idl, NULL, NULL, NULL);
-            (c->syntax->prerequisites)(&ctx);
-            if (ctx.error) {
-                char *error = xstrdup(ctx.error);
-                ctl_context_done(&ctx, c);
-                return error;
-            }
-            ctl_context_done(&ctx, c);
-
-            ovs_assert(!c->output.string);
-            ovs_assert(!c->table);
-        }
-    }
-
-    return NULL;
-}
-
-static void
-oneline_format(struct ds *lines, struct ds *s)
-{
-    size_t j;
-
-    ds_chomp(lines, '\n');
-    for (j = 0; j < lines->length; j++) {
-        int ch = lines->string[j];
-        switch (ch) {
-        case '\n':
-            ds_put_cstr(s, "\\n");
-            break;
-
-        case '\\':
-            ds_put_cstr(s, "\\\\");
-            break;
-
-        default:
-            ds_put_char(s, ch);
-        }
-    }
-    ds_put_char(s, '\n');
-}
-
-static void
-oneline_print(struct ds *lines)
-{
-    struct ds s = DS_EMPTY_INITIALIZER;
-    oneline_format(lines, &s);
-    fputs(ds_cstr(&s), stdout);
-    ds_destroy(&s);
-}
-
-static char *
-do_nbctl(const char *args, struct ctl_command *commands, size_t n_commands,
-         struct ovsdb_idl *idl, const struct timer *wait_timeout, bool *retry)
-{
-    struct ovsdb_idl_txn *txn;
-    enum ovsdb_idl_txn_status status;
-    struct ovsdb_symbol_table *symtab;
-    struct nbctl_context ctx;
-    struct ctl_command *c;
-    struct shash_node *node;
-    int64_t next_cfg = 0;
-    char *error = NULL;
-    int64_t start_time = 0;
-
-    ovs_assert(retry);
-
-    txn = the_idl_txn = ovsdb_idl_txn_create(idl);
-    if (dry_run) {
-        ovsdb_idl_txn_set_dry_run(txn);
-    }
-
-    ovsdb_idl_txn_add_comment(txn, "ovs-nbctl: %s", args);
-
-    const struct nbrec_nb_global *nb = nbrec_nb_global_first(idl);
-    if (!nb) {
-        /* XXX add verification that table is empty */
-        nb = nbrec_nb_global_insert(txn);
-    }
-
-    /* Deal with potential overflows. */
-    if (nb->nb_cfg == LLONG_MAX) {
-        nbrec_nb_global_set_nb_cfg(nb, 0);
-    }
-
-    if (wait_type != NBCTL_WAIT_NONE) {
-        ovsdb_idl_txn_increment(txn, &nb->header_, &nbrec_nb_global_col_nb_cfg,
-                                force_wait);
-    }
-
-    symtab = ovsdb_symbol_table_create();
-    for (c = commands; c < &commands[n_commands]; c++) {
-        ds_init(&c->output);
-        c->table = NULL;
-    }
-    nbctl_context_init(&ctx);
-    ctl_context_init(&ctx.base, NULL, idl, txn, symtab, NULL);
-    for (c = commands; c < &commands[n_commands]; c++) {
-        ctl_context_init_command(&ctx.base, c);
-        if (c->syntax->run) {
-            (c->syntax->run)(&ctx.base);
-        }
-        if (ctx.base.error) {
-            error = xstrdup(ctx.base.error);
-            ctl_context_done(&ctx.base, c);
-            goto out_error;
-        }
-        ctl_context_done_command(&ctx.base, c);
-
-        if (ctx.base.try_again) {
-            ctl_context_done(&ctx.base, NULL);
-            goto try_again;
-        }
-    }
-    ctl_context_done(&ctx.base, NULL);
-
-    SHASH_FOR_EACH (node, &symtab->sh) {
-        struct ovsdb_symbol *symbol = node->data;
-        if (!symbol->created) {
-            error = xasprintf("row id \"%s\" is referenced but never created "
-                              "(e.g. with \"-- --id=%s create ...\")",
-                              node->name, node->name);
-            goto out_error;
-        }
-        if (!symbol->strong_ref) {
-            if (!symbol->weak_ref) {
-                VLOG_WARN("row id \"%s\" was created but no reference to it "
-                          "was inserted, so it will not actually appear in "
-                          "the database", node->name);
-            } else {
-                VLOG_WARN("row id \"%s\" was created but only a weak "
-                          "reference to it was inserted, so it will not "
-                          "actually appear in the database", node->name);
-            }
-        }
-    }
-
-    start_time = time_wall_msec();
-    status = ovsdb_idl_txn_commit_block(txn);
-    if (wait_type != NBCTL_WAIT_NONE && status == TXN_SUCCESS) {
-        next_cfg = ovsdb_idl_txn_get_increment_new_value(txn);
-    }
-    if (status == TXN_UNCHANGED || status == TXN_SUCCESS) {
-        for (c = commands; c < &commands[n_commands]; c++) {
-            if (c->syntax->postprocess) {
-                ctl_context_init(&ctx.base, c, idl, txn, symtab, NULL);
-                (c->syntax->postprocess)(&ctx.base);
-                if (ctx.base.error) {
-                    error = xstrdup(ctx.base.error);
-                    ctl_context_done(&ctx.base, c);
-                    goto out_error;
-                }
-                ctl_context_done(&ctx.base, c);
-            }
-        }
-    }
-
-    switch (status) {
-    case TXN_UNCOMMITTED:
-    case TXN_INCOMPLETE:
-        OVS_NOT_REACHED();
-
-    case TXN_ABORTED:
-        /* Should not happen--we never call ovsdb_idl_txn_abort(). */
-        error = xstrdup("transaction aborted");
-        goto out_error;
-
-    case TXN_UNCHANGED:
-    case TXN_SUCCESS:
-        break;
-
-    case TXN_TRY_AGAIN:
-        goto try_again;
-
-    case TXN_ERROR:
-        error = xasprintf("transaction error: %s",
-                          ovsdb_idl_txn_get_error(txn));
-        goto out_error;
-
-    case TXN_NOT_LOCKED:
-        /* Should not happen--we never call ovsdb_idl_set_lock(). */
-        error = xstrdup("database not locked");
-        goto out_error;
-
-    default:
-        OVS_NOT_REACHED();
-    }
-
-    for (c = commands; c < &commands[n_commands]; c++) {
-        struct ds *ds = &c->output;
-
-        if (c->table) {
-            table_print(c->table, &table_style);
-        } else if (oneline) {
-            oneline_print(ds);
-        } else {
-            fputs(ds_cstr(ds), stdout);
-        }
-    }
-
-    if (wait_type != NBCTL_WAIT_NONE && status != TXN_UNCHANGED) {
-        ovsdb_idl_enable_reconnect(idl);
-        for (;;) {
-            ovsdb_idl_run(idl);
-            NBREC_NB_GLOBAL_FOR_EACH (nb, idl) {
-                int64_t cur_cfg = (wait_type == NBCTL_WAIT_SB
-                                   ? nb->sb_cfg
-                                   : MIN(nb->sb_cfg, nb->hv_cfg));
-                if (cur_cfg >= next_cfg) {
-                    if (print_wait_time) {
-                        printf("Time spent on processing nb_cfg %"PRId64":\n",
-                               next_cfg);
-                        printf("\tovn-northd delay before processing:"
-                               "\t%"PRId64"ms\n",
-                               nb->nb_cfg_timestamp - start_time);
-                        printf("\tovn-northd completion:"
-                               "\t\t\t%"PRId64"ms\n",
-                               nb->sb_cfg_timestamp - start_time);
-                        if (wait_type == NBCTL_WAIT_HV) {
-                            printf("\tovn-controller(s) completion:"
-                                   "\t\t%"PRId64"ms\n",
-                                   nb->hv_cfg_timestamp - start_time);
-                        }
-                    }
-                    goto done;
-                }
-            }
-            ovsdb_idl_wait(idl);
-            if (wait_timeout) {
-                timer_wait(wait_timeout);
-            }
-            poll_block();
-            if (wait_timeout && timer_expired(wait_timeout)) {
-                error = xstrdup("timeout expired");
-                goto out_error;
-            }
-        }
-    done: ;
-    }
-
-    nbctl_context_destroy(&ctx);
-    ovsdb_symbol_table_destroy(symtab);
-    ovsdb_idl_txn_destroy(txn);
-    the_idl_txn = NULL;
-
-    *retry = false;
-    return NULL;
-
-try_again:
-    /* Our transaction needs to be rerun, or a prerequisite was not met.  Free
-     * resources and return so that the caller can try again. */
-    *retry = true;
-
-out_error:
-    ovsdb_idl_txn_abort(txn);
-    ovsdb_idl_txn_destroy(txn);
-    the_idl_txn = NULL;
-
-    nbctl_context_destroy(&ctx);
-    ovsdb_symbol_table_destroy(symtab);
-    return error;
-}
-
-/* Frees the current transaction and the underlying IDL and then calls
- * exit(status).
- *
- * Freeing the transaction and the IDL is not strictly necessary, but it makes
- * for a clean memory leak report from valgrind in the normal case.  That makes
- * it easier to notice real memory leaks. */
-static void
-nbctl_exit(int status)
-{
-    if (the_idl_txn) {
-        ovsdb_idl_txn_abort(the_idl_txn);
-        ovsdb_idl_txn_destroy(the_idl_txn);
-    }
-    ovsdb_idl_destroy(the_idl);
-    exit(status);
-}
-
 static const struct ctl_command_syntax nbctl_commands[] = {
     { "init", 0, 0, "", NULL, nbctl_init, NULL, "", RW },
     { "sync", 0, 0, "", nbctl_pre_sync, nbctl_sync, NULL, "", RO },
-    { "show", 0, 1, "[SWITCH]", NULL, nbctl_show, NULL, "", RO },
+    { "show", 0, 1, "[SWITCH]", nbctl_pre_show, nbctl_show, NULL, "", RO },
 
     /* logical switch commands. */
-    { "ls-add", 0, 1, "[SWITCH]", NULL, nbctl_ls_add, NULL,
+    { "ls-add", 0, 1, "[SWITCH]", nbctl_pre_ls_add, nbctl_ls_add, NULL,
       "--may-exist,--add-duplicate", RW },
-    { "ls-del", 1, 1, "SWITCH", NULL, nbctl_ls_del, NULL, "--if-exists", RW },
-    { "ls-list", 0, 0, "", NULL, nbctl_ls_list, NULL, "", RO },
+    { "ls-del", 1, 1, "SWITCH", nbctl_pre_ls_del, nbctl_ls_del, NULL, "--if-exists", RW },
+    { "ls-list", 0, 0, "", nbctl_pre_ls_list, nbctl_ls_list, NULL, "", RO },
 
     /* acl commands. */
     { "acl-add", 5, 6, "{SWITCH | PORTGROUP} DIRECTION PRIORITY MATCH ACTION",
-      NULL, nbctl_acl_add, NULL,
+      nbctl_pre_acl, nbctl_acl_add, NULL,
       "--log,--may-exist,--type=,--name=,--severity=,--meter=", RW },
     { "acl-del", 1, 4, "{SWITCH | PORTGROUP} [DIRECTION [PRIORITY MATCH]]",
-      NULL, nbctl_acl_del, NULL, "--type=", RW },
+      nbctl_pre_acl, nbctl_acl_del, NULL, "--type=", RW },
     { "acl-list", 1, 1, "{SWITCH | PORTGROUP}",
-      NULL, nbctl_acl_list, NULL, "--type=", RO },
+      nbctl_pre_acl_list, nbctl_acl_list, NULL, "--type=", RO },
 
     /* qos commands. */
     { "qos-add", 5, 7,
       "SWITCH DIRECTION PRIORITY MATCH [rate=RATE [burst=BURST]] [dscp=DSCP]",
-      NULL, nbctl_qos_add, NULL, "--may-exist", RW },
-    { "qos-del", 1, 4, "SWITCH [{DIRECTION | UUID} [PRIORITY MATCH]]", NULL,
-      nbctl_qos_del, NULL, "", RW },
-    { "qos-list", 1, 1, "SWITCH", NULL, nbctl_qos_list, NULL, "", RO },
+      nbctl_pre_qos_add, nbctl_qos_add, NULL, "--may-exist", RW },
+    { "qos-del", 1, 4, "SWITCH [{DIRECTION | UUID} [PRIORITY MATCH]]",
+      nbctl_pre_qos_del, nbctl_qos_del, NULL, "", RW },
+    { "qos-list", 1, 1, "SWITCH", nbctl_pre_qos_list, nbctl_qos_list,
+      NULL, "", RO },
 
     /* meter commands. */
-    { "meter-add", 4, 5, "NAME ACTION RATE UNIT [BURST]", NULL,
+    { "meter-add", 4, 5, "NAME ACTION RATE UNIT [BURST]", nbctl_pre_meter_add,
       nbctl_meter_add, NULL, "--fair", RW },
-    { "meter-del", 0, 1, "[NAME]", NULL, nbctl_meter_del, NULL, "", RW },
-    { "meter-list", 0, 0, "", NULL, nbctl_meter_list, NULL, "", RO },
+    { "meter-del", 0, 1, "[NAME]", nbctl_pre_meter_del, nbctl_meter_del,
+      NULL, "", RW },
+    { "meter-list", 0, 0, "", nbctl_pre_meter_list, nbctl_meter_list,
+      NULL, "", RO },
 
     /* logical switch port commands. */
-    { "lsp-add", 2, 4, "SWITCH PORT [PARENT] [TAG]", NULL, nbctl_lsp_add,
-      NULL, "--may-exist", RW },
-    { "lsp-del", 1, 1, "PORT", NULL, nbctl_lsp_del, NULL, "--if-exists", RW },
-    { "lsp-list", 1, 1, "SWITCH", NULL, nbctl_lsp_list, NULL, "", RO },
-    { "lsp-get-parent", 1, 1, "PORT", NULL, nbctl_lsp_get_parent, NULL,
-      "", RO },
-    { "lsp-get-tag", 1, 1, "PORT", NULL, nbctl_lsp_get_tag, NULL, "", RO },
-    { "lsp-set-addresses", 1, INT_MAX, "PORT [ADDRESS]...", NULL,
-      nbctl_lsp_set_addresses, NULL, "", RW },
-    { "lsp-get-addresses", 1, 1, "PORT", NULL, nbctl_lsp_get_addresses, NULL,
-      "", RO },
-    { "lsp-set-port-security", 0, INT_MAX, "PORT [ADDRS]...", NULL,
-      nbctl_lsp_set_port_security, NULL, "", RW },
-    { "lsp-get-port-security", 1, 1, "PORT", NULL,
-      nbctl_lsp_get_port_security, NULL, "", RO },
-    { "lsp-get-up", 1, 1, "PORT", NULL, nbctl_lsp_get_up, NULL, "", RO },
-    { "lsp-set-enabled", 2, 2, "PORT STATE", NULL, nbctl_lsp_set_enabled,
+    { "lsp-add", 2, 4, "SWITCH PORT [PARENT] [TAG]",
+      nbctl_pre_lsp_add, nbctl_lsp_add, NULL, "--may-exist", RW },
+    { "lsp-del", 1, 1, "PORT", nbctl_pre_lsp_del, nbctl_lsp_del,
+      NULL, "--if-exists", RW },
+    { "lsp-list", 1, 1, "SWITCH", nbctl_pre_lsp_list, nbctl_lsp_list,
+      NULL, "", RO },
+    { "lsp-get-parent", 1, 1, "PORT", nbctl_pre_lsp_get_parent,
+      nbctl_lsp_get_parent, NULL, "", RO },
+    { "lsp-get-tag", 1, 1, "PORT", nbctl_pre_lsp_get_tag, nbctl_lsp_get_tag,
+      NULL, "", RO },
+    { "lsp-set-addresses", 1, INT_MAX, "PORT [ADDRESS]...",
+      nbctl_pre_lsp_set_addresses, nbctl_lsp_set_addresses, NULL, "", RW },
+    { "lsp-get-addresses", 1, 1, "PORT", nbctl_pre_lsp_get_addresses,
+      nbctl_lsp_get_addresses, NULL, "", RO },
+    { "lsp-set-port-security", 0, INT_MAX, "PORT [ADDRS]...",
+      nbctl_pre_lsp_port_security, nbctl_lsp_set_port_security,
       NULL, "", RW },
-    { "lsp-get-enabled", 1, 1, "PORT", NULL, nbctl_lsp_get_enabled, NULL,
-      "", RO },
-    { "lsp-set-type", 2, 2, "PORT TYPE", NULL, nbctl_lsp_set_type, NULL,
-      "", RW },
-    { "lsp-get-type", 1, 1, "PORT", NULL, nbctl_lsp_get_type, NULL, "", RO },
-    { "lsp-set-options", 1, INT_MAX, "PORT KEY=VALUE [KEY=VALUE]...", NULL,
-      nbctl_lsp_set_options, NULL, "", RW },
-    { "lsp-get-options", 1, 1, "PORT", NULL, nbctl_lsp_get_options, NULL,
-      "", RO },
-    { "lsp-set-dhcpv4-options", 1, 2, "PORT [DHCP_OPT_UUID]", NULL,
-      nbctl_lsp_set_dhcpv4_options, NULL, "", RW },
-    { "lsp-get-dhcpv4-options", 1, 1, "PORT", NULL,
+    { "lsp-get-port-security", 1, 1, "PORT", nbctl_pre_lsp_port_security,
+      nbctl_lsp_get_port_security, NULL, "", RO },
+    { "lsp-get-up", 1, 1, "PORT", nbctl_pre_lsp_get_up, nbctl_lsp_get_up,
+      NULL, "", RO },
+    { "lsp-set-enabled", 2, 2, "PORT STATE", nbctl_pre_lsp_enabled,
+      nbctl_lsp_set_enabled, NULL, "", RW },
+    { "lsp-get-enabled", 1, 1, "PORT", nbctl_pre_lsp_enabled,
+      nbctl_lsp_get_enabled, NULL, "", RO },
+    { "lsp-set-type", 2, 2, "PORT TYPE", nbctl_pre_lsp_type,
+      nbctl_lsp_set_type, NULL, "", RW },
+    { "lsp-get-type", 1, 1, "PORT", nbctl_pre_lsp_type,
+      nbctl_lsp_get_type, NULL, "", RO },
+    { "lsp-set-options", 1, INT_MAX, "PORT KEY=VALUE [KEY=VALUE]...",
+      nbctl_pre_lsp_options, nbctl_lsp_set_options, NULL, "", RW },
+    { "lsp-get-options", 1, 1, "PORT", nbctl_pre_lsp_options,
+      nbctl_lsp_get_options, NULL, "", RO },
+    { "lsp-set-dhcpv4-options", 1, 2, "PORT [DHCP_OPT_UUID]",
+      nbctl_pre_lsp_dhcpv4_options, nbctl_lsp_set_dhcpv4_options,
+      NULL, "", RW },
+    { "lsp-get-dhcpv4-options", 1, 1, "PORT", nbctl_pre_lsp_dhcpv4_options,
       nbctl_lsp_get_dhcpv4_options, NULL, "", RO },
-    { "lsp-set-dhcpv6-options", 1, 2, "PORT [DHCP_OPT_UUID]", NULL,
-      nbctl_lsp_set_dhcpv6_options, NULL, "", RW },
-    { "lsp-get-dhcpv6-options", 1, 1, "PORT", NULL,
+    { "lsp-set-dhcpv6-options", 1, 2, "PORT [DHCP_OPT_UUID]",
+      nbctl_pre_lsp_dhcpv6_options, nbctl_lsp_set_dhcpv6_options,
+      NULL, "", RW },
+    { "lsp-get-dhcpv6-options", 1, 1, "PORT", nbctl_pre_lsp_dhcpv6_options,
       nbctl_lsp_get_dhcpv6_options, NULL, "", RO },
-    { "lsp-get-ls", 1, 1, "PORT", NULL, nbctl_lsp_get_ls, NULL, "", RO },
+    { "lsp-get-ls", 1, 1, "PORT", nbctl_pre_lsp_get_ls, nbctl_lsp_get_ls,
+      NULL, "", RO },
 
     /* forwarding group commands. */
     { "fwd-group-add", 4, INT_MAX, "SWITCH GROUP VIP VMAC PORT...",
-      NULL, nbctl_fwd_group_add, NULL, "--liveness", RW },
-    { "fwd-group-del", 1, 1, "GROUP", NULL, nbctl_fwd_group_del, NULL,
-      "--if-exists", RW },
-    { "fwd-group-list", 0, 1, "[GROUP]", NULL, nbctl_fwd_group_list, NULL,
-      "", RO },
+      nbctl_pre_fwd_group_add, nbctl_fwd_group_add, NULL, "--liveness", RW },
+    { "fwd-group-del", 1, 1, "GROUP", nbctl_pre_fwd_group_del,
+      nbctl_fwd_group_del, NULL, "--if-exists", RW },
+    { "fwd-group-list", 0, 1, "[GROUP]", nbctl_pre_fwd_group_list,
+      nbctl_fwd_group_list, NULL, "", RO },
 
     /* logical router commands. */
-    { "lr-add", 0, 1, "[ROUTER]", NULL, nbctl_lr_add, NULL,
+    { "lr-add", 0, 1, "[ROUTER]", nbctl_pre_lr_add, nbctl_lr_add, NULL,
       "--may-exist,--add-duplicate", RW },
-    { "lr-del", 1, 1, "ROUTER", NULL, nbctl_lr_del, NULL, "--if-exists", RW },
-    { "lr-list", 0, 0, "", NULL, nbctl_lr_list, NULL, "", RO },
+    { "lr-del", 1, 1, "ROUTER", nbctl_pre_lr_del, nbctl_lr_del,
+      NULL, "--if-exists", RW },
+    { "lr-list", 0, 0, "", nbctl_pre_lr_list, nbctl_lr_list, NULL, "", RO },
 
     /* logical router port commands. */
     { "lrp-add", 4, INT_MAX,
       "ROUTER PORT MAC NETWORK... [COLUMN[:KEY]=VALUE]...",
-      NULL, nbctl_lrp_add, NULL, "--may-exist", RW },
+      nbctl_pre_lrp_add, nbctl_lrp_add, NULL, "--may-exist", RW },
     { "lrp-set-gateway-chassis", 2, 3,
       "PORT CHASSIS [PRIORITY]",
-      NULL, nbctl_lrp_set_gateway_chassis, NULL, "--may-exist", RW },
-    { "lrp-del-gateway-chassis", 2, 2, "PORT CHASSIS", NULL,
-      nbctl_lrp_del_gateway_chassis, NULL, "", RW },
-    { "lrp-get-gateway-chassis", 1, 1, "PORT", NULL,
-      nbctl_lrp_get_gateway_chassis, NULL, "", RO },
-    { "lrp-del", 1, 1, "PORT", NULL, nbctl_lrp_del, NULL, "--if-exists", RW },
-    { "lrp-list", 1, 1, "ROUTER", NULL, nbctl_lrp_list, NULL, "", RO },
-    { "lrp-set-enabled", 2, 2, "PORT STATE", NULL, nbctl_lrp_set_enabled,
+      nbctl_pre_lrp_set_gateway_chassis, nbctl_lrp_set_gateway_chassis,
+      NULL, "--may-exist", RW },
+    { "lrp-del-gateway-chassis", 2, 2, "PORT CHASSIS",
+      nbctl_pre_lrp_del_gateway_chassis, nbctl_lrp_del_gateway_chassis,
       NULL, "", RW },
-    { "lrp-get-enabled", 1, 1, "PORT", NULL, nbctl_lrp_get_enabled,
+    { "lrp-get-gateway-chassis", 1, 1, "PORT",
+      nbctl_pre_lrp_get_gateway_chassis, nbctl_lrp_get_gateway_chassis,
       NULL, "", RO },
-    { "lrp-set-redirect-type", 2, 2, "PORT TYPE", NULL,
-      nbctl_lrp_set_redirect_type, NULL, "", RW },
-    { "lrp-get-redirect-type", 1, 1, "PORT", NULL, nbctl_lrp_get_redirect_type,
+    { "lrp-del", 1, 1, "PORT", nbctl_pre_lrp_del, nbctl_lrp_del,
+      NULL, "--if-exists", RW },
+    { "lrp-list", 1, 1, "ROUTER", nbctl_pre_lrp_list, nbctl_lrp_list,
       NULL, "", RO },
+    { "lrp-set-enabled", 2, 2, "PORT STATE", nbctl_pre_lrp_enabled,
+      nbctl_lrp_set_enabled, NULL, "", RW },
+    { "lrp-get-enabled", 1, 1, "PORT", nbctl_pre_lrp_enabled,
+      nbctl_lrp_get_enabled, NULL, "", RO },
+    { "lrp-set-redirect-type", 2, 2, "PORT TYPE",
+      nbctl_pre_lrp_redirect_type, nbctl_lrp_set_redirect_type,
+      NULL, "", RW },
+    { "lrp-get-redirect-type", 1, 1, "PORT", nbctl_pre_lrp_redirect_type,
+      nbctl_lrp_get_redirect_type, NULL, "", RO },
 
     /* logical router route commands. */
-    { "lr-route-add", 3, 4, "ROUTER PREFIX NEXTHOP [PORT]", NULL,
-      nbctl_lr_route_add, NULL, "--may-exist,--ecmp,--ecmp-symmetric-reply,"
-      "--policy=,--bfd?", RW },
-    { "lr-route-del", 1, 4, "ROUTER [PREFIX [NEXTHOP [PORT]]]", NULL,
-      nbctl_lr_route_del, NULL, "--if-exists,--policy=", RW },
-    { "lr-route-list", 1, 1, "ROUTER", NULL, nbctl_lr_route_list, NULL,
-      "", RO },
+    { "lr-route-add", 3, 4, "ROUTER PREFIX NEXTHOP [PORT]",
+      nbctl_pre_lr_route_add, nbctl_lr_route_add, NULL,
+      "--may-exist,--ecmp,--ecmp-symmetric-reply,--policy=,--bfd?", RW },
+    { "lr-route-del", 1, 4, "ROUTER [PREFIX [NEXTHOP [PORT]]]",
+      nbctl_pre_lr_route_del, nbctl_lr_route_del, NULL,
+      "--if-exists,--policy=", RW },
+    { "lr-route-list", 1, 1, "ROUTER", nbctl_pre_lr_route_list,
+      nbctl_lr_route_list, NULL, "", RO },
 
     /* Policy commands */
     { "lr-policy-add", 4, INT_MAX,
      "ROUTER PRIORITY MATCH ACTION [NEXTHOP] [OPTIONS - KEY=VALUE ...]",
-     NULL, nbctl_lr_policy_add, NULL, "--may-exist", RW },
-    { "lr-policy-del", 1, 3, "ROUTER [{PRIORITY | UUID} [MATCH]]", NULL,
-        nbctl_lr_policy_del, NULL, "--if-exists", RW },
-    { "lr-policy-list", 1, 1, "ROUTER", NULL, nbctl_lr_policy_list, NULL,
-       "", RO },
+     nbctl_pre_lr_policy_add, nbctl_lr_policy_add, NULL, "--may-exist", RW },
+    { "lr-policy-del", 1, 3, "ROUTER [{PRIORITY | UUID} [MATCH]]",
+      nbctl_pre_lr_policy_del, nbctl_lr_policy_del, NULL, "--if-exists", RW },
+    { "lr-policy-list", 1, 1, "ROUTER", nbctl_pre_lr_policy_list,
+      nbctl_lr_policy_list, NULL, "", RO },
 
     /* NAT commands. */
     { "lr-nat-add", 4, 7,
       "ROUTER TYPE EXTERNAL_IP LOGICAL_IP"
-      "[LOGICAL_PORT EXTERNAL_MAC] [EXTERNAL_PORT_RANGE]", NULL,
-      nbctl_lr_nat_add, NULL, "--may-exist,--stateless,--portrange", RW },
-    { "lr-nat-del", 1, 3, "ROUTER [TYPE [IP]]", NULL,
-        nbctl_lr_nat_del, NULL, "--if-exists", RW },
-    { "lr-nat-list", 1, 1, "ROUTER", NULL, nbctl_lr_nat_list, NULL, "", RO },
-    { "lr-nat-update-ext-ip", 4, 4, "ROUTER TYPE IP ADDRESS_SET", NULL,
-      nbctl_lr_nat_set_ext_ips, NULL, "--is-exempted", RW},
+      "[LOGICAL_PORT EXTERNAL_MAC] [EXTERNAL_PORT_RANGE]",
+      nbctl_pre_lr_nat_add, nbctl_lr_nat_add,
+      NULL, "--may-exist,--stateless,--portrange", RW },
+    { "lr-nat-del", 1, 3, "ROUTER [TYPE [IP]]",
+      nbctl_pre_lr_nat_del, nbctl_lr_nat_del, NULL, "--if-exists", RW },
+    { "lr-nat-list", 1, 1, "ROUTER", nbctl_pre_lr_nat_list,
+      nbctl_lr_nat_list, NULL, "", RO },
+    { "lr-nat-update-ext-ip", 4, 4, "ROUTER TYPE IP ADDRESS_SET",
+      nbctl_pre_lr_nat_set_ext_ips, nbctl_lr_nat_set_ext_ips,
+      NULL, "--is-exempted", RW},
     /* load balancer commands. */
-    { "lb-add", 3, 4, "LB VIP[:PORT] IP[:PORT]... [PROTOCOL]", NULL,
-      nbctl_lb_add, NULL, "--may-exist,--add-duplicate,--reject,--event", RW },
-    { "lb-del", 1, 2, "LB [VIP]", NULL, nbctl_lb_del, NULL,
+    { "lb-add", 3, 4, "LB VIP[:PORT] IP[:PORT]... [PROTOCOL]",
+      nbctl_pre_lb_add, nbctl_lb_add, NULL,
+      "--may-exist,--add-duplicate,--reject,--event", RW },
+    { "lb-del", 1, 2, "LB [VIP]", nbctl_pre_lb_del, nbctl_lb_del, NULL,
         "--if-exists", RW },
-    { "lb-list", 0, 1, "[LB]", NULL, nbctl_lb_list, NULL, "", RO },
-    { "lr-lb-add", 2, 2, "ROUTER LB", NULL, nbctl_lr_lb_add, NULL,
-        "--may-exist", RW },
-    { "lr-lb-del", 1, 2, "ROUTER [LB]", NULL, nbctl_lr_lb_del, NULL,
-        "--if-exists", RW },
-    { "lr-lb-list", 1, 1, "ROUTER", NULL, nbctl_lr_lb_list, NULL,
-        "", RO },
-    { "ls-lb-add", 2, 2, "SWITCH LB", NULL, nbctl_ls_lb_add, NULL,
-        "--may-exist", RW },
-    { "ls-lb-del", 1, 2, "SWITCH [LB]", NULL, nbctl_ls_lb_del, NULL,
-        "--if-exists", RW },
-    { "ls-lb-list", 1, 1, "SWITCH", NULL, nbctl_ls_lb_list, NULL,
-        "", RO },
+    { "lb-list", 0, 1, "[LB]", nbctl_pre_lb_list, nbctl_lb_list, NULL, "", RO },
+    { "lr-lb-add", 2, 2, "ROUTER LB", nbctl_pre_lr_lb_add,
+      nbctl_lr_lb_add, NULL, "--may-exist", RW },
+    { "lr-lb-del", 1, 2, "ROUTER [LB]", nbctl_pre_lr_lb_del,
+      nbctl_lr_lb_del, NULL, "--if-exists", RW },
+    { "lr-lb-list", 1, 1, "ROUTER", nbctl_pre_lr_lb_list,
+      nbctl_lr_lb_list, NULL, "", RO },
+    { "ls-lb-add", 2, 2, "SWITCH LB", nbctl_pre_ls_lb_add,
+      nbctl_ls_lb_add, NULL, "--may-exist", RW },
+    { "ls-lb-del", 1, 2, "SWITCH [LB]", nbctl_pre_ls_lb_del,
+      nbctl_ls_lb_del, NULL, "--if-exists", RW },
+    { "ls-lb-list", 1, 1, "SWITCH", nbctl_pre_ls_lb_list, nbctl_ls_lb_list,
+      NULL, "", RO },
 
     /* DHCP_Options commands */
-    {"dhcp-options-create", 1, INT_MAX, "CIDR [EXTERNAL:IDS]", NULL,
-     nbctl_dhcp_options_create, NULL, "", RW },
-    {"dhcp-options-del", 1, 1, "DHCP_OPT_UUID", NULL,
+    {"dhcp-options-create", 1, INT_MAX, "CIDR [EXTERNAL:IDS]",
+     NULL, nbctl_dhcp_options_create, NULL, "", RW },
+    {"dhcp-options-del", 1, 1, "DHCP_OPT_UUID", nbctl_pre_dhcp_options_del,
      nbctl_dhcp_options_del, NULL, "", RW},
-    {"dhcp-options-list", 0, 0, "", NULL, nbctl_dhcp_options_list, NULL, "", RO},
+    {"dhcp-options-list", 0, 0, "", nbctl_pre_dhcp_options_list,
+     nbctl_dhcp_options_list, NULL, "", RO},
     {"dhcp-options-set-options", 1, INT_MAX, "DHCP_OPT_UUID KEY=VALUE [KEY=VALUE]...",
-    NULL, nbctl_dhcp_options_set_options, NULL, "", RW },
-    {"dhcp-options-get-options", 1, 1, "DHCP_OPT_UUID", NULL,
-     nbctl_dhcp_options_get_options, NULL, "", RO },
+    nbctl_pre_dhcp_options_options, nbctl_dhcp_options_set_options,
+    NULL, "", RW },
+    {"dhcp-options-get-options", 1, 1, "DHCP_OPT_UUID",
+     nbctl_pre_dhcp_options_options, nbctl_dhcp_options_get_options,
+     NULL, "", RO },
 
     /* Connection commands. */
     {"get-connection", 0, 0, "", pre_connection, cmd_get_connection, NULL, "", RO},
@@ -6683,418 +6770,53 @@ static const struct ctl_command_syntax nbctl_commands[] = {
         pre_cmd_set_ssl, cmd_set_ssl, NULL, "--bootstrap", RW},
 
     /* Port Group Commands */
-    {"pg-add", 1, INT_MAX, "", NULL, cmd_pg_add, NULL, "", RW },
-    {"pg-set-ports", 2, INT_MAX, "", NULL, cmd_pg_set_ports, NULL, "", RW },
-    {"pg-del", 1, 1, "", NULL, cmd_pg_del, NULL, "", RW },
+    {"pg-add", 1, INT_MAX, "", cmd_pre_pg_add, cmd_pg_add, NULL, "", RW },
+    {"pg-set-ports", 2, INT_MAX, "", cmd_pre_pg_set_ports, cmd_pg_set_ports,
+     NULL, "", RW },
+    {"pg-del", 1, 1, "", cmd_pre_pg_del, cmd_pg_del, NULL, "", RW },
 
     /* HA chassis group commands. */
-    {"ha-chassis-group-add", 1, 1, "[CHASSIS GROUP]", NULL,
-      cmd_ha_ch_grp_add, NULL, "", RW },
-    {"ha-chassis-group-del", 1, 1, "[CHASSIS GROUP]", NULL,
-      cmd_ha_ch_grp_del, NULL, "", RW },
-    {"ha-chassis-group-list", 0, 0, "[CHASSIS GROUP]", NULL,
-      cmd_ha_ch_grp_list, NULL, "", RO },
-    {"ha-chassis-group-add-chassis", 3, 3, "[CHASSIS GROUP]", NULL,
-      cmd_ha_ch_grp_add_chassis, NULL, "", RW },
-    {"ha-chassis-group-remove-chassis", 2, 2, "[CHASSIS GROUP]", NULL,
-      cmd_ha_ch_grp_remove_chassis, NULL, "", RW },
-    {"ha-chassis-group-set-chassis-prio", 3, 3, "[CHASSIS GROUP]", NULL,
-      cmd_ha_ch_grp_set_chassis_prio, NULL, "", RW },
+    {"ha-chassis-group-add", 1, 1, "[CHASSIS GROUP]",
+     NULL, cmd_ha_ch_grp_add, NULL, "", RW },
+    {"ha-chassis-group-del", 1, 1, "[CHASSIS GROUP]",
+     pre_ha_ch_grp_del, cmd_ha_ch_grp_del, NULL, "", RW },
+    {"ha-chassis-group-list", 0, 0, "[CHASSIS GROUP]",
+     pre_ha_ch_grp_list, cmd_ha_ch_grp_list, NULL, "", RO },
+    {"ha-chassis-group-add-chassis", 3, 3, "[CHASSIS GROUP]",
+     pre_ha_ch_grp_add_chassis, cmd_ha_ch_grp_add_chassis, NULL, "", RW },
+    {"ha-chassis-group-remove-chassis", 2, 2, "[CHASSIS GROUP]",
+     pre_ha_ch_grp_remove_chassis, cmd_ha_ch_grp_remove_chassis, NULL, "", RW },
+    {"ha-chassis-group-set-chassis-prio", 3, 3, "[CHASSIS GROUP]",
+     pre_ha_ch_grp_set_chassis_prio, cmd_ha_ch_grp_set_chassis_prio, NULL,
+     "", RW },
 
     {NULL, 0, 0, NULL, NULL, NULL, NULL, "", RO},
 };
 
-/* Registers nbctl and common db commands. */
-static void
-nbctl_cmd_init(void)
+int
+main(int argc, char *argv[])
 {
-    ctl_init(&nbrec_idl_class, nbrec_table_classes, tables, NULL, nbctl_exit);
-    ctl_register_commands(nbctl_commands);
-}
-
-/* Server implementation. */
+    struct ovn_dbctl_options dbctl_options = {
+        .db_version = nbrec_get_db_version(),
+        .default_db = default_nb_db(),
+        .allow_wait = true,
 
-#undef ctl_fatal
+        .options_env_var_name = "OVN_NBCTL_OPTIONS",
+        .daemon_env_var_name = "OVN_NB_DAEMON",
 
-static const struct option *
-find_option_by_value(const struct option *options, int value)
-{
-    const struct option *o;
+        .idl_class = &nbrec_idl_class,
+        .tables = tables,
+        .cmd_show_table = NULL,
+        .commands = nbctl_commands,
 
-    for (o = options; o->name; o++) {
-        if (o->val == value) {
-            return o;
-        }
-    }
-    return NULL;
-}
+        .usage = nbctl_usage,
+        .add_base_prerequisites = nbctl_add_base_prerequisites,
+        .pre_execute = nbctl_pre_execute,
+        .post_execute = nbctl_post_execute,
 
-static char * OVS_WARN_UNUSED_RESULT
-server_parse_options(int argc, char *argv[], struct shash *local_options,
-                     int *n_options_p)
-{
-    static const struct option global_long_options[] = {
-        VLOG_LONG_OPTIONS,
-        MAIN_LOOP_LONG_OPTIONS,
-        TABLE_LONG_OPTIONS,
-        {NULL, 0, NULL, 0},
+        .ctx_create = nbctl_ctx_create,
+        .ctx_destroy = nbctl_ctx_destroy,
     };
-    const int n_global_long_options = ARRAY_SIZE(global_long_options) - 1;
-    char *short_options;
-    struct option *options;
-    char *error = NULL;
 
-    ovs_assert(n_options_p);
-
-    short_options = build_short_options(global_long_options, false);
-    options = append_command_options(global_long_options, OPT_LOCAL);
-
-    optind = 0;
-    opterr = 0;
-    for (;;) {
-        int idx;
-        int c;
-
-        c = getopt_long(argc, argv, short_options, options, &idx);
-        if (c == -1) {
-            break;
-        }
-
-        bool handled;
-        error = handle_main_loop_option(c, optarg, &handled);
-        if (error) {
-            goto out;
-        }
-        if (handled) {
-            continue;
-        }
-
-        switch (c) {
-        case OPT_LOCAL:
-            error = add_local_option(options[idx].name, optarg, local_options);
-            if (error) {
-                goto out;
-            }
-            break;
-
-        VLOG_OPTION_HANDLERS
-        TABLE_OPTION_HANDLERS(&table_style)
-
-        case '?':
-            if (find_option_by_value(options, optopt)) {
-                error = xasprintf("option '%s' doesn't allow an argument",
-                                  argv[optind-1]);
-            } else if (optopt) {
-                error = xasprintf("unrecognized option '%c'", optopt);
-            } else {
-                error = xasprintf("unrecognized option '%s'", argv[optind-1]);
-            }
-            goto out;
-            break;
-
-        case ':':
-            error = xasprintf("option '%s' requires an argument",
-                              argv[optind-1]);
-            goto out;
-            break;
-
-        case 0:
-            break;
-
-        default:
-            error = xasprintf("unhandled option '%c'", c);
-            goto out;
-            break;
-        }
-    }
-    *n_options_p = optind;
-
-out:
-    for (int i = n_global_long_options; options[i].name; i++) {
-        free(CONST_CAST(char *, options[i].name));
-    }
-    free(options);
-    free(short_options);
-
-    return error;
-}
-
-static void
-server_cmd_exit(struct unixctl_conn *conn, int argc OVS_UNUSED,
-                const char *argv[] OVS_UNUSED, void *exiting_)
-{
-    bool *exiting = exiting_;
-    *exiting = true;
-    unixctl_command_reply(conn, NULL);
-}
-
-static void
-server_cmd_run(struct unixctl_conn *conn, int argc, const char **argv_,
-               void *idl_)
-{
-    struct ovsdb_idl *idl = idl_;
-    struct ctl_command *commands = NULL;
-    struct shash local_options;
-    size_t n_commands = 0;
-    int n_options = 0;
-    char *error = NULL;
-
-    /* Copy args so that getopt() can permute them. Leave last entry NULL. */
-    char **argv = xcalloc(argc + 1, sizeof *argv);
-    for (int i = 0; i < argc; i++) {
-        argv[i] = xstrdup(argv_[i]);
-    }
-
-    /* Reset global state. */
-    oneline = false;
-    dry_run = false;
-    wait_type = NBCTL_WAIT_NONE;
-    force_wait = false;
-    timeout = 0;
-    table_style = table_style_default;
-
-    /* Parse commands & options. */
-    char *args = process_escape_args(argv);
-    shash_init(&local_options);
-    error = server_parse_options(argc, argv, &local_options, &n_options);
-    if (error) {
-        unixctl_command_reply_error(conn, error);
-        goto out;
-    }
-    error = ctl_parse_commands(argc - n_options, argv + n_options,
-                               &local_options, &commands, &n_commands);
-    if (error) {
-        unixctl_command_reply_error(conn, error);
-        goto out;
-    }
-    VLOG(ctl_might_write_to_db(commands, n_commands) ? VLL_INFO : VLL_DBG,
-         "Running command %s", args);
-
-    struct timer *wait_timeout = NULL;
-    struct timer wait_timeout_;
-    if (timeout) {
-        wait_timeout = &wait_timeout_;
-        timer_set_duration(wait_timeout, timeout * 1000);
-    }
-
-    error = run_prerequisites(commands, n_commands, idl);
-    if (error) {
-        unixctl_command_reply_error(conn, error);
-        goto out;
-    }
-    error = main_loop(args, commands, n_commands, idl, wait_timeout);
-    if (error) {
-        unixctl_command_reply_error(conn, error);
-        goto out;
-    }
-
-    struct ds output = DS_EMPTY_INITIALIZER;
-    table_format_reset();
-    for (struct ctl_command *c = commands; c < &commands[n_commands]; c++) {
-        if (c->table) {
-            table_format(c->table, &table_style, &output);
-        } else if (oneline) {
-            oneline_format(&c->output, &output);
-        } else {
-            ds_put_cstr(&output, ds_cstr_ro(&c->output));
-        }
-    }
-    unixctl_command_reply(conn, ds_cstr_ro(&output));
-    ds_destroy(&output);
-
-out:
-    free(error);
-
-    struct ctl_command *c;
-    for (c = commands; c < &commands[n_commands]; c++) {
-        ds_destroy(&c->output);
-        table_destroy(c->table);
-        free(c->table);
-        shash_destroy_free_data(&c->options);
-    }
-    free(commands);
-    shash_destroy_free_data(&local_options);
-    free(args);
-    for (int i = 0; i < argc; i++) {
-        free(argv[i]);
-    }
-    free(argv);
-}
-
-static void
-server_cmd_init(struct ovsdb_idl *idl, bool *exiting)
-{
-    unixctl_command_register("exit", "", 0, 0, server_cmd_exit, exiting);
-    unixctl_command_register("run", "", 0, INT_MAX, server_cmd_run, idl);
-}
-
-static void
-server_loop(struct ovsdb_idl *idl, int argc, char *argv[])
-{
-    struct unixctl_server *server = NULL;
-    bool exiting = false;
-
-    service_start(&argc, &argv);
-    daemonize_start(false);
-
-    char *abs_unixctl_path = get_abs_unix_ctl_path(unixctl_path);
-    int error = unixctl_server_create(abs_unixctl_path, &server);
-    free(abs_unixctl_path);
-
-    if (error) {
-        ctl_fatal("failed to create unixctl server (%s)",
-                  ovs_retval_to_string(error));
-    }
-    puts(unixctl_server_get_path(server));
-    fflush(stdout);
-    server_cmd_init(idl, &exiting);
-
-    for (;;) {
-        memory_run();
-        if (memory_should_report()) {
-            struct simap usage = SIMAP_INITIALIZER(&usage);
-
-            /* Nothing special to report yet. */
-            memory_report(&usage);
-            simap_destroy(&usage);
-        }
-
-        ovsdb_idl_run(idl);
-        if (!ovsdb_idl_is_alive(idl)) {
-            int retval = ovsdb_idl_get_last_error(idl);
-            ctl_fatal("%s: database connection failed (%s)",
-                      db, ovs_retval_to_string(retval));
-        }
-
-        if (ovsdb_idl_has_ever_connected(idl)) {
-            daemonize_complete();
-        }
-        unixctl_server_run(server);
-
-        if (exiting) {
-            break;
-        }
-
-        memory_wait();
-        ovsdb_idl_wait(idl);
-        unixctl_server_wait(server);
-        poll_block();
-    }
-
-    unixctl_server_destroy(server);
-}
-
-static void
-nbctl_client(const char *socket_name,
-             const struct ovs_cmdl_parsed_option *parsed_options, size_t n,
-             int argc, char *argv[])
-{
-    struct svec args = SVEC_EMPTY_INITIALIZER;
-
-    for (const struct ovs_cmdl_parsed_option *po = parsed_options;
-         po < &parsed_options[n]; po++) {
-        optarg = po->arg;
-        switch (po->o->val) {
-        case OPT_DB:
-            VLOG_WARN("not using ovn-nbctl daemon because of %s option",
-                      po->o->name);
-            svec_destroy(&args);
-            return;
-
-        case OPT_NO_SYSLOG:
-            vlog_set_levels(&this_module, VLF_SYSLOG, VLL_WARN);
-            break;
-
-        case 'h':
-            usage();
-            exit(EXIT_SUCCESS);
-
-        case OPT_COMMANDS:
-            ctl_print_commands();
-            /* fall through */
-
-        case OPT_OPTIONS:
-            ctl_print_options(get_all_options());
-            /* fall through */
-
-        case OPT_LEADER_ONLY:
-        case OPT_NO_LEADER_ONLY:
-        case OPT_SHUFFLE_REMOTES:
-        case OPT_NO_SHUFFLE_REMOTES:
-        case OPT_BOOTSTRAP_CA_CERT:
-        STREAM_SSL_CASES
-        OVN_DAEMON_OPTION_CASES
-            VLOG_INFO("using ovn-nbctl daemon, ignoring %s option",
-                      po->o->name);
-            break;
-
-        case 'u':
-            socket_name = optarg;
-            break;
-
-        case 'V':
-            ovs_print_version(0, 0);
-            printf("DB Schema %s\n", nbrec_get_db_version());
-            exit(EXIT_SUCCESS);
-
-        case 't':
-            if (!str_to_uint(po->arg, 10, &timeout) || !timeout) {
-                ctl_fatal("value %s on -t or --timeout is invalid", po->arg);
-            }
-            break;
-
-        VLOG_OPTION_HANDLERS
-
-        case OPT_LOCAL:
-        default:
-            if (po->arg) {
-                svec_add_nocopy(&args,
-                                xasprintf("--%s=%s", po->o->name, po->arg));
-            } else {
-                svec_add_nocopy(&args, xasprintf("--%s", po->o->name));
-            }
-            break;
-        }
-    }
-
-    ovs_assert(socket_name && socket_name[0]);
-
-    svec_add(&args, "--");
-    for (int i = optind; i < argc; i++) {
-        svec_add(&args, argv[i]);
-    }
-
-    ctl_timeout_setup(timeout);
-
-    struct jsonrpc *client;
-    int error = unixctl_client_create(socket_name, &client);
-    if (error) {
-        ctl_fatal("%s: could not connect to ovn-nb daemon (%s); "
-                  "unset OVN_NB_DAEMON to avoid using daemon",
-                  socket_name, ovs_strerror(error));
-    }
-
-    char *cmd_result;
-    char *cmd_error;
-    error = unixctl_client_transact(client, "run",
-                                    args.n, args.names,
-                                    &cmd_result, &cmd_error);
-    if (error) {
-        ctl_fatal("%s: transaction error (%s)",
-                  socket_name, ovs_strerror(error));
-    }
-    svec_destroy(&args);
-
-    int exit_status;
-    if (cmd_error) {
-        exit_status = EXIT_FAILURE;
-        fprintf(stderr, "%s: %s", program_name, cmd_error);
-    } else {
-        exit_status = EXIT_SUCCESS;
-        fputs(cmd_result, stdout);
-    }
-    free(cmd_result);
-    free(cmd_error);
-    jsonrpc_close(client);
-    exit(exit_status);
+    return ovn_dbctl_main(argc, argv, &dbctl_options);
 }

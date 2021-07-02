@@ -78,7 +78,8 @@ struct uuid;
 enum ref_type {
     REF_TYPE_ADDRSET,
     REF_TYPE_PORTGROUP,
-    REF_TYPE_PORTBINDING
+    REF_TYPE_PORTBINDING,
+    REF_TYPE_MC_GROUP
 };
 
 struct ref_lflow_node {
@@ -129,6 +130,7 @@ struct lflow_ctx_in {
     struct ovsdb_idl_index *sbrec_logical_flow_by_logical_datapath;
     struct ovsdb_idl_index *sbrec_logical_flow_by_logical_dp_group;
     struct ovsdb_idl_index *sbrec_port_binding_by_name;
+    const struct sbrec_port_binding_table *port_binding_table;
     const struct sbrec_dhcp_options_table *dhcp_options_table;
     const struct sbrec_dhcpv6_options_table *dhcpv6_options_table;
     const struct sbrec_datapath_binding_table *dp_binding_table;
@@ -143,7 +145,7 @@ struct lflow_ctx_in {
     const struct shash *addr_sets;
     const struct shash *port_groups;
     const struct sset *active_tunnels;
-    const struct sset *local_lport_ids;
+    const struct sset *related_lport_ids;
 };
 
 struct lflow_ctx_out {
@@ -179,4 +181,8 @@ bool lflow_add_flows_for_datapath(const struct sbrec_datapath_binding *,
 bool lflow_handle_flows_for_lport(const struct sbrec_port_binding *,
                                   struct lflow_ctx_in *,
                                   struct lflow_ctx_out *);
+bool lflow_handle_changed_mc_groups(struct lflow_ctx_in *,
+                                    struct lflow_ctx_out *);
+bool lflow_handle_changed_port_bindings(struct lflow_ctx_in *,
+                                        struct lflow_ctx_out *);
 #endif /* controller/lflow.h */

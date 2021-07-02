@@ -213,6 +213,19 @@
           The default value is <code>false</code>.
         </p>
       </column>
+      <column name="options" key="use_parallel_build">
+        <p>
+          If set to <code>true</code>, <code>ovn-northd</code> will attempt
+          to compute logical flows in parallel.
+        </p>
+        <p>
+          Parallel computation is enabled only if the system has 4 or more
+          cores/threads available to be used by ovn-northd.
+        </p>
+        <p>
+          The default value is <code>false</code>.
+        </p>
+      </column>
 
       <column name="options" key="ignore_lsp_down">
         <p>
@@ -224,6 +237,21 @@
           environments where this is not an issue, setting it to
           <code>true</code> can reduce the load and latency of the control
           plane. The default value is <code>false</code>.
+        </p>
+      </column>
+
+      <column name="options" key="use_ct_inv_match">
+        <p>
+          If set to false, <code>ovn-northd</code> will not use the
+          <code>ct.inv</code> field in any of the logical flow matches.
+          The default value is true.  If the NIC supports offloading
+          OVS datapath flows but doesn't support offloading ct_state
+          <code>inv</code> flag, then the datapath flows matching on this flag
+          (either <code>+inv</code> or <code>-inv</code>) will not be
+          offloaded.  CMS should consider setting <code>use_ct_inv_match</code>
+          to <code>false</code> in such cases.  This results in a side effect
+          of the invalid packets getting delivered to the destination VIF,
+          which otherwise would have been dropped by <code>OVN</code>.
         </p>
       </column>
 
@@ -562,7 +590,11 @@
     <group title="Other options">
       <column name="other_config" key="vlan-passthru"
           type='{"type": "boolean"}'>
-        Determines whether VLAN tagged incoming traffic should be allowed.
+        Determines whether VLAN tagged incoming traffic should be allowed. Note
+        that this may have security implications when enabled for a logical
+        switch with a tag=0 localnet port. If not properly isolated from other
+        localnet ports, fabric traffic that belongs to other tagged networks may
+        be passed through such a port.
       </column>
     </group>
 
@@ -816,6 +848,15 @@
             </dd>
           </dl>
         </column>
+
+        <column name="options" key="arp_proxy">
+          Optional. A list of IPv4 addresses that this
+          logical switch <code>router</code> port will reply to ARP requests.
+          Example: <code>169.254.239.254 169.254.239.2</code>. The
+          <ref column="options" key="router-port"/>'s logical router should
+          have a route to forward packets sent to configured proxy ARP IPs to
+          an appropriate destination.
+        </column>
       </group>
 
       <group title="Options for localnet ports">
@@ -830,6 +871,12 @@
           uses its local configuration to determine exactly how to connect to
           this locally accessible network, if at all.
         </column>
+
+        <column name="options" key="ethtype">
+          Optional. VLAN EtherType field value for encapsulating VLAN
+          headers. Supported values: 802.11q (default), 802.11ad.
+        </column>
+
       </group>
 
       <group title="Options for l2gateway ports">
@@ -890,6 +937,15 @@
         <column name="options" key="qos_burst">
           If set, indicates the maximum burst size for data sent from this
           interface, in bits.
+        </column>
+
+        <column name="options" key="hostname">
+          <p>
+            If set, indicates the DHCPv4 option "Hostname" (option code 12)
+            associated for this Logical Switch Port. If DHCPv4 is enabled for
+            this Logical Switch Port, hostname dhcp option will be included in
+            DHCP reply.
+          </p>
         </column>
       </group>
 
@@ -1653,6 +1709,12 @@
         exactly one IPv4 and/or one IPv6 address on it, separated by a space
         character.
       </column>
+
+      <column name="options" key="skip_snat">
+        If the load balancing rule is configured with <code>skip_snat</code>
+        option, the force_snat_for_lb option configured for the router
+        pipeline will not be applied for this load balancer.
+      </column>
     </group>
   </table>
 
@@ -1717,6 +1779,13 @@
         Return traffic from an <code>allow-related</code> flow is always
         allowed and cannot be changed through an ACL.
       </p>
+
+      <p>
+        <code>allow-stateless</code> flows always take precedence before
+        stateful ACLs, regardless of their priority. (Both
+        <code>allow</code> and <code>allow-related</code> ACLs can be
+        stateful.)
+      </p>
     </column>
 
     <column name="direction">
@@ -1762,7 +1831,20 @@
       <p>The action to take when the ACL rule matches:</p>
       <ul>
         <li>
-          <code>allow</code>: Forward the packet.
+          <code>allow-stateless</code>: Always forward the packet in stateless
+          manner, omitting connection tracking mechanism, regardless of other
+          rules defined for the switch.  May require defining additional rules
+          for inbound replies.  For example, if you define a rule to allow
+          outgoing TCP traffic directed to an IP address, then you probably
+          also want to define another rule to allow incoming TCP traffic coming
+          from this same IP address.
+        </li>
+
+        <li>
+          <code>allow</code>: Forward the packet. It will also send the
+          packets through connection tracking when
+          <code>allow-related</code> rules exist on the logical switch.
+          Otherwise, it's equivalent to <code>allow-stateless</code>.
         </li>
 
         <li>
@@ -2649,7 +2731,9 @@
     <column name="nexthop">
       <p>
         Nexthop IP address for this route.  Nexthop IP address should be the IP
-        address of a connected router port or the IP address of a logical port.
+        address of a connected router port or the IP address of a logical port
+        or can be set to <code>discard</code> for dropping packets which match
+        the given route.
       </p>
     </column>
 
@@ -2693,7 +2777,7 @@
       </column>
 
       <column name="options" key="ecmp_symmetric_reply">
-        It true, then new traffic that arrives over this route will have
+        If true, then new traffic that arrives over this route will have
         its reply traffic bypass ECMP route selection and will be sent out
         this route instead. Note that this option overrides any rules set
         in the <ref table="Logical_Router_policy" /> table. This option
@@ -3238,6 +3322,20 @@
           </p>
         </column>
 
+        <column name="options" key="hostname">
+          <p>
+            The DHCPv4 option code for this option is 12.
+            If set, indicates the DHCPv4 option "Hostname".
+            Alternatively, this option can be configured in
+            <ref column="options:hostname" table="Logical_Switch_Port"
+            db="OVN_NB"/> column in table <ref table="Logical_Switch_Port"/>.
+            If Hostname option value is set in both conflicting
+            <ref table="Logical_Switch_Port"/> and
+            <ref table="DHCP_Options"/> tables,
+            <ref table="Logical_Switch_Port"/> takes precedence.
+          </p>
+        </column>
+
         <column name="options" key="domain_name">
           <p>
             The DHCPv4 option code for this option is 15. This option
@@ -3616,7 +3714,13 @@
       Key-value pair of DNS records with <code>DNS query name</code> as the key
       and value as a string of IP address(es) separated by comma or space.
 
+      For PTR requests, the key-value pair can be
+      <code>Reverse IPv4 address.in-addr.arpa</code> and the value
+      <code>DNS domain name</code>.  For IPv6 addresses, the key
+      has to be <code>Reverse IPv6 address.ip6.arpa</code>.
+
       <p><b>Example: </b> "vm1.ovn.org" = "10.0.0.4 aef0::4"</p>
+      <p><b>Example: </b> "4.0.0.10.in-addr.arpa" = "vm1.ovn.org"</p>
     </column>
 
     <column name="external_ids">

@@ -139,9 +139,18 @@ get_unique_lport_key(uint64_t dp_tunnel_key, uint64_t lport_tunnel_key,
 }
 
 static inline void
+get_mc_group_key(const char *mg_name, int64_t dp_tunnel_key,
+                 struct ds *mg_key)
+{
+    ds_clear(mg_key);
+    ds_put_format(mg_key, "%"PRId64"_%s", dp_tunnel_key, mg_name);
+}
+
+static inline void
 get_sb_port_group_name(const char *nb_pg_name, int64_t dp_tunnel_key,
                        struct ds *sb_pg_name)
 {
+    ds_clear(sb_pg_name);
     ds_put_format(sb_pg_name, "%"PRId64"_%s", dp_tunnel_key, nb_pg_name);
 }
 

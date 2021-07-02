@@ -213,13 +213,36 @@ the default database directory, add options as shown here::
   ``yum install`` or ``rpm -ivh``) and .deb (e.g. via
   ``apt-get install`` or ``dpkg -i``) use the above configure options.
 
-To build with DDlog support, add ``--with-ddlog=<path to ddlog>/lib``
-to the ``configure`` command line.  Building with DDLog adds a few
-minutes to the build because the Rust compiler is slow.  To speed this
-up by about 2x, also add ``--enable-ddlog-fast-build``.  This disables
-some Rust compiler optimizations, making a much slower
-``ovn-northd-ddlog`` executable, so it should not be used for
-production builds or for profiling.
+Use ``--with-ddlog`` to build with DDlog support.  To build with
+DDlog, the build system needs to be able to find the ``ddlog`` and
+``ovsdb2ddlog`` binaries and the DDlog library directory (the
+directory that contains ``ddlog_std.dl``).  This option supports a
+few ways to do that:
+
+  * If binaries are in $PATH, use the library directory as argument,
+    e.g. ``--with-ddlog=$HOME/differential-datalog/lib``.  This is
+    suitable if DDlog was installed from source via ``stack install`` or
+    from (hypothetical) distribution packaging.
+
+    The DDlog documentation recommends pointing $DDLOG_HOME to the
+    DDlog source directory.  If you did this, so that $DDLOG_HOME/lib
+    is the library directory, you may use ``--with-ddlog`` without an
+    argument.
+
+  * If the binaries and libraries are in the ``bin`` and ``lib``
+    subdirectories of an installation directory, use the installation
+    directory as the argument.  This is suitable if DDlog was
+    installed from one of the binary tarballs published by the DDlog
+    developers.
+
+.. note::
+
+   Building with DDLog adds a few minutes to the build because the
+   Rust compiler is slow.  Add ``--enable-ddlog-fast-build`` to make
+   this about 2x faster.  This disables some Rust compiler
+   optimizations, making a much slower ``ovn-northd-ddlog``
+   executable, so it should not be used for production builds or for
+   profiling.
 
 By default, static libraries are built and linked against. If you want to use
 shared libraries instead::
@@ -371,7 +394,7 @@ Building
 3. Run ``make install`` to install the executables and manpages into the
    running system, by default under ``/usr/local``::
 
-       $ make install
+       $ sudo make install
 
 .. _general-starting:
 
@@ -422,23 +445,23 @@ Before starting ovn-northd you need to start OVN Northbound and Southbound
 ovsdb-servers. Before ovsdb-servers can be started,
 configure the Northbound and Southbound databases::
 
-       $ mkdir -p /usr/local/etc/ovn
-       $ ovsdb-tool create /usr/local/etc/ovn/ovnnb_db.db \
+       $ sudo mkdir -p /usr/local/etc/ovn
+       $ sudo ovsdb-tool create /usr/local/etc/ovn/ovnnb_db.db \
          ovn-nb.ovsschema
-       $ ovsdb-tool create /usr/local/etc/ovn/ovnsb_db.db \
+       $ sudo ovsdb-tool create /usr/local/etc/ovn/ovnsb_db.db \
          ovn-sb.ovsschema
 
 Configure ovsdb-servers to use databases created above, to listen on a Unix
 domain socket and to use the SSL configuration in the database::
 
-   $ mkdir -p /usr/local/var/run/ovn
-   $ ovsdb-server /usr/local/etc/ovn/ovnnb_db.db --remote=punix:/usr/local/var/run/ovn/ovnnb_db.sock \
+   $ sudo mkdir -p /usr/local/var/run/ovn
+   $ sudo ovsdb-server /usr/local/etc/ovn/ovnnb_db.db --remote=punix:/usr/local/var/run/ovn/ovnnb_db.sock \
         --remote=db:OVN_Northbound,NB_Global,connections \
         --private-key=db:OVN_Northbound,SSL,private_key \
         --certificate=db:OVN_Northbound,SSL,certificate \
         --bootstrap-ca-cert=db:OVN_Northbound,SSL,ca_cert \
         --pidfile=/usr/local/var/run/ovn/ovnnb-server.pid --detach --log-file=/usr/local/var/log/ovn/ovnnb-server.log
-   $ ovsdb-server /usr/local/etc/ovn/ovnsb_db.db --remote=punix:/usr/local/var/run/ovn/ovnsb_db.sock \
+   $ sudo ovsdb-server /usr/local/etc/ovn/ovnsb_db.db --remote=punix:/usr/local/var/run/ovn/ovnsb_db.sock \
         --remote=db:OVN_Southbound,SB_Global,connections \
         --private-key=db:OVN_Southbound,SSL,private_key \
         --certificate=db:OVN_Southbound,SSL,certificate \

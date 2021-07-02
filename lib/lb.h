@@ -20,6 +20,7 @@
 #include <sys/types.h>
 #include <netinet/in.h>
 #include "openvswitch/hmap.h"
+#include "sset.h"
 #include "ovn-util.h"
 
 struct nbrec_load_balancer;
@@ -38,10 +39,8 @@ struct ovn_northd_lb {
     struct ovn_northd_lb_vip *vips_nb;
     size_t n_vips;
 
-    struct lport_addresses hairpin_snat_ips; /* IP (v4 and/or v6) to be used
-                                              * as source for hairpinned
-                                              * traffic.
-                                              */
+    struct sset ips_v4;
+    struct sset ips_v6;
 
     size_t n_dps;
     size_t n_allocated_dps;
@@ -81,10 +80,7 @@ struct ovn_northd_lb_backend {
     const struct sbrec_service_monitor *sbrec_monitor;
 };
 
-struct ovn_northd_lb *ovn_northd_lb_create(
-    const struct nbrec_load_balancer *,
-    struct hmap *ports,
-    void * (*ovn_port_find)(const struct hmap *ports, const char *name));
+struct ovn_northd_lb *ovn_northd_lb_create(const struct nbrec_load_balancer *);
 struct ovn_northd_lb * ovn_northd_lb_find(struct hmap *, const struct uuid *);
 void ovn_northd_lb_destroy(struct ovn_northd_lb *);
 void ovn_northd_lb_add_datapath(struct ovn_northd_lb *,

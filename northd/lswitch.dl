@@ -22,19 +22,18 @@ import helpers
 import ipam
 import vec
 
-function is_enabled(lsp: nb::Logical_Switch_Port): bool { is_enabled(lsp.enabled) }
-function is_enabled(lsp: Ref<nb::Logical_Switch_Port>): bool { lsp.deref().is_enabled() }
+function is_enabled(lsp: Intern<nb::Logical_Switch_Port>): bool { is_enabled(lsp.enabled) }
 function is_enabled(sp: SwitchPort): bool { sp.lsp.is_enabled() }
-function is_enabled(sp: Ref<SwitchPort>): bool { sp.lsp.is_enabled() }
+function is_enabled(sp: Intern<SwitchPort>): bool { sp.lsp.is_enabled() }
 
-relation SwitchRouterPeerRef(lsp: uuid, rport: Option<Ref<RouterPort>>)
+relation SwitchRouterPeerRef(lsp: uuid, rport: Option<Intern<RouterPort>>)
 
 SwitchRouterPeerRef(lsp, Some{rport}) :-
     SwitchRouterPeer(lsp, _, lrp),
-    rport in &RouterPort(.lrp = nb::Logical_Router_Port{._uuid = lrp}).
+    rport in &RouterPort(.lrp = &nb::Logical_Router_Port{._uuid = lrp}).
 
 SwitchRouterPeerRef(lsp, None) :-
-    nb::Logical_Switch_Port(._uuid = lsp),
+    &nb::Logical_Switch_Port(._uuid = lsp),
     not SwitchRouterPeer(lsp, _, _).
 
 /* LogicalSwitchPortCandidate.
@@ -51,7 +50,7 @@ Warning[message] :-
     LogicalSwitchPortCandidate(lsp_uuid, ls_uuid),
     var lss = ls_uuid.group_by(lsp_uuid).to_set(),
     lss.size() > 1,
-    lsp in nb::Logical_Switch_Port(._uuid = lsp_uuid),
+    lsp in &nb::Logical_Switch_Port(._uuid = lsp_uuid),
     var message = "Bad configuration: logical switch port ${lsp.name} belongs "
     "to more than one logical switch".
 
@@ -67,10 +66,12 @@ LogicalSwitchPort(lsp_uuid, ls_uuid) :-
 relation LogicalSwitchPortWithUnknownAddress(ls: uuid, lsp: uuid)
 LogicalSwitchPortWithUnknownAddress(ls_uuid, lsp_uuid) :-
     LogicalSwitchPort(lsp_uuid, ls_uuid),
-    lsp in nb::Logical_Switch_Port(._uuid = lsp_uuid),
+    lsp in &nb::Logical_Switch_Port(._uuid = lsp_uuid),
     lsp.is_enabled() and lsp.addresses.contains("unknown").
 
-relation LogicalSwitchHasUnknownPorts(ls: uuid, has_unknown: bool)
+// "Pitfalls of projections" in ddlog-new-feature.rst explains why this
+// is an output relation:
+output relation LogicalSwitchHasUnknownPorts(ls: uuid, has_unknown: bool)
 LogicalSwitchHasUnknownPorts(ls, true) :- LogicalSwitchPortWithUnknownAddress(ls, _).
 LogicalSwitchHasUnknownPorts(ls, false) :-
     nb::Logical_Switch(._uuid = ls),
@@ -82,7 +83,7 @@ relation PortStaticAddresses(lsport: uuid, ip4addrs: Set<string>, ip6addrs: Set<
 PortStaticAddresses(.lsport     = port_uuid,
                     .ip4addrs   = ip4_addrs.union(),
                     .ip6addrs   = ip6_addrs.union()) :-
-    nb::Logical_Switch_Port(._uuid = port_uuid, .addresses = addresses),
+    &nb::Logical_Switch_Port(._uuid = port_uuid, .addresses = addresses),
     var address = FlatMap(if (addresses.is_empty()) { set_singleton("") } else { addresses }),
     (var ip4addrs, var ip6addrs) = if (not is_dynamic_lsp_address(address)) {
         split_addresses(address)
@@ -114,9 +115,11 @@ relation LogicalSwitchStatefulACL(ls: uuid, acl: uuid)
 
 LogicalSwitchStatefulACL(ls, acl) :-
     LogicalSwitchACL(ls, acl),
-    nb::ACL(._uuid = acl, .action = "allow-related").
+    &nb::ACL(._uuid = acl, .action = "allow-related").
 
-relation LogicalSwitchHasStatefulACL(ls: uuid, has_stateful_acl: bool)
+// "Pitfalls of projections" in ddlog-new-feature.rst explains why this
+// is an output relation:
+output relation LogicalSwitchHasStatefulACL(ls: uuid, has_stateful_acl: bool)
 
 LogicalSwitchHasStatefulACL(ls, true) :-
     LogicalSwitchStatefulACL(ls, _).
@@ -124,6 +127,17 @@ LogicalSwitchHasStatefulACL(ls, true) :-
 LogicalSwitchHasStatefulACL(ls, false) :-
     nb::Logical_Switch(._uuid = ls),
     not LogicalSwitchStatefulACL(ls, _).
+
+// "Pitfalls of projections" in ddlog-new-feature.rst explains why this
+// is an output relation:
+output relation LogicalSwitchHasACLs(ls: uuid, has_acls: bool)
+
+LogicalSwitchHasACLs(ls, true) :-
+    LogicalSwitchACL(ls, _).
+
+LogicalSwitchHasACLs(ls, false) :-
+    nb::Logical_Switch(._uuid = ls),
+    not LogicalSwitchACL(ls, _).
 
 /*
  * LogicalSwitchLocalnetPorts maps from each logical switch UUID
@@ -134,7 +148,7 @@ relation LogicalSwitchLocalnetPort0(ls_uuid: uuid, lsp: (uuid, string))
 LogicalSwitchLocalnetPort0(ls_uuid, (lsp_uuid, lsp.name)) :-
     ls in nb::Logical_Switch(._uuid = ls_uuid),
     var lsp_uuid = FlatMap(ls.ports),
-    lsp in nb::Logical_Switch_Port(._uuid = lsp_uuid),
+    lsp in &nb::Logical_Switch_Port(._uuid = lsp_uuid),
     lsp.__type == "localnet".
 
 relation LogicalSwitchLocalnetPorts(ls_uuid: uuid, localnet_ports: Vec<(uuid, string)>)
@@ -161,7 +175,9 @@ LogicalSwitchWithDNSRecords(ls) :-
     nb::DNS(._uuid = dns_uuid, .records = records),
     not records.is_empty().
 
-relation LogicalSwitchHasDNSRecords(ls: uuid, has_dns_records: bool)
+// "Pitfalls of projections" in ddlog-new-feature.rst explains why this
+// is an output relation:
+output relation LogicalSwitchHasDNSRecords(ls: uuid, has_dns_records: bool)
 
 LogicalSwitchHasDNSRecords(ls, true) :-
     LogicalSwitchWithDNSRecords(ls).
@@ -174,10 +190,12 @@ relation LogicalSwitchHasNonRouterPort0(ls: uuid)
 LogicalSwitchHasNonRouterPort0(ls_uuid) :-
     ls in nb::Logical_Switch(._uuid = ls_uuid),
     var lsp_uuid = FlatMap(ls.ports),
-    lsp in nb::Logical_Switch_Port(._uuid = lsp_uuid),
+    lsp in &nb::Logical_Switch_Port(._uuid = lsp_uuid),
     lsp.__type != "router".
 
-relation LogicalSwitchHasNonRouterPort(ls: uuid, has_non_router_port: bool)
+// "Pitfalls of projections" in ddlog-new-feature.rst explains why this
+// is an output relation:
+output relation LogicalSwitchHasNonRouterPort(ls: uuid, has_non_router_port: bool)
 LogicalSwitchHasNonRouterPort(ls, true) :-
     LogicalSwitchHasNonRouterPort0(ls).
 LogicalSwitchHasNonRouterPort(ls, false) :-
@@ -186,21 +204,32 @@ LogicalSwitchHasNonRouterPort(ls, false) :-
 
 /* Switch relation collects all attributes of a logical switch */
 
-relation &Switch(
-    ls:                nb::Logical_Switch,
+typedef Switch = Switch {
+    /* Fields copied from nb::Logical_Switch_Port. */
+    _uuid:             uuid,
+    name:              string,
+    load_balancer:     Set<uuid>,
+    other_config:      Map<string,string>,
+    external_ids:      Map<string,string>,
+
+    /* Additional computed fields. */
     has_stateful_acl:  bool,
+    has_acls:          bool,
     has_lb_vip:        bool,
     has_dns_records:   bool,
     has_unknown_ports: bool,
     localnet_ports:    Vec<(uuid, string)>,  // UUID and name of each localnet port.
     subnet:            Option<(in_addr/*subnet*/, in_addr/*mask*/, bit<32>/*start_ipv4*/, bit<32>/*total_ipv4s*/)>,
     ipv6_prefix:       Option<in6_addr>,
-    mcast_cfg:         Ref<McastSwitchCfg>,
+    mcast_cfg:         Intern<McastSwitchCfg>,
     is_vlan_transparent: bool,
 
     /* Does this switch have at least one port with type != "router"? */
     has_non_router_port: bool
-)
+}
+
+
+relation Switch[Intern<Switch>]
 
 function ipv6_parse_prefix(s: string): Option<in6_addr> {
     if (string_contains(s, "/")) {
@@ -213,19 +242,28 @@ function ipv6_parse_prefix(s: string): Option<in6_addr> {
     }
 }
 
-&Switch(.ls                = ls,
-        .has_stateful_acl  = has_stateful_acl,
-        .has_lb_vip        = has_lb_vip,
-        .has_dns_records   = has_dns_records,
-        .has_unknown_ports = has_unknown_ports,
-        .localnet_ports    = localnet_ports,
-        .subnet            = subnet,
-        .ipv6_prefix       = ipv6_prefix,
-        .mcast_cfg         = mcast_cfg,
-        .has_non_router_port = has_non_router_port,
-        .is_vlan_transparent = is_vlan_transparent) :-
+Switch[Switch{
+           ._uuid             = ls._uuid,
+           .name              = ls.name,
+           .load_balancer     = ls.load_balancer,
+           .other_config      = ls.other_config,
+           .external_ids      = ls.external_ids,
+
+           .has_stateful_acl  = has_stateful_acl,
+           .has_acls          = has_acls,
+           .has_lb_vip        = has_lb_vip,
+           .has_dns_records   = has_dns_records,
+           .has_unknown_ports = has_unknown_ports,
+           .localnet_ports    = localnet_ports,
+           .subnet            = subnet,
+           .ipv6_prefix       = ipv6_prefix,
+           .mcast_cfg         = mcast_cfg,
+           .has_non_router_port = has_non_router_port,
+           .is_vlan_transparent = is_vlan_transparent
+       }.intern()] :-
     nb::Logical_Switch[ls],
     LogicalSwitchHasStatefulACL(ls._uuid, has_stateful_acl),
+    LogicalSwitchHasACLs(ls._uuid, has_acls),
     LogicalSwitchHasLBVIP(ls._uuid, has_lb_vip),
     LogicalSwitchHasDNSRecords(ls._uuid, has_dns_records),
     LogicalSwitchHasUnknownPorts(ls._uuid, has_unknown_ports),
@@ -260,20 +298,22 @@ function ipv6_parse_prefix(s: string): Option<in6_addr> {
     var is_vlan_transparent = ls.other_config.get_bool_def("vlan-passthru", false).
 
 /* SwitchLB: many-to-many relation between logical switches and nb::LB */
-relation SwitchLB(sw_uuid: uuid, lb: Ref<nb::Load_Balancer>)
+relation SwitchLB(sw_uuid: uuid, lb: Intern<nb::Load_Balancer>)
 SwitchLB(sw_uuid, lb) :-
     nb::Logical_Switch(._uuid = sw_uuid, .load_balancer = lb_ids),
     var lb_id = FlatMap(lb_ids),
-    lb in &LoadBalancerRef[nb::Load_Balancer{._uuid = lb_id}].
+    lb in &nb::Load_Balancer(._uuid = lb_id).
 
 /* Load balancer VIPs associated with switch */
-relation SwitchLBVIP(sw_uuid: uuid, lb: Ref<nb::Load_Balancer>, vip: string, backends: string)
+relation SwitchLBVIP(sw_uuid: uuid, lb: Intern<nb::Load_Balancer>, vip: string, backends: string)
 SwitchLBVIP(sw_uuid, lb, vip, backends) :-
     SwitchLB(sw_uuid, lb@(&nb::Load_Balancer{.vips = vips})),
     var kv = FlatMap(vips),
     (var vip, var backends) = kv.
 
-relation LogicalSwitchHasLBVIP(sw_uuid: uuid, has_lb_vip: bool)
+// "Pitfalls of projections" in ddlog-new-feature.rst explains why this
+// is an output relation:
+output relation LogicalSwitchHasLBVIP(sw_uuid: uuid, has_lb_vip: bool)
 LogicalSwitchHasLBVIP(sw_uuid, true) :-
     SwitchLBVIP(.sw_uuid = sw_uuid).
 LogicalSwitchHasLBVIP(sw_uuid, false) :-
@@ -288,39 +328,43 @@ LogicalSwitchHasLBVIP(sw_uuid, false) :-
  *   - LBVIP parses the IP address and port (and drops VIPs where those are invalid).
  */
 relation LBVIP0(
-    lb: Ref<nb::Load_Balancer>,
+    lb: Intern<nb::Load_Balancer>,
     vip_key: string,
     backend_ips: string,
-    health_check: Ref<nb::Load_Balancer_Health_Check>)
+    health_check: Intern<nb::Load_Balancer_Health_Check>)
 LBVIP0(lb, vip_key, backend_ips, health_check) :-
-    LoadBalancerRef[lb],
+    lb in &nb::Load_Balancer(),
     var vip = FlatMap(lb.vips),
     (var vip_key, var backend_ips) = vip,
-    LoadBalancerHealthCheckRef[health_check@&nb::Load_Balancer_Health_Check{.vip = vip_key}],
+    health_check in &nb::Load_Balancer_Health_Check(.vip = vip_key),
     lb.health_check.contains(health_check._uuid).
 
 relation LBVIP1(
-    lb: Ref<nb::Load_Balancer>,
+    lb: Intern<nb::Load_Balancer>,
     vip_key: string,
     backend_ips: string,
-    health_check: Option<Ref<nb::Load_Balancer_Health_Check>>)
+    health_check: Option<Intern<nb::Load_Balancer_Health_Check>>)
 LBVIP1(lb, vip_key, backend_ips, Some{health_check}) :-
     LBVIP0(lb, vip_key, backend_ips, health_check).
 LBVIP1(lb, vip_key, backend_ips, None) :-
-    LoadBalancerRef[lb],
+    lb in &nb::Load_Balancer(),
     var vip = FlatMap(lb.vips),
     (var vip_key, var backend_ips) = vip,
     not LBVIP0(lb, vip_key, backend_ips, _).
 
-relation &LBVIP(
-    lb: Ref<nb::Load_Balancer>,
+typedef LBVIP = LBVIP {
+    lb: Intern<nb::Load_Balancer>,
     vip_key: string,
     backend_ips: string,
-    health_check: Option<Ref<nb::Load_Balancer_Health_Check>>,
+    health_check: Option<Intern<nb::Load_Balancer_Health_Check>>,
     vip_addr: v46_ip,
     vip_port: bit<16>,
-    backends: Vec<lb_vip_backend>)
-&LBVIP(lb, vip_key, backend_ips, health_check, vip_addr, vip_port, backends) :-
+    backends: Vec<lb_vip_backend>
+}
+
+relation LBVIP[Intern<LBVIP>]
+
+LBVIP[LBVIP{lb, vip_key, backend_ips, health_check, vip_addr, vip_port, backends}.intern()] :-
     LBVIP1(lb, vip_key, backend_ips, health_check),
     Some{(var vip_addr, var vip_port)} = ip_address_and_port_from_lb_key(vip_key),
     var backends = backend_ips.split(",").filter_map(
@@ -382,17 +426,20 @@ function default_protocol(protocol: Option<string>): string = {
     }
 }
 
-relation &LBVIPWithStatus(
-    lb: Ref<nb::Load_Balancer>,
+typedef LBVIPWithStatus = LBVIPWithStatus {
+    lb: Intern<nb::Load_Balancer>,
     vip_key: string,
     backend_ips: string,
-    health_check: Option<Ref<nb::Load_Balancer_Health_Check>>,
+    health_check: Option<Intern<nb::Load_Balancer_Health_Check>>,
     vip_addr: v46_ip,
     vip_port: bit<16>,
-    backends: Map<lb_vip_backend, bool>)
-&LBVIPWithStatus(lb, vip_key, backend_ips, health_check, vip_addr, vip_port, map_empty()) :-
+    backends: Map<lb_vip_backend, bool>
+}
+relation LBVIPWithStatus[Intern<LBVIPWithStatus>]
+
+LBVIPWithStatus[LBVIPWithStatus{lb, vip_key, backend_ips, health_check, vip_addr, vip_port, map_empty()}.intern()] :-
     &LBVIP(lb, vip_key, backend_ips, health_check, vip_addr, vip_port, vec_empty()).
-&LBVIPWithStatus(lb, vip_key, backend_ips, health_check, vip_addr, vip_port, backends_with_status) :-
+LBVIPWithStatus[LBVIPWithStatus{lb, vip_key, backend_ips, health_check, vip_addr, vip_port, backends_with_status}.intern()] :-
     &LBVIP(lb, vip_key, backend_ips, health_check, vip_addr, vip_port, backends),
     var backend = FlatMap(backends),
     LBVIPBackendStatus(lbvip, backend, up),
@@ -404,20 +451,20 @@ relation &LBVIPWithStatus(
  * Only some backends have health checking enabled. The ones that don't
  * are always considered to be up. */
 relation LBVIPBackendStatus0(
-    lbvip: Ref<LBVIP>,
+    lbvip: Intern<LBVIP>,
     backend: lb_vip_backend,
     up: bool)
 LBVIPBackendStatus0(lbvip, backend, is_online(sm.status)) :-
     LBVIP[lbvip@&LBVIP{.lb = lb}],
     var backend = FlatMap(lbvip.backends),
     Some{var svc_monitor} = backend.svc_monitor,
-    sm in sb::Service_Monitor(.port = backend.port as integer),
+    sm in &sb::Service_Monitor(.port = backend.port as integer),
     ip46_parse(sm.ip) == Some{backend.ip},
     svc_monitor.port_name == sm.logical_port,
     default_protocol(lb.protocol) == default_protocol(sm.protocol).
 
 relation LBVIPBackendStatus(
-    lbvip: Ref<LBVIP>,
+    lbvip: Intern<LBVIP>,
     backend: lb_vip_backend,
     up: bool)
 LBVIPBackendStatus(lbvip, backend, up) :- LBVIPBackendStatus0(lbvip, backend, up).
@@ -428,69 +475,70 @@ LBVIPBackendStatus(lbvip, backend, true) :-
 
 /* SwitchPortDHCPv4Options: many-to-one relation between logical switches and DHCPv4 options */
 relation SwitchPortDHCPv4Options(
-    port: Ref<SwitchPort>,
-    dhcpv4_options: Ref<nb::DHCP_Options>)
+    port: Intern<SwitchPort>,
+    dhcpv4_options: Intern<nb::DHCP_Options>)
 
 SwitchPortDHCPv4Options(port, options) :-
     port in &SwitchPort(.lsp = lsp),
     port.lsp.__type != "external",
     Some{var dhcpv4_uuid} = lsp.dhcpv4_options,
-    options in &DHCP_OptionsRef[nb::DHCP_Options{._uuid = dhcpv4_uuid}].
+    options in &nb::DHCP_Options(._uuid = dhcpv4_uuid).
 
 /* SwitchPortDHCPv6Options: many-to-one relation between logical switches and DHCPv4 options */
 relation SwitchPortDHCPv6Options(
-    port: Ref<SwitchPort>,
-    dhcpv6_options: Ref<nb::DHCP_Options>)
+    port: Intern<SwitchPort>,
+    dhcpv6_options: Intern<nb::DHCP_Options>)
 
 SwitchPortDHCPv6Options(port, options) :-
     port in &SwitchPort(.lsp = lsp),
     port.lsp.__type != "external",
     Some{var dhcpv6_uuid} = lsp.dhcpv6_options,
-    options in &DHCP_OptionsRef[nb::DHCP_Options{._uuid = dhcpv6_uuid}].
+    options in &nb::DHCP_Options(._uuid = dhcpv6_uuid).
 
 /* SwitchQoS: many-to-one relation between logical switches and nb::QoS */
-relation SwitchQoS(sw: Ref<Switch>, qos: Ref<nb::QoS>)
+relation SwitchQoS(sw: Intern<Switch>, qos: Intern<nb::QoS>)
 
 SwitchQoS(sw, qos) :-
-    sw in &Switch(.ls = nb::Logical_Switch{.qos_rules = qos_rules}),
+    sw in &Switch(),
+    nb::Logical_Switch(._uuid = sw._uuid, .qos_rules = qos_rules),
     var qos_rule = FlatMap(qos_rules),
-    qos in &QoSRef[nb::QoS{._uuid = qos_rule}].
+    qos in &nb::QoS(._uuid = qos_rule).
 
 /* Reports whether a given ACL is associated with a fair meter.
  * 'has_fair_meter' is false if 'acl' has no meter, or if has a meter
  * that isn't a fair meter.  (The latter case has two subcases: the
  * case where the meter that the ACL names corresponds to an nb::Meter
  * with that name, and the case where it doesn't.) */
-relation ACLHasFairMeter(acl: Ref<nb::ACL>, has_fair_meter: bool)
+relation ACLHasFairMeter(acl: Intern<nb::ACL>, has_fair_meter: bool)
 ACLHasFairMeter(acl, true) :-
     ACLWithFairMeter(acl, _).
 ACLHasFairMeter(acl, false) :-
-    acl in &ACLRef[_],
+    acl in &nb::ACL(),
     not ACLWithFairMeter(acl, _).
 
 /* All the ACLs associated with a fair meter, with their fair meters. */
-relation ACLWithFairMeter(acl: Ref<nb::ACL>, meter: Ref<nb::Meter>)
+relation ACLWithFairMeter(acl: Intern<nb::ACL>, meter: Intern<nb::Meter>)
 ACLWithFairMeter(acl, meter) :-
-    acl in &ACLRef[nb::ACL{.meter = Some{meter_name}}],
-    meter in &MeterRef[nb::Meter{.name = meter_name, .fair = Some{true}}].
+    acl in &nb::ACL(.meter = Some{meter_name}),
+    meter in &nb::Meter(.name = meter_name, .fair = Some{true}).
 
 /* SwitchACL: many-to-many relation between logical switches and ACLs */
-relation &SwitchACL(sw: Ref<Switch>,
-                    acl: Ref<nb::ACL>,
+relation &SwitchACL(sw: Intern<Switch>,
+                    acl: Intern<nb::ACL>,
                     has_fair_meter: bool)
 
 &SwitchACL(.sw = sw, .acl = acl, .has_fair_meter = has_fair_meter) :-
     LogicalSwitchACL(sw_uuid, acl_uuid),
-    sw in &Switch(.ls = nb::Logical_Switch{._uuid = sw_uuid}),
-    acl in &ACLRef[nb::ACL{._uuid = acl_uuid}],
+    sw in &Switch(._uuid = sw_uuid),
+    acl in &nb::ACL(._uuid = acl_uuid),
     ACLHasFairMeter(acl, has_fair_meter).
 
 function oVN_FEATURE_PORT_UP_NOTIF(): string { "port-up-notif" }
 relation SwitchPortUp0(lsp: uuid)
 SwitchPortUp0(lsp) :-
-    nb::Logical_Switch_Port(._uuid = lsp, .__type = "router").
+    &nb::Logical_Switch_Port(._uuid = lsp, .__type = "router").
 SwitchPortUp0(lsp) :-
-    nb::Logical_Switch_Port(._uuid = lsp, .name = lsp_name, .__type = __type),
+    &nb::Logical_Switch_Port(._uuid = lsp, .name = lsp_name, .__type = __type),
     sb::Port_Binding(.logical_port = lsp_name, .up = up, .chassis = Some{chassis_uuid}),
     sb::Chassis(._uuid = chassis_uuid, .other_config = other_config),
     if (other_config.get_bool_def(oVN_FEATURE_PORT_UP_NOTIF(), false)) {
@@ -501,11 +549,11 @@ SwitchPortUp0(lsp) :-
 
 relation SwitchPortUp(lsp: uuid, up: bool)
 SwitchPortUp(lsp, true) :- SwitchPortUp0(lsp).
-SwitchPortUp(lsp, false) :- nb::Logical_Switch_Port(._uuid = lsp), not SwitchPortUp0(lsp).
+SwitchPortUp(lsp, false) :- &nb::Logical_Switch_Port(._uuid = lsp), not SwitchPortUp0(lsp).
 
 relation SwitchPortHAChassisGroup0(lsp_uuid: uuid, hac_group_uuid: uuid)
 SwitchPortHAChassisGroup0(lsp_uuid, ha_chassis_group_uuid(ls_uuid)) :-
-    lsp in nb::Logical_Switch_Port(._uuid = lsp_uuid),
+    lsp in &nb::Logical_Switch_Port(._uuid = lsp_uuid),
     lsp.__type == "external",
     Some{var hac_group_uuid} = lsp.ha_chassis_group,
     ha_chassis_group in nb::HA_Chassis_Group(._uuid = hac_group_uuid),
@@ -518,7 +566,7 @@ relation SwitchPortHAChassisGroup(lsp_uuid: uuid, hac_group_uuid: Option<uuid>)
 SwitchPortHAChassisGroup(lsp_uuid, Some{hac_group_uuid}) :-
     SwitchPortHAChassisGroup0(lsp_uuid, hac_group_uuid).
 SwitchPortHAChassisGroup(lsp_uuid, None) :-
-    lsp in nb::Logical_Switch_Port(._uuid = lsp_uuid),
+    lsp in &nb::Logical_Switch_Port(._uuid = lsp_uuid),
     not SwitchPortHAChassisGroup0(lsp_uuid, _).
 
 /* SwitchPort relation collects all attributes of a logical switch port
@@ -533,11 +581,11 @@ SwitchPortHAChassisGroup(lsp_uuid, None) :-
  * - `up`                        - true if the port is bound to a chassis or has type ""
  * - 'hac_group_uuid'            - uuid of sb::HA_Chassis_Group, only for "external" ports
  */
-relation &SwitchPort(
-    lsp:                        nb::Logical_Switch_Port,
+typedef SwitchPort = SwitchPort {
+    lsp:                        Intern<nb::Logical_Switch_Port>,
     json_name:                  string,
-    sw:                         Ref<Switch>,
-    peer:                       Option<Ref<RouterPort>>,
+    sw:                         Intern<Switch>,
+    peer:                       Option<Intern<RouterPort>>,
     static_addresses:           Vec<lport_addresses>,
     dynamic_address:            Option<lport_addresses>,
     static_dynamic_mac:         Option<eth_addr>,
@@ -551,32 +599,37 @@ relation &SwitchPort(
     needs_dynamic_ipv6address:  bool,
     needs_dynamic_tag:          bool,
     up:                         bool,
-    mcast_cfg:                  Ref<McastPortCfg>,
+    mcast_cfg:                  Intern<McastPortCfg>,
     hac_group_uuid:             Option<uuid>
-)
+}
 
-&SwitchPort(.lsp                        = lsp,
-            .json_name                  = json_string_escape(lsp.name),
-            .sw                         = sw,
-            .peer                       = peer,
-            .static_addresses           = static_addresses,
-            .dynamic_address            = dynamic_address,
-            .static_dynamic_mac         = static_dynamic_mac,
-            .static_dynamic_ipv4        = static_dynamic_ipv4,
-            .static_dynamic_ipv6        = static_dynamic_ipv6,
-            .ps_addresses               = ps_addresses,
-            .ps_eth_addresses           = ps_eth_addresses,
-            .parent_name                = parent_name,
-            .needs_dynamic_ipv4address  = needs_dynamic_ipv4address,
-            .needs_dynamic_macaddress   = needs_dynamic_macaddress,
-            .needs_dynamic_ipv6address  = needs_dynamic_ipv6address,
-            .needs_dynamic_tag          = needs_dynamic_tag,
-            .up                         = up,
-            .mcast_cfg                  = mcast_cfg,
-            .hac_group_uuid             = hac_group_uuid) :-
-    nb::Logical_Switch_Port[lsp],
+relation SwitchPort[Intern<SwitchPort>]
+
+SwitchPort[SwitchPort{
+              .lsp                        = lsp,
+              .json_name                  = json_string_escape(lsp.name),
+              .sw                         = sw,
+              .peer                       = peer,
+              .static_addresses           = static_addresses,
+              .dynamic_address            = dynamic_address,
+              .static_dynamic_mac         = static_dynamic_mac,
+              .static_dynamic_ipv4        = static_dynamic_ipv4,
+              .static_dynamic_ipv6        = static_dynamic_ipv6,
+              .ps_addresses               = ps_addresses,
+              .ps_eth_addresses           = ps_eth_addresses,
+              .parent_name                = parent_name,
+              .needs_dynamic_ipv4address  = needs_dynamic_ipv4address,
+              .needs_dynamic_macaddress   = needs_dynamic_macaddress,
+              .needs_dynamic_ipv6address  = needs_dynamic_ipv6address,
+              .needs_dynamic_tag          = needs_dynamic_tag,
+              .up                         = up,
+              .mcast_cfg                  = mcast_cfg,
+              .hac_group_uuid             = hac_group_uuid
+           }.intern()] :-
+    lsp in &nb::Logical_Switch_Port(),
     LogicalSwitchPort(lsp._uuid, lswitch_uuid),
-    sw in &Switch(.ls = nb::Logical_Switch{._uuid = lswitch_uuid, .other_config = other_config},
+    sw in &Switch(._uuid = lswitch_uuid,
+                  .other_config = other_config,
                   .subnet = subnet,
                   .ipv6_prefix = ipv6_prefix),
     SwitchRouterPeerRef(lsp._uuid, peer),
@@ -648,7 +701,7 @@ relation &SwitchPort(
                              .hac_group_uuid = hac_group_uuid).
 
 /* Switch port port security addresses */
-relation SwitchPortPSAddresses(port:     Ref<SwitchPort>,
+relation SwitchPortPSAddresses(port:     Intern<SwitchPort>,
                                ps_addrs: lport_addresses)
 
 SwitchPortPSAddresses(port, ps_addrs) :-
@@ -657,7 +710,7 @@ SwitchPortPSAddresses(port, ps_addrs) :-
 
 /* All static addresses associated with a port parsed into
  * the lport_addresses data structure */
-relation SwitchPortStaticAddresses(port: Ref<SwitchPort>,
+relation SwitchPortStaticAddresses(port: Intern<SwitchPort>,
                                    addrs:  lport_addresses)
 SwitchPortStaticAddresses(port, addrs) :-
     port in &SwitchPort(.static_addresses = static_addresses),
@@ -665,7 +718,7 @@ SwitchPortStaticAddresses(port, addrs) :-
 
 /* All static and dynamic addresses associated with a port parsed into
  * the lport_addresses data structure */
-relation SwitchPortAddresses(port: Ref<SwitchPort>,
+relation SwitchPortAddresses(port: Intern<SwitchPort>,
                              addrs:  lport_addresses)
 
 SwitchPortAddresses(port, addrs) :- SwitchPortStaticAddresses(port, addrs).
@@ -696,7 +749,7 @@ SwitchPortAddresses(port, addrs) :-
     }.
 
 /* All static and dynamic IPv4 addresses associated with a port */
-relation SwitchPortIPv4Address(port: Ref<SwitchPort>,
+relation SwitchPortIPv4Address(port: Intern<SwitchPort>,
                                ea:     eth_addr,
                                addr:   ipv4_netaddr)
 
@@ -705,7 +758,7 @@ SwitchPortIPv4Address(port, ea, addr) :-
     var addr = FlatMap(addrs).
 
 /* All static and dynamic IPv6 addresses associated with a port */
-relation SwitchPortIPv6Address(port:   Ref<SwitchPort>,
+relation SwitchPortIPv6Address(port:   Intern<SwitchPort>,
                                ea:     eth_addr,
                                addr:   ipv6_netaddr)
 
@@ -742,3 +795,10 @@ function put_svc_monitor_mac(options: Map<string,string>,
 relation SvcMonitorMac(mac: eth_addr)
 SvcMonitorMac(get_svc_monitor_mac(options, uuid)) :-
     nb::NB_Global(._uuid = uuid, .options = options).
+
+relation UseCtInvMatch[bool]
+UseCtInvMatch[options.get_bool_def("use_ct_inv_match", true)] :-
+    nb::NB_Global(.options = options).
+UseCtInvMatch[true] :-
+    Unit(),
+    not nb in nb::NB_Global().

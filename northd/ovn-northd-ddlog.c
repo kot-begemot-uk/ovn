@@ -31,6 +31,7 @@
 #include "openvswitch/json.h"
 #include "openvswitch/poll-loop.h"
 #include "openvswitch/vlog.h"
+#include "ovs-numa.h"
 #include "ovsdb-cs.h"
 #include "ovsdb-data.h"
 #include "ovsdb-error.h"
@@ -74,15 +75,21 @@ static const char *ovnnb_db;
 static const char *ovnsb_db;
 static const char *unixctl_path;
 
+/* SSL options */
+static const char *ssl_private_key_file;
+static const char *ssl_certificate_file;
+static const char *ssl_ca_cert_file;
+
 /* Frequently used table ids. */
 static table_id WARNING_TABLE_ID;
 static table_id NB_CFG_TIMESTAMP_ID;
 
 /* Initialize frequently used table ids. */
-static void init_table_ids(void)
+static void
+init_table_ids(ddlog_prog ddlog)
 {
-    WARNING_TABLE_ID = ddlog_get_table_id("helpers::Warning");
-    NB_CFG_TIMESTAMP_ID = ddlog_get_table_id("NbCfgTimestamp");
+    WARNING_TABLE_ID = ddlog_get_table_id(ddlog, "helpers::Warning");
+    NB_CFG_TIMESTAMP_ID = ddlog_get_table_id(ddlog, "NbCfgTimestamp");
 }
 
 struct northd_ctx {
@@ -159,7 +166,8 @@ northd_ctx_create(const char *server, const char *database,
                   ddlog_prog ddlog, ddlog_delta *delta,
                   const char **input_relations,
                   const char **output_relations,
-                  const char **output_only_relations)
+                  const char **output_only_relations,
+                  bool paused)
 {
     struct northd_ctx *ctx = xmalloc(sizeof *ctx);
     *ctx = (struct northd_ctx) {
@@ -175,7 +183,7 @@ northd_ctx_create(const char *server, const char *database,
         .db_name = database,
         /* 'output_only_relations' will get filled in later. */
         .lock_name = lock_name,
-        .paused = false,
+        .paused = paused,
     };
 
     ovsdb_cs_set_remote(ctx->cs, server, true);
@@ -199,6 +207,7 @@ northd_ctx_destroy(struct northd_ctx *ctx)
 {
     if (ctx) {
         ovsdb_cs_destroy(ctx->cs);
+        json_destroy(ctx->request_id);
         json_destroy(ctx->output_only_data);
         free(ctx->prefix);
         free(ctx);
@@ -336,6 +345,7 @@ ddlog_commit(ddlog_prog ddlog, ddlog_delta *delta)
 
     /* Merge changes into `delta`. */
     ddlog_delta_union(delta, new_delta);
+    ddlog_free_delta(new_delta);
 
     return 0;
 }
@@ -346,7 +356,8 @@ ddlog_clear(struct northd_ctx *ctx)
     int n_failures = 0;
     for (int i = 0; ctx->input_relations[i]; i++) {
         char *table = xasprintf("%s%s", ctx->prefix, ctx->input_relations[i]);
-        if (ddlog_clear_relation(ctx->ddlog, ddlog_get_table_id(table))) {
+        if (ddlog_clear_relation(ctx->ddlog, ddlog_get_table_id(ctx->ddlog,
+                                                                table))) {
             n_failures++;
         }
         free(table);
@@ -610,7 +621,7 @@ northd_update_probe_interval(struct northd_ctx *nb, struct northd_ctx *sb)
      * Any other value is an explicit probe interval request from the
      * database. */
     int probe_interval = 0;
-    table_id tid = ddlog_get_table_id("Northd_Probe_Interval");
+    table_id tid = ddlog_get_table_id(nb->ddlog, "Northd_Probe_Interval");
     ddlog_delta *probe_delta = ddlog_delta_remove_table(nb->delta, tid);
     ddlog_delta_enumerate(probe_delta, northd_update_probe_interval_cb, (uintptr_t) &probe_interval);
     ddlog_free_delta(probe_delta);
@@ -669,7 +680,7 @@ ddlog_table_update_output(struct ds *ds, ddlog_prog ddlog, ddlog_delta *delta,
         return;
     }
     char *table_name = xasprintf("%s::Out_%s", db, table);
-    ddlog_delta_clear_table(delta, ddlog_get_table_id(table_name));
+    ddlog_delta_clear_table(delta, ddlog_get_table_id(ddlog, table_name));
     free(table_name);
 
     if (!updates[0]) {
@@ -947,7 +958,7 @@ get_database_ops(struct northd_ctx *ctx)
              * We require output-only tables to have an accompanying index
              * named <table>_Index. */
             char *index = xasprintf("%s_Index", table);
-            index_id idxid = ddlog_get_index_id(index);
+            index_id idxid = ddlog_get_index_id(ctx->ddlog, index);
             if (idxid == -1) {
                 VLOG_WARN_RL(&rl, "%s: unknown index", index);
                 free(index);
@@ -999,7 +1010,7 @@ get_database_ops(struct northd_ctx *ctx)
     static int64_t old_sb_cfg_timestamp = INT64_MIN;
     int64_t new_sb_cfg = old_sb_cfg;
     if (ctx->has_timestamp_columns) {
-        table_id sb_cfg_tid = ddlog_get_table_id("SbCfg");
+        table_id sb_cfg_tid = ddlog_get_table_id(ctx->ddlog, "SbCfg");
         ddlog_delta *sb_cfg_delta = ddlog_delta_remove_table(ctx->delta,
                                                              sb_cfg_tid);
         ddlog_delta_enumerate(sb_cfg_delta, northd_update_sb_cfg_cb,
@@ -1041,7 +1052,7 @@ static void
 usage(void)
 {
     printf("\
-%s: OVN northbound management daemon\n\
+%s: OVN northbound management daemon (DDlog version)\n\
 usage: %s [OPTIONS]\n\
 \n\
 Options:\n\
@@ -1049,6 +1060,8 @@ Options:\n\
                             (default: %s)\n\
   --ovnsb-db=DATABASE       connect to ovn-sb database at DATABASE\n\
                             (default: %s)\n\
+  --dry-run                 start in paused state (do not commit db changes)\n\
+  --ddlog-record=FILE.TXT   record db changes to replay later for debugging\n\
   --unixctl=SOCKET          override default control socket name\n\
   -h, --help                display this help message\n\
   -o, --options             list available options\n\
@@ -1060,25 +1073,30 @@ Options:\n\
 }
 
 static void
-parse_options(int argc OVS_UNUSED, char *argv[] OVS_UNUSED)
+parse_options(int argc OVS_UNUSED, char *argv[] OVS_UNUSED,
+              bool *pause)
 {
     enum {
         OVN_DAEMON_OPTION_ENUMS,
         VLOG_OPTION_ENUMS,
         SSL_OPTION_ENUMS,
-        OPT_DDLOG_RECORD
+        OPT_DRY_RUN,
+        OPT_DDLOG_RECORD,
+        OPT_DUMMY_NUMA,
     };
     static const struct option long_options[] = {
-        {"ddlog-record", required_argument, NULL, OPT_DDLOG_RECORD},
         {"ovnsb-db", required_argument, NULL, 'd'},
         {"ovnnb-db", required_argument, NULL, 'D'},
         {"unixctl", required_argument, NULL, 'u'},
         {"help", no_argument, NULL, 'h'},
         {"options", no_argument, NULL, 'o'},
         {"version", no_argument, NULL, 'V'},
+        {"dry-run", no_argument, NULL, OPT_DRY_RUN},
+        {"ddlog-record", required_argument, NULL, OPT_DDLOG_RECORD},
         OVN_DAEMON_LONG_OPTIONS,
         VLOG_LONG_OPTIONS,
         STREAM_SSL_LONG_OPTIONS,
+        {"dummy-numa", required_argument, NULL, OPT_DUMMY_NUMA},
         {NULL, 0, NULL, 0},
     };
     char *short_options = ovs_cmdl_long_options_to_short_options(long_options);
@@ -1094,10 +1112,17 @@ parse_options(int argc OVS_UNUSED, char *argv[] OVS_UNUSED)
         switch (c) {
         OVN_DAEMON_OPTION_HANDLERS;
         VLOG_OPTION_HANDLERS;
-        STREAM_SSL_OPTION_HANDLERS;
 
-        case OPT_DDLOG_RECORD:
-            record_file = optarg;
+        case 'p':
+            ssl_private_key_file = optarg;
+            break;
+
+        case 'c':
+            ssl_certificate_file = optarg;
+            break;
+
+        case 'C':
+            ssl_ca_cert_file = optarg;
             break;
 
         case 'd':
@@ -1124,6 +1149,18 @@ parse_options(int argc OVS_UNUSED, char *argv[] OVS_UNUSED)
             ovs_print_version(0, 0);
             exit(EXIT_SUCCESS);
 
+        case OPT_DRY_RUN:
+            *pause = true;
+            break;
+
+        case OPT_DUMMY_NUMA:
+            ovs_numa_set_dummy(optarg);
+            break;
+
+        case OPT_DDLOG_RECORD:
+            record_file = optarg;
+            break;
+
         default:
             break;
         }
@@ -1140,6 +1177,18 @@ parse_options(int argc OVS_UNUSED, char *argv[] OVS_UNUSED)
     free(short_options);
 }
 
+static void
+update_ssl_config(void)
+{
+    if (ssl_private_key_file && ssl_certificate_file) {
+        stream_ssl_set_key_and_cert(ssl_private_key_file,
+                                    ssl_certificate_file);
+    }
+    if (ssl_ca_cert_file) {
+        stream_ssl_set_ca_cert_file(ssl_ca_cert_file, false);
+    }
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -1147,14 +1196,16 @@ main(int argc, char *argv[])
     struct unixctl_server *unixctl;
     int retval;
     bool exiting;
-
-    init_table_ids();
+    struct northd_status status = {
+        .locked = false,
+        .pause = false,
+    };
 
     fatal_ignore_sigpipe();
     ovs_cmdl_proctitle_init(argc, argv);
     set_program_name(argv[0]);
     service_start(&argc, &argv);
-    parse_options(argc, argv);
+    parse_options(argc, argv, &status.pause);
 
     daemonize_start(false);
 
@@ -1166,10 +1217,6 @@ main(int argc, char *argv[])
         exit(EXIT_FAILURE);
     }
 
-    struct northd_status status = {
-        .locked = false,
-        .pause = false,
-    };
     unixctl_command_register("exit", "", 0, 0, ovn_northd_exit, &exiting);
     unixctl_command_register("status", "", 0, 0, ovn_northd_status, &status);
 
@@ -1179,6 +1226,7 @@ main(int argc, char *argv[])
     if (!ddlog) {
         ovs_fatal(0, "DDlog instance could not be created");
     }
+    init_table_ids(ddlog);
 
     unixctl_command_register("enable-cpu-profiling", "", 0, 0,
                              ovn_northd_enable_cpu_profiling, ddlog);
@@ -1201,10 +1249,12 @@ main(int argc, char *argv[])
 
     struct northd_ctx *nb_ctx = northd_ctx_create(
         ovnnb_db, "OVN_Northbound", "nb", NULL, ddlog, delta,
-        nb_input_relations, nb_output_relations, nb_output_only_relations);
+        nb_input_relations, nb_output_relations, nb_output_only_relations,
+        status.pause);
     struct northd_ctx *sb_ctx = northd_ctx_create(
         ovnsb_db, "OVN_Southbound", "sb", "ovn_northd", ddlog, delta,
-        sb_input_relations, sb_output_relations, sb_output_only_relations);
+        sb_input_relations, sb_output_relations, sb_output_only_relations,
+        status.pause);
 
     unixctl_command_register("pause", "", 0, 0, ovn_northd_pause, sb_ctx);
     unixctl_command_register("resume", "", 0, 0, ovn_northd_resume, sb_ctx);
@@ -1213,12 +1263,14 @@ main(int argc, char *argv[])
 
     char *ovn_internal_version = ovn_get_internal_version();
     VLOG_INFO("OVN internal version is : [%s]", ovn_internal_version);
+    free(ovn_internal_version);
 
     daemonize_complete();
 
     /* Main loop. */
     exiting = false;
     while (!exiting) {
+        update_ssl_config();
         memory_run();
         if (memory_should_report()) {
             struct simap usage = SIMAP_INITIALIZER(&usage);

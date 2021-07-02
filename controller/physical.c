@@ -15,6 +15,7 @@
 
 #include <config.h>
 #include "binding.h"
+#include "coverage.h"
 #include "byte-order.h"
 #include "encaps.h"
 #include "flow.h"
@@ -47,6 +48,8 @@
 #include "hmapx.h"
 
 VLOG_DEFINE_THIS_MODULE(physical);
+
+COVERAGE_DEFINE(physical_run);
 
 /* Datapath zone IDs for connection tracking and NAT */
 struct zone_ids {
@@ -609,6 +612,34 @@ put_replace_chassis_mac_flows(const struct simap *ct_zones,
     }
 }
 
+#define VLAN_80211AD_ETHTYPE 0x88a8
+#define VLAN_80211Q_ETHTYPE 0x8100
+
+static void
+ofpact_put_push_vlan(struct ofpbuf *ofpacts, const struct smap *options, int tag)
+{
+    const char *ethtype_opt = options ? smap_get(options, "ethtype") : NULL;
+
+    int ethtype = VLAN_80211Q_ETHTYPE;
+    if (ethtype_opt) {
+        if (!strcasecmp(ethtype_opt, "802.11ad")) {
+            ethtype = VLAN_80211AD_ETHTYPE;
+        } else if (strcasecmp(ethtype_opt, "802.11q")) {
+            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 1);
+            VLOG_WARN_RL(&rl, "Unknown port ethtype: %s", ethtype_opt);
+        }
+    }
+
+    struct ofpact_push_vlan *push_vlan;
+    push_vlan = ofpact_put_PUSH_VLAN(ofpacts);
+    push_vlan->ethertype = htons(ethtype);
+
+    struct ofpact_vlan_vid *vlan_vid;
+    vlan_vid = ofpact_put_SET_VLAN_VID(ofpacts);
+    vlan_vid->vlan_vid = tag;
+    vlan_vid->push_vlan_if_needed = false;
+}
+
 static void
 put_replace_router_port_mac_flows(struct ovsdb_idl_index
                                   *sbrec_port_binding_by_name,
@@ -696,10 +727,7 @@ put_replace_router_port_mac_flows(struct ovsdb_idl_index
         replace_mac->mac = chassis_mac;
 
         if (tag) {
-            struct ofpact_vlan_vid *vlan_vid;
-            vlan_vid = ofpact_put_SET_VLAN_VID(ofpacts_p);
-            vlan_vid->vlan_vid = tag;
-            vlan_vid->push_vlan_if_needed = true;
+            ofpact_put_push_vlan(ofpacts_p, &localnet_port->options, tag);
         }
 
         ofpact_put_OUTPUT(ofpacts_p)->port = ofport;
@@ -711,20 +739,23 @@ put_replace_router_port_mac_flows(struct ovsdb_idl_index
 }
 
 static void
-put_local_common_flows(uint32_t dp_key, uint32_t port_key,
-                       uint32_t parent_port_key,
+put_local_common_flows(uint32_t dp_key,
+                       const struct sbrec_port_binding *pb,
+                       const struct sbrec_port_binding *parent_pb,
                        const struct zone_ids *zone_ids,
                        struct ofpbuf *ofpacts_p,
                        struct ovn_desired_flow_table *flow_table)
 {
     struct match match;
 
-    /* Table 33, priority 100.
+    uint32_t port_key = pb->tunnel_key;
+
+    /* Table 38, priority 100.
      * =======================
      *
      * Implements output to local hypervisor.  Each flow matches a
      * logical output port on the local hypervisor, and resubmits to
-     * table 34.
+     * table 39.
      */
 
     match_init_catchall(&match);
@@ -746,12 +777,13 @@ put_local_common_flows(uint32_t dp_key, uint32_t port_key,
         }
     }
 
-    /* Resubmit to table 34. */
+    /* Resubmit to table 39. */
     put_resubmit(OFTABLE_CHECK_LOOPBACK, ofpacts_p);
-    ofctrl_add_flow(flow_table, OFTABLE_LOCAL_OUTPUT, 100, 0,
-                    &match, ofpacts_p, hc_uuid);
+    ofctrl_add_flow(flow_table, OFTABLE_LOCAL_OUTPUT, 100,
+                    pb->header_.uuid.parts[0], &match, ofpacts_p,
+                    &pb->header_.uuid);
 
-    /* Table 34, Priority 100.
+    /* Table 39, Priority 100.
      * =======================
      *
      * Drop packets whose logical inport and outport are the same
@@ -763,8 +795,9 @@ put_local_common_flows(uint32_t dp_key, uint32_t port_key,
                          0, MLF_ALLOW_LOOPBACK);
     match_set_reg(&match, MFF_LOG_INPORT - MFF_REG0, port_key);
     match_set_reg(&match, MFF_LOG_OUTPORT - MFF_REG0, port_key);
-    ofctrl_add_flow(flow_table, OFTABLE_CHECK_LOOPBACK, 100, 0,
-                    &match, ofpacts_p, hc_uuid);
+    ofctrl_add_flow(flow_table, OFTABLE_CHECK_LOOPBACK, 100,
+                    pb->header_.uuid.parts[0], &match, ofpacts_p,
+                    &pb->header_.uuid);
 
     /* Table 64, Priority 100.
      * =======================
@@ -778,7 +811,7 @@ put_local_common_flows(uint32_t dp_key, uint32_t port_key,
      * table 65 for logical-to-physical translation, then restore
      * the port number.
      *
-     * If 'parent_port_key' is set, then the 'port_key' represents a nested
+     * If 'parent_pb' is not NULL, then the 'pb' represents a nested
      * container.
      *
      * Note:We can set in_port to 0 too. But if recirculation happens
@@ -787,7 +820,7 @@ put_local_common_flows(uint32_t dp_key, uint32_t port_key,
      * in_port is 0.
      * */
 
-    bool nested_container = parent_port_key ? true: false;
+    bool nested_container = parent_pb ? true: false;
     match_init_catchall(&match);
     ofpbuf_clear(ofpacts_p);
     match_set_metadata(&match, htonll(dp_key));
@@ -801,8 +834,9 @@ put_local_common_flows(uint32_t dp_key, uint32_t port_key,
     put_load(ofp_to_u16(OFPP_NONE), MFF_IN_PORT, 0, 16, ofpacts_p);
     put_resubmit(OFTABLE_LOG_TO_PHY, ofpacts_p);
     put_stack(MFF_IN_PORT, ofpact_put_STACK_POP(ofpacts_p));
-    ofctrl_add_flow(flow_table, OFTABLE_SAVE_INPORT, 100, 0,
-                    &match, ofpacts_p, hc_uuid);
+    ofctrl_add_flow(flow_table, OFTABLE_SAVE_INPORT, 100,
+                    pb->header_.uuid.parts[0], &match, ofpacts_p,
+                    &pb->header_.uuid);
 
     if (nested_container) {
         /* It's a nested container and when the packet from the nested
@@ -824,7 +858,8 @@ put_local_common_flows(uint32_t dp_key, uint32_t port_key,
         match_init_catchall(&match);
         ofpbuf_clear(ofpacts_p);
         match_set_metadata(&match, htonll(dp_key));
-        match_set_reg(&match, MFF_LOG_OUTPORT - MFF_REG0, parent_port_key);
+        match_set_reg(&match, MFF_LOG_OUTPORT - MFF_REG0,
+                      parent_pb->tunnel_key);
         match_set_reg_masked(&match, MFF_LOG_FLAGS - MFF_REG0,
                              MLF_NESTED_CONTAINER, MLF_NESTED_CONTAINER);
 
@@ -913,7 +948,7 @@ consider_port_binding(struct ovsdb_idl_index *sbrec_port_binding_by_name,
         }
 
         struct zone_ids binding_zones = get_zone_ids(binding, ct_zones);
-        put_local_common_flows(dp_key, port_key, 0, &binding_zones,
+        put_local_common_flows(dp_key, binding, NULL, &binding_zones,
                                ofpacts_p, flow_table);
 
         match_init_catchall(&match);
@@ -1113,10 +1148,9 @@ consider_port_binding(struct ovsdb_idl_index *sbrec_port_binding_by_name,
          */
 
         struct zone_ids zone_ids = get_zone_ids(binding, ct_zones);
-        uint32_t parent_port_key = parent_port ? parent_port->tunnel_key : 0;
-        /* Pass the parent port tunnel key if the port is a nested
+        /* Pass the parent port binding if the port is a nested
          * container. */
-        put_local_common_flows(dp_key, port_key, parent_port_key, &zone_ids,
+        put_local_common_flows(dp_key, binding, parent_port, &zone_ids,
                                ofpacts_p, flow_table);
 
         /* Table 0, Priority 150 and 100.
@@ -1142,7 +1176,6 @@ consider_port_binding(struct ovsdb_idl_index *sbrec_port_binding_by_name,
          * for frames that lack any 802.1Q header later. */
         if (tag || !strcmp(binding->type, "localnet")
             || !strcmp(binding->type, "l2gateway")) {
-            match_set_dl_vlan(&match, htons(tag), 0);
             if (nested_container) {
                 /* When a packet comes from a container sitting behind a
                  * parent_port, we should let it loopback to other containers
@@ -1151,7 +1184,16 @@ consider_port_binding(struct ovsdb_idl_index *sbrec_port_binding_by_name,
                 put_load(1, MFF_LOG_FLAGS, MLF_NESTED_CONTAINER_BIT, 1,
                          ofpacts_p);
             }
-            ofpact_put_STRIP_VLAN(ofpacts_p);
+
+            /* For vlan-passthru switch ports that are untagged, skip
+             * matching/stripping VLAN header that originates from the VIF
+             * itself. */
+            bool passthru = smap_get_bool(&binding->options,
+                                          "vlan-passthru", false);
+            if (!passthru || tag) {
+                match_set_dl_vlan(&match, htons(tag), 0);
+                ofpact_put_STRIP_VLAN(ofpacts_p);
+            }
         }
 
         /* Remember the size with just strip vlan added so far,
@@ -1159,6 +1201,11 @@ consider_port_binding(struct ovsdb_idl_index *sbrec_port_binding_by_name,
         uint32_t ofpacts_orig_size = ofpacts_p->size;
 
         load_logical_ingress_metadata(binding, &zone_ids, ofpacts_p);
+
+        if (!strcmp(binding->type, "localport")) {
+            /* mark the packet as incoming from a localport */
+            put_load(1, MFF_LOG_FLAGS, MLF_LOCALPORT_BIT, 1, ofpacts_p);
+        }
 
         /* Resubmit to first logical ingress pipeline table. */
         put_resubmit(OFTABLE_LOG_INGRESS_PIPELINE, ofpacts_p);
@@ -1195,10 +1242,9 @@ consider_port_binding(struct ovsdb_idl_index *sbrec_port_binding_by_name,
         if (tag) {
             /* For containers sitting behind a local vif, tag the packets
              * before delivering them. */
-            struct ofpact_vlan_vid *vlan_vid;
-            vlan_vid = ofpact_put_SET_VLAN_VID(ofpacts_p);
-            vlan_vid->vlan_vid = tag;
-            vlan_vid->push_vlan_if_needed = true;
+            ofpact_put_push_vlan(
+                ofpacts_p, localnet_port ? &localnet_port->options : NULL,
+                tag);
         }
         ofpact_put_OUTPUT(ofpacts_p)->port = ofport;
         if (tag) {
@@ -1217,6 +1263,24 @@ consider_port_binding(struct ovsdb_idl_index *sbrec_port_binding_by_name,
                                               binding, chassis, active_tunnels,
                                               local_datapaths, ofpacts_p,
                                               ofport, flow_table);
+        }
+
+        /* Table 39, priority 160.
+         * =======================
+         *
+         * Do not forward local traffic from a localport to a localnet port.
+         */
+        if (!strcmp(binding->type, "localnet")) {
+            /* do not forward traffic from localport to localnet port */
+            match_init_catchall(&match);
+            ofpbuf_clear(ofpacts_p);
+            match_set_metadata(&match, htonll(dp_key));
+            match_set_reg(&match, MFF_LOG_OUTPORT - MFF_REG0, port_key);
+            match_set_reg_masked(&match, MFF_LOG_FLAGS - MFF_REG0,
+                                 MLF_LOCALPORT, MLF_LOCALPORT);
+            ofctrl_add_flow(flow_table, OFTABLE_CHECK_LOOPBACK, 160,
+                            binding->header_.uuid.parts[0], &match,
+                            ofpacts_p, &binding->header_.uuid);
         }
 
     } else if (!tun && !is_ha_remote) {
@@ -1473,6 +1537,8 @@ void
 physical_run(struct physical_ctx *p_ctx,
              struct ovn_desired_flow_table *flow_table)
 {
+    COVERAGE_INC(physical_run);
+
     if (!hc_uuid) {
         hc_uuid = xmalloc(sizeof(struct uuid));
         uuid_generate(hc_uuid);
@@ -1842,7 +1908,17 @@ physical_handle_ovs_iface_changes(struct physical_ctx *p_ctx,
         const struct sbrec_port_binding *lb_pb =
             local_binding_get_primary_pb(p_ctx->local_bindings, iface_id);
         if (!lb_pb) {
-            continue;
+            /* For regular VIFs (e.g. lsp) the upcoming port-binding update
+             * will remove lfows related to the unclaimed ovs port.
+             * Localport is a special case and it needs to be managed here
+             * since the port is not binded and otherwise the related lfows
+             * will not be cleared removing the ovs port.
+             */
+            lb_pb = lport_lookup_by_name(p_ctx->sbrec_port_binding_by_name,
+                                         iface_id);
+            if (!lb_pb || strcmp(lb_pb->type, "localport")) {
+                continue;
+            }
         }
 
         int64_t ofport = iface_rec->n_ofport ? *iface_rec->ofport : 0;
@@ -1886,24 +1962,5 @@ physical_clear_unassoc_flows_with_db(struct ovn_desired_flow_table *flow_table)
 {
     if (hc_uuid) {
         ofctrl_remove_flows(flow_table, hc_uuid);
-    }
-}
-
-void
-physical_clear_dp_flows(struct physical_ctx *p_ctx,
-                        struct hmapx *ct_updated_datapaths,
-                        struct ovn_desired_flow_table *flow_table)
-{
-    const struct sbrec_port_binding *binding;
-    SBREC_PORT_BINDING_TABLE_FOR_EACH (binding, p_ctx->port_binding_table) {
-        if (!hmapx_find(ct_updated_datapaths, binding->datapath)) {
-            continue;
-        }
-        const struct sbrec_port_binding *peer =
-            get_binding_peer(p_ctx->sbrec_port_binding_by_name, binding);
-        ofctrl_remove_flows(flow_table, &binding->header_.uuid);
-        if (peer) {
-            ofctrl_remove_flows(flow_table, &peer->header_.uuid);
-        }
     }
 }

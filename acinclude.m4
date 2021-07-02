@@ -42,28 +42,65 @@ AC_DEFUN([OVS_ENABLE_WERROR],
    fi
    AC_SUBST([SPARSE_WERROR])])
 
-dnl OVS_CHECK_DDLOG
+dnl OVS_CHECK_DDLOG([VERSION])
 dnl
-dnl Configure ddlog source tree
+dnl Configure ddlog source tree, checking for the given DDlog VERSION.
+dnl VERSION should be a major and minor, e.g. 0.36, which will accept
+dnl 0.36.0, 0.36.1, and so on.  Omit VERSION to accept any version of
+dnl ddlog (which is probably only useful for developers who are trying
+dnl different versions, since OVN is currently bound to a particular
+dnl DDlog version).
 AC_DEFUN([OVS_CHECK_DDLOG], [
-  AC_ARG_WITH([ddlog],
-              [AC_HELP_STRING([--with-ddlog=.../differential-datalog/lib],
-                              [Enables DDlog by pointing to its library dir])],
-              [DDLOGLIBDIR=$withval], [DDLOGLIBDIR=no])
+  AC_ARG_VAR([DDLOG_HOME], [Root of the DDlog installation])
+  AC_ARG_WITH(
+    [ddlog],
+    [AC_HELP_STRING([--with-ddlog[[=INSTALLDIR|LIBDIR]]], [Enables DDlog])],
+    [DDLOG_PATH=$PATH
+     if test "$withval" = yes; then
+       # --with-ddlog: $DDLOG_HOME must be set
+       if test -z "$DDLOG_HOME"; then
+         AC_MSG_ERROR([To build with DDlog, specify the DDlog install or library directory on --with-ddlog or in \$DDLOG_HOME])
+       fi
+       DDLOGLIBDIR=$DDLOG_HOME/lib
+       test -d "$DDLOG_HOME/bin" && DDLOG_PATH=$DDLOG_HOME/bin
+     elif test -f "$withval/lib/ddlog_std.dl"; then
+       # --with-ddlog=INSTALLDIR
+       DDLOGLIBDIR=$withval/lib
+       test -d "$withval/bin" && DDLOG_PATH=$withval/bin
+     elif test -f "$withval/ddlog_std.dl"; then
+       # --with-ddlog=LIBDIR
+       DDLOGLIBDIR=$withval/lib
+     else
+       AC_MSG_ERROR([$withval does not contain ddlog_std.dl or lib/ddlog_std.dl])
+     fi],
+    [DDLOGLIBDIR=no
+     DDLOG_PATH=no])
 
   AC_MSG_CHECKING([for DDlog library directory])
+  AC_MSG_RESULT([$DDLOGLIBDIR])
   if test "$DDLOGLIBDIR" != no; then
-    if test ! -d "$DDLOGLIBDIR"; then
-      AC_MSG_ERROR([ddlog library dir "$DDLOGLIBDIR" doesn't exist])
-    elif test ! -f "$DDLOGLIBDIR"/ddlog_std.dl; then
-      AC_MSG_ERROR([ddlog library dir "$DDLOGLIBDIR" lacks ddlog_std.dl])
-    fi
-
-    AC_ARG_VAR([DDLOG])
-    AC_CHECK_PROGS([DDLOG], [ddlog], [none])
+    AC_ARG_VAR([DDLOG], [path to ddlog binary])
+    AC_PATH_PROGS([DDLOG], [ddlog], [none], [$DDLOG_PATH])
     if test X"$DDLOG" = X"none"; then
         AC_MSG_ERROR([ddlog is required to build with DDlog])
     fi
+
+    AC_ARG_VAR([OVSDB2DDLOG], [path to ovsdb2ddlog binary])
+    AC_PATH_PROGS([OVSDB2DDLOG], [ovsdb2ddlog], [none], [$DDLOG_PATH])
+    if test X"$OVSDB2DDLOG" = X"none"; then
+        AC_MSG_ERROR([ovsdb2ddlog is required to build with DDlog])
+    fi
+
+    for tool in "$DDLOG" "$OVSDB2DDLOG"; do
+      AC_MSG_CHECKING([$tool version])
+      $tool --version >&AS_MESSAGE_LOG_FD 2>&1
+      tool_version=$($tool --version | sed -n 's/^.* v\([[0-9]][[^ ]]*\).*/\1/p')
+      AC_MSG_RESULT([$tool_version])
+      m4_if([$1], [], [], [
+          AS_CASE([$tool_version],
+              [$1 | $1.*], [],
+              [*], [AC_MSG_ERROR([DDlog version $1.x is required, but $tool is version $tool_version])])])
+    done
 
     AC_ARG_VAR([CARGO])
     AC_CHECK_PROGS([CARGO], [cargo], [none])
@@ -80,7 +117,6 @@ AC_DEFUN([OVS_CHECK_DDLOG], [
     AC_SUBST([DDLOGLIBDIR])
     AC_DEFINE([DDLOG], [1], [Build OVN daemons with ddlog.])
   fi
-  AC_MSG_RESULT([$DDLOGLIBDIR])
 
   AM_CONDITIONAL([DDLOG], [test "$DDLOGLIBDIR" != no])
 ])
@@ -371,17 +407,12 @@ AC_DEFUN([OVN_CHECK_OVS], [
                               [Specify the OVS build directory])])
 
   AC_MSG_CHECKING([for OVS source directory])
-  if test X"$with_ovs_source" != X; then
-    OVSDIR=`eval echo "$with_ovs_source"`
-    case $OVSDIR in
-      /*) ;;
-      *) OVSDIR=`pwd`/$OVSDIR ;;
-    esac
-    if test ! -f "$OVSDIR/vswitchd/bridge.c"; then
-      AC_ERROR([$OVSDIR is not an OVS source directory])
-    fi
-  else
-    OVSDIR=$srcdir/ovs
+  if test X"$with_ovs_source" = X; then
+    with_ovs_source="$srcdir/ovs"
+  fi
+  OVSDIR=$(cd "$(eval echo "$with_ovs_source")"; pwd)
+  if test ! -f "$OVSDIR/vswitchd/bridge.c"; then
+    AC_ERROR([$OVSDIR is not an OVS source directory])
   fi
 
   AC_MSG_RESULT([$OVSDIR])
@@ -407,5 +438,6 @@ AC_DEFUN([OVN_CHECK_OVS], [
   AC_SUBST(OVSBUILDDIR)
   OVSVERSION=`sed -n 's/^#define PACKAGE_VERSION//p' $OVSBUILDDIR/config.h | tr \\\n ' ' | sed 's/^[ \t]*//;s/[ \t]*$//' | sed 's/\"//g'`
   AC_SUBST(OVSVERSION)
-  AC_MSG_RESULT([OVS version is $OVSVERSION])
+  AC_MSG_CHECKING([OVS version])
+  AC_MSG_RESULT([$OVSVERSION])
 ])

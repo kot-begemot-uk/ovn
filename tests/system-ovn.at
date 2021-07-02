@@ -23,7 +23,7 @@ start_daemon ovn-controller
 
 # Logical network:
 # Two LRs - R1 and R2 that are connected to each other via LS "join"
-# in 20.0.0.0/24 network. R1 has switchess foo (192.168.1.0/24) and
+# in 20.0.0.0/24 network. R1 has switches foo (192.168.1.0/24) and
 # bar (192.168.2.0/24) connected to it. R2 has alice (172.16.1.0/24) connected
 # to it.  R2 is a gateway router on which we add NAT rules.
 #
@@ -284,13 +284,13 @@ ovn-nbctl --wait=hv sync
 OVS_WAIT_UNTIL([ovs-ofctl dump-flows br-int | grep 'nat(src=fd30::1)'])
 
 # 'alice1' should be able to ping 'foo1' directly.
-NS_CHECK_EXEC([alice1], [ping -6 -v -q -c 3 -i 0.3 -w 2 fd11::2 | FORMAT_PING], \
+NS_CHECK_EXEC([alice1], [ping6 -v -q -c 3 -i 0.3 -w 2 fd11::2 | FORMAT_PING], \
 [0], [dnl
 3 packets transmitted, 3 received, 0% packet loss, time 0ms
 ])
 
 # North-South DNAT: 'alice1' should also be able to ping 'foo1' via fd30::2
-NS_CHECK_EXEC([alice1], [ping -6 -q -c 3 -i 0.3 -w 2 fd30::2 | FORMAT_PING], \
+NS_CHECK_EXEC([alice1], [ping6 -q -c 3 -i 0.3 -w 2 fd30::2 | FORMAT_PING], \
 [0], [dnl
 3 packets transmitted, 3 received, 0% packet loss, time 0ms
 ])
@@ -303,7 +303,7 @@ icmpv6,orig=(src=fd21::2,dst=fd30::2,id=<cleared>,type=128,code=0),reply=(src=fd
 
 # South-North SNAT: 'bar1' pings 'alice1'. But 'alice1' receives traffic
 # from fd30::1
-NS_CHECK_EXEC([bar1], [ping -6 -q -c 3 -i 0.3 -w 2 fd21::2 | FORMAT_PING], \
+NS_CHECK_EXEC([bar1], [ping6 -q -c 3 -i 0.3 -w 2 fd21::2 | FORMAT_PING], \
 [0], [dnl
 3 packets transmitted, 3 received, 0% packet loss, time 0ms
 ])
@@ -324,7 +324,7 @@ ovn-nbctl --wait=hv sync
 AT_CHECK([ovs-appctl dpctl/flush-conntrack])
 
 # East-west DNAT and SNAT: 'bar1' pings fd30::2. 'foo1' receives it.
-NS_CHECK_EXEC([bar1], [ping -6 -q -c 3 -i 0.3 -w 2 fd30::2 | FORMAT_PING], \
+NS_CHECK_EXEC([bar1], [ping6 -q -c 3 -i 0.3 -w 2 fd30::2 | FORMAT_PING], \
 [0], [dnl
 3 packets transmitted, 3 received, 0% packet loss, time 0ms
 ])
@@ -960,7 +960,7 @@ ovn-nbctl --wait=hv sync
 OVS_WAIT_UNTIL([ovs-ofctl dump-flows br-int | grep 'nat(src=fd40::4)'])
 
 # North-South DNAT: 'alice1' should be able to ping 'foo1' via fd30::2
-NS_CHECK_EXEC([alice1], [ping -6 -q -c 3 -i 0.3 -w 2 fd40::2 | FORMAT_PING], \
+NS_CHECK_EXEC([alice1], [ping6 -q -c 3 -i 0.3 -w 2 fd40::2 | FORMAT_PING], \
 [0], [dnl
 3 packets transmitted, 3 received, 0% packet loss, time 0ms
 ])
@@ -978,7 +978,7 @@ icmpv6,orig=(src=fd30::3,dst=fd11::2,id=<cleared>,type=128,code=0),reply=(src=fd
 ])
 
 # North-South DNAT: 'bob1' should be able to ping 'foo1' via fd40::3
-NS_CHECK_EXEC([bob1], [ping -6 -q -c 3 -i 0.3 -w 2 fd40::3 | FORMAT_PING], \
+NS_CHECK_EXEC([bob1], [ping6 -q -c 3 -i 0.3 -w 2 fd40::3 | FORMAT_PING], \
 [0], [dnl
 3 packets transmitted, 3 received, 0% packet loss, time 0ms
 ])
@@ -997,7 +997,7 @@ icmpv6,orig=(src=fd30::4,dst=fd11::2,id=<cleared>,type=128,code=0),reply=(src=fd
 
 # South-North SNAT: 'bar1' pings 'bob1'. But 'bob1' receives traffic
 # from fd40::4
-NS_CHECK_EXEC([bar1], [ping -6 -q -c 3 -i 0.3 -w 2 fd30::4 | FORMAT_PING], \
+NS_CHECK_EXEC([bar1], [ping6 -q -c 3 -i 0.3 -w 2 fd30::4 | FORMAT_PING], \
 [0], [dnl
 3 packets transmitted, 3 received, 0% packet loss, time 0ms
 ])
@@ -1010,7 +1010,7 @@ icmpv6,orig=(src=fd12::2,dst=fd30::4,id=<cleared>,type=128,code=0),reply=(src=fd
 
 # South-North SNAT: 'foo1' pings 'alice1'. But 'alice1' receives traffic
 # from fd40::1
-NS_CHECK_EXEC([foo1], [ping -6 -q -c 3 -i 0.3 -w 2 fd30::3 | FORMAT_PING], \
+NS_CHECK_EXEC([foo1], [ping6 -q -c 3 -i 0.3 -w 2 fd30::3 | FORMAT_PING], \
 [0], [dnl
 3 packets transmitted, 3 received, 0% packet loss, time 0ms
 ])
@@ -1232,7 +1232,7 @@ NS_CHECK_EXEC([alice1], [ping -q -c 3 -i 0.3 -w 2 30.0.0.2 | FORMAT_PING], \
 ])
 
 # North-South DNAT: 'alice16' should be able to ping 'foo16' via fd30::2
-NS_CHECK_EXEC([alice16], [ping -6 -q -c 3 -i 0.3 -w 2 fd40::2 | FORMAT_PING], \
+NS_CHECK_EXEC([alice16], [ping6 -q -c 3 -i 0.3 -w 2 fd40::2 | FORMAT_PING], \
 [0], [dnl
 3 packets transmitted, 3 received, 0% packet loss, time 0ms
 ])
@@ -1265,7 +1265,7 @@ NS_CHECK_EXEC([bob1], [ping -q -c 3 -i 0.3 -w 2 30.0.0.3 | FORMAT_PING], \
 ])
 
 # North-South DNAT: 'bob16' should be able to ping 'foo16' via fd40::3
-NS_CHECK_EXEC([bob16], [ping -6 -q -c 3 -i 0.3 -w 2 fd40::3 | FORMAT_PING], \
+NS_CHECK_EXEC([bob16], [ping6 -q -c 3 -i 0.3 -w 2 fd40::3 | FORMAT_PING], \
 [0], [dnl
 3 packets transmitted, 3 received, 0% packet loss, time 0ms
 ])
@@ -1300,7 +1300,7 @@ NS_CHECK_EXEC([bar1], [ping -q -c 3 -i 0.3 -w 2 172.16.1.4 | FORMAT_PING], \
 ])
 # South-North SNAT: 'bar16' pings 'bob16'. But 'bob16' receives traffic
 # from fd40::4
-NS_CHECK_EXEC([bar16], [ping -6 -q -c 3 -i 0.3 -w 2 fd30::4 | FORMAT_PING], \
+NS_CHECK_EXEC([bar16], [ping6 -q -c 3 -i 0.3 -w 2 fd30::4 | FORMAT_PING], \
 [0], [dnl
 3 packets transmitted, 3 received, 0% packet loss, time 0ms
 ])
@@ -1324,7 +1324,7 @@ NS_CHECK_EXEC([foo1], [ping -q -c 3 -i 0.3 -w 2 172.16.1.3 | FORMAT_PING], \
 
 # South-North SNAT: 'foo16' pings 'alice16'. But 'alice16' receives traffic
 # from fd40::1
-NS_CHECK_EXEC([foo16], [ping -6 -q -c 3 -i 0.3 -w 2 fd30::3 | FORMAT_PING], \
+NS_CHECK_EXEC([foo16], [ping6 -q -c 3 -i 0.3 -w 2 fd30::3 | FORMAT_PING], \
 [0], [dnl
 3 packets transmitted, 3 received, 0% packet loss, time 0ms
 ])
@@ -2312,8 +2312,7 @@ CHECK_CONNTRACK_NAT()
 ovn_start
 OVS_TRAFFIC_VSWITCHD_START()
 ADD_BR([br-int])
-check ovs-vsctl add-br br-ext
-
+ADD_BR([br-ext], [set Bridge br-ext fail-mode=standalone])
 
 # Set external-ids in br-int needed for ovn-controller
 ovs-vsctl \
@@ -3699,7 +3698,7 @@ ovn-nbctl --wait=hv sync
 OVS_WAIT_UNTIL([ovs-ofctl dump-flows br-int | grep 'nat(src=fd20::1)'])
 
 # North-South DNAT: 'alice1' pings 'foo1' using fd20::3
-NS_CHECK_EXEC([alice1], [ping -6 -q -c 3 -i 0.3 -w 2 fd20::3 | FORMAT_PING], \
+NS_CHECK_EXEC([alice1], [ping6 -q -c 3 -i 0.3 -w 2 fd20::3 | FORMAT_PING], \
 [0], [dnl
 3 packets transmitted, 3 received, 0% packet loss, time 0ms
 ])
@@ -3712,7 +3711,7 @@ icmpv6,orig=(src=fd20::2,dst=fd20::3,id=<cleared>,type=128,code=0),reply=(src=fd
 
 # South-North SNAT: 'foo2' pings 'alice1'. But 'alice1' receives traffic
 # from 172.16.1.4
-NS_CHECK_EXEC([foo2], [ping -6 -q -c 3 -i 0.3 -w 2 fd20::2 | FORMAT_PING], \
+NS_CHECK_EXEC([foo2], [ping6 -q -c 3 -i 0.3 -w 2 fd20::2 | FORMAT_PING], \
 [0], [dnl
 3 packets transmitted, 3 received, 0% packet loss, time 0ms
 ])
@@ -3727,7 +3726,7 @@ AT_CHECK([ovs-appctl dpctl/flush-conntrack])
 
 # South-North SNAT: 'bar1' pings 'alice1'. But 'alice1' receives traffic
 # from fd20::1
-NS_CHECK_EXEC([bar1], [ping -6 -q -c 3 -i 0.3 -w 2 fd20::2 | FORMAT_PING], \
+NS_CHECK_EXEC([bar1], [ping6 -q -c 3 -i 0.3 -w 2 fd20::2 | FORMAT_PING], \
 [0], [dnl
 3 packets transmitted, 3 received, 0% packet loss, time 0ms
 ])
@@ -4555,13 +4554,13 @@ NS_CHECK_EXEC([lsp], [nc 88.88.88.89 8080 -z], [0])
 
 # Capture IPv4 UDP hairpinned packets.
 filter="dst 42.42.42.1 and dst port 2021 and udp"
-NS_CHECK_EXEC([lsp], [tcpdump -n -c 2 -i lsp ${filter} > lsp.pcap &])
+NS_CHECK_EXEC([lsp], [tcpdump -nn -c 2 -i lsp ${filter} > lsp.pcap &])
 
 sleep 1
 
 # Generate IPv4 UDP hairpin traffic.
-NS_CHECK_EXEC([lsp], [nc -u 88.88.88.88 4040 -z &], [0])
-NS_CHECK_EXEC([lsp], [nc -u 88.88.88.89 4040 -z &], [0])
+NS_CHECK_EXEC([lsp], [echo a | nc -u 88.88.88.88 4040 &], [0])
+NS_CHECK_EXEC([lsp], [echo a | nc -u 88.88.88.89 4040 &], [0])
 
 # Check hairpin traffic.
 OVS_WAIT_UNTIL([
@@ -4639,15 +4638,15 @@ NS_CHECK_EXEC([lsp], [timeout 2s nc -k -l 4200::1 4041 &], [0])
 NS_CHECK_EXEC([lsp], [nc 8800::0088 8080 -z], [0])
 NS_CHECK_EXEC([lsp], [nc 8800::0089 8080 -z], [0])
 
-# Capture IPv4 UDP hairpinned packets.
+# Capture IPv6 UDP hairpinned packets.
 filter="dst 4200::1 and dst port 2021 and udp"
-NS_CHECK_EXEC([lsp], [tcpdump -n -c 2 -i lsp $filter > lsp.pcap &])
+NS_CHECK_EXEC([lsp], [tcpdump -nn -c 2 -i lsp $filter > lsp.pcap &])
 
 sleep 1
 
 # Generate IPv6 UDP hairpin traffic.
-NS_CHECK_EXEC([lsp], [nc -u 8800::0088 4040 -z &], [0])
-NS_CHECK_EXEC([lsp], [nc -u 8800::0089 4040 -z &], [0])
+NS_CHECK_EXEC([lsp], [echo a | nc -u 8800::0088 4040 &], [0])
+NS_CHECK_EXEC([lsp], [echo a | nc -u 8800::0089 4040 &], [0])
 
 # Check hairpin traffic.
 OVS_WAIT_UNTIL([
@@ -4757,25 +4756,21 @@ ADD_VETH(sw1-p1-rej, sw1-p1-rej, br-int, "20.0.0.3/24", "40:54:00:00:00:03", \
 sleep 1
 
 # Capture packets in sw0-p1-rej.
-NS_CHECK_EXEC([sw0-p1-rej], [tcpdump -n -c 4 -i sw0-p1-rej tcp > sw0-p1-rej-ip4.pcap &], [0])
+NS_CHECK_EXEC([sw0-p1-rej], [tcpdump -nn -c 4 -i sw0-p1-rej tcp > sw0-p1-rej-ip4.pcap &], [0])
 
 sleep 1
 
 OVS_WAIT_UNTIL([
-    ip netns exec sw0-p1-rej nc  10.0.0.4 80 2> r
-    res=$(cat r)
-    test "$res" = "Ncat: Connection refused."
+    ip netns exec sw0-p1-rej nc -vz 10.0.0.4 80 2>&1 | grep -i 'connection refused'
 ])
 
 # Now send traffic to port 84
 OVS_WAIT_UNTIL([
-    ip netns exec sw0-p1-rej nc  10.0.0.4 84 2> r
-    res=$(cat r)
-    test "$res" = "Ncat: Connection refused."
+    ip netns exec sw0-p1-rej nc -vz 10.0.0.4 84 2>&1 | grep -i 'connection refused'
 ])
 
 OVS_WAIT_UNTIL([
-    n_pkt=$(ovs-ofctl dump-flows br-int table=45 | grep -v n_packets=0 | \
+    n_pkt=$(ovs-ofctl dump-flows br-int table=44 | grep -v n_packets=0 | \
 grep controller | grep tp_dst=84 -c)
     test $n_pkt -eq 1
 ])
@@ -4789,14 +4784,12 @@ OVS_WAIT_UNTIL([
 # Without this sleep, test case fails intermittently.
 sleep 3
 
-NS_CHECK_EXEC([sw0-p2-rej], [tcpdump -n -c 2 -i sw0-p2-rej tcp port 80 > sw0-p2-rej-ip6.pcap &], [0])
+NS_CHECK_EXEC([sw0-p2-rej], [tcpdump -nn -c 2 -i sw0-p2-rej tcp port 80 > sw0-p2-rej-ip6.pcap &], [0])
 
 sleep 1
 
 OVS_WAIT_UNTIL([
-    ip netns exec sw0-p2-rej nc -6 aef0::3 80 2> r
-    res=$(cat r)
-    test "$res" = "Ncat: Connection refused."
+    ip netns exec sw0-p2-rej nc -vz6 aef0::3 80 2>&1 | grep -i 'connection refused'
 ])
 
 
@@ -4811,57 +4804,55 @@ ovn-nbctl acl-add sw1 to-lport 1004 "ip" allow-related
 ovn-nbctl --log acl-add pg0 to-lport 1004 "outport == @pg0 && ip && tcp && tcp.dst == 84" reject
 
 OVS_WAIT_UNTIL([
-    ip netns exec sw1-p1-rej nc  10.0.0.4 84 2> r
-    res=$(cat r)
-    test "$res" = "Ncat: Connection refused."
+    ip netns exec sw1-p1-rej nc -vz 10.0.0.4 84 2>&1 | grep -i 'connection refused'
 ])
 
 # Now test for IPv4 UDP.
-NS_CHECK_EXEC([sw0-p1-rej], [tcpdump -n -c 1 -i sw0-p1-rej udp port 90 > sw0-p1-rej-udp.pcap &], [0])
-NS_CHECK_EXEC([sw0-p1-rej], [tcpdump -n -c 1 -i sw0-p1-rej icmp > sw0-p1-rej-icmp.pcap &], [0])
+NS_CHECK_EXEC([sw0-p1-rej], [tcpdump -nn -c 1 -i sw0-p1-rej udp port 90 > sw0-p1-rej-udp.pcap &], [0])
+NS_CHECK_EXEC([sw0-p1-rej], [tcpdump -nn -c 1 -i sw0-p1-rej icmp > sw0-p1-rej-icmp.pcap &], [0])
 
 printf '.%.0s' {1..100} > foo
 OVS_WAIT_UNTIL([
     ip netns exec sw0-p1-rej nc -u 10.0.0.4 90 < foo
     c=$(cat sw0-p1-rej-icmp.pcap | grep \
-"10.0.0.4 > 10.0.0.3: ICMP 10.0.0.4 udp port dnsix unreachable" | uniq | wc -l)
+"10.0.0.4 > 10.0.0.3: ICMP 10.0.0.4 udp port 90 unreachable" | uniq | wc -l)
     test $c -eq 1
 ])
 
 rm -f *.pcap
 
-NS_CHECK_EXEC([sw0-p1-rej], [tcpdump -n -c 1 -i sw0-p1-rej udp port 94 > sw0-p1-rej-udp.pcap &], [0])
-NS_CHECK_EXEC([sw0-p1-rej], [tcpdump -n -c 1 -i sw0-p1-rej icmp > sw0-p1-rej-icmp.pcap &], [0])
+NS_CHECK_EXEC([sw0-p1-rej], [tcpdump -nn -c 1 -i sw0-p1-rej udp port 94 > sw0-p1-rej-udp.pcap &], [0])
+NS_CHECK_EXEC([sw0-p1-rej], [tcpdump -nn -c 1 -i sw0-p1-rej icmp > sw0-p1-rej-icmp.pcap &], [0])
 
 OVS_WAIT_UNTIL([
     ip netns exec sw0-p1-rej nc -u 10.0.0.4 94 < foo
     c=$(cat sw0-p1-rej-icmp.pcap | grep \
-"10.0.0.4 > 10.0.0.3: ICMP 10.0.0.4 udp port objcall unreachable" | uniq | wc -l)
+"10.0.0.4 > 10.0.0.3: ICMP 10.0.0.4 udp port 94 unreachable" | uniq | wc -l)
     test $c -eq 1
 ])
 
 # Now test for IPv6 UDP.
-NS_CHECK_EXEC([sw0-p2-rej], [tcpdump -n -c 1 -i sw0-p2-rej udp port 90 > sw0-p2-rej-ip6-udp.pcap &], [0])
-NS_CHECK_EXEC([sw0-p2-rej], [tcpdump -n -c 1 -i sw0-p2-rej icmp6 > sw0-p2-rej-icmp6.pcap &], [0])
+NS_CHECK_EXEC([sw0-p2-rej], [tcpdump -nn -c 1 -i sw0-p2-rej udp port 90 > sw0-p2-rej-ip6-udp.pcap &], [0])
+NS_CHECK_EXEC([sw0-p2-rej], [tcpdump -nn -c 1 -i sw0-p2-rej icmp6 > sw0-p2-rej-icmp6.pcap &], [0])
 
 OVS_WAIT_UNTIL([
     ip netns exec sw0-p2-rej nc -u -6 aef0::3 90 < foo
     c=$(cat sw0-p2-rej-icmp6.pcap | grep \
 "IP6 aef0::3 > aef0::4: ICMP6, destination unreachable, unreachable port, \
-aef0::3 udp port dnsix" | uniq | wc -l)
+aef0::3 udp port 90" | uniq | wc -l)
     test $c -eq 1
 ])
 
 rm -f *.pcap
 
-NS_CHECK_EXEC([sw0-p2-rej], [tcpdump -n -c 1 -i sw0-p2-rej udp port 94 > sw0-p2-rej-ip6-udp.pcap &], [0])
-NS_CHECK_EXEC([sw0-p2-rej], [tcpdump -n -c 1 -i sw0-p2-rej icmp6 > sw0-p2-rej-icmp6.pcap &], [0])
+NS_CHECK_EXEC([sw0-p2-rej], [tcpdump -nn -c 1 -i sw0-p2-rej udp port 94 > sw0-p2-rej-ip6-udp.pcap &], [0])
+NS_CHECK_EXEC([sw0-p2-rej], [tcpdump -nn -c 1 -i sw0-p2-rej icmp6 > sw0-p2-rej-icmp6.pcap &], [0])
 
 OVS_WAIT_UNTIL([
     ip netns exec sw0-p2-rej nc -u -6 aef0::3 94 < foo
     c=$(cat sw0-p2-rej-icmp6.pcap | grep \
 "IP6 aef0::3 > aef0::4: ICMP6, destination unreachable, unreachable port, \
-aef0::3 udp port objcall" | uniq | wc -l)
+aef0::3 udp port 94" | uniq | wc -l)
     test $c -eq 1
 ])
 
@@ -4871,39 +4862,34 @@ ovn-nbctl pg-add pg0 sw0-p1-rej sw0-p2-rej
 ovn-nbctl --log acl-add pg0 from-lport 1004 "inport == @pg0 && ip && (tcp || udp)" reject
 
 OVS_WAIT_UNTIL([
-    ip netns exec sw0-p1-rej nc  10.0.0.4 80 2> r
-    res=$(cat r)
-    echo "result = $res"
-    test "$res" = "Ncat: Connection refused."
+    ip netns exec sw0-p1-rej nc -vz 10.0.0.4 80 2>&1 | grep -i 'connection refused'
 ])
 
 OVS_WAIT_UNTIL([
-    ip netns exec sw0-p2-rej nc -6 aef0::3 80 2> r
-    res=$(cat r)
-    test "$res" = "Ncat: Connection refused."
+    ip netns exec sw0-p2-rej nc -vz6 aef0::3 80 2>&1 | grep -i 'connection refused'
 ])
 
 rm -f *.pcap
 
-NS_CHECK_EXEC([sw0-p1-rej], [tcpdump -n -c 1 -i sw0-p1-rej icmp > sw0-p1-rej-icmp.pcap &], [0])
+NS_CHECK_EXEC([sw0-p1-rej], [tcpdump -nn -c 1 -i sw0-p1-rej icmp > sw0-p1-rej-icmp.pcap &], [0])
 
 printf '.%.0s' {1..100} > foo
 OVS_WAIT_UNTIL([
     ip netns exec sw0-p1-rej nc -u 10.0.0.4 90 < foo
     c=$(cat sw0-p1-rej-icmp.pcap | grep \
-"10.0.0.4 > 10.0.0.3: ICMP 10.0.0.4 udp port dnsix unreachable" | uniq | wc -l)
+"10.0.0.4 > 10.0.0.3: ICMP 10.0.0.4 udp port 90 unreachable" | uniq | wc -l)
     test $c -eq 1
 ])
 
 rm -f *.pcap
 # Now test for IPv6 UDP.
-NS_CHECK_EXEC([sw0-p2-rej], [tcpdump -n -c 1 -i sw0-p2-rej icmp6 > sw0-p2-rej-icmp6.pcap &], [0])
+NS_CHECK_EXEC([sw0-p2-rej], [tcpdump -nn -c 1 -i sw0-p2-rej icmp6 > sw0-p2-rej-icmp6.pcap &], [0])
 
 OVS_WAIT_UNTIL([
     ip netns exec sw0-p2-rej nc -u -6 aef0::3 90 < foo
     c=$(cat sw0-p2-rej-icmp6.pcap | grep \
 "IP6 aef0::3 > aef0::4: ICMP6, destination unreachable, unreachable port, \
-aef0::3 udp port dnsix" | uniq | wc -l)
+aef0::3 udp port 90" | uniq | wc -l)
     test $c -eq 1
 ])
 
@@ -5310,6 +5296,196 @@ OVS_TRAFFIC_VSWITCHD_STOP(["/failed to query port patch-.*/d
 AT_CLEANUP
 ])
 
+OVN_FOR_EACH_NORTHD([
+AT_SETUP([ovn -- load-balancer and firewall tuple conflict IPv4])
+AT_SKIP_IF([test $HAVE_NC = no])
+AT_KEYWORDS([ovnlb])
+
+CHECK_CONNTRACK()
+CHECK_CONNTRACK_NAT()
+ovn_start
+OVS_TRAFFIC_VSWITCHD_START()
+OVS_CHECK_CT_ZERO_SNAT()
+ADD_BR([br-int])
+
+# Set external-ids in br-int needed for ovn-controller
+ovs-vsctl \
+        -- set Open_vSwitch . external-ids:system-id=hv1 \
+        -- set Open_vSwitch . external-ids:ovn-remote=unix:$ovs_base/ovn-sb/ovn-sb.sock \
+        -- set Open_vSwitch . external-ids:ovn-encap-type=geneve \
+        -- set Open_vSwitch . external-ids:ovn-encap-ip=169.0.0.1 \
+        -- set bridge br-int fail-mode=secure other-config:disable-in-band=true
+
+# Start ovn-controller
+start_daemon ovn-controller
+
+# Logical network:
+# 1 logical switch connetected to one logical router.
+# 2 VMs, one used as backend for a load balancer.
+
+check ovn-nbctl                                                  \
+    -- lr-add rtr                                                \
+    -- lrp-add rtr rtr-ls 00:00:00:00:01:00 42.42.42.1/24        \
+    -- ls-add ls                                                 \
+    -- lsp-add ls ls-rtr                                         \
+    -- lsp-set-addresses ls-rtr 00:00:00:00:01:00                \
+    -- lsp-set-type ls-rtr router                                \
+    -- lsp-set-options ls-rtr router-port=rtr-ls                 \
+    -- lsp-add ls vm1 -- lsp-set-addresses vm1 00:00:00:00:00:01 \
+    -- lsp-add ls vm2 -- lsp-set-addresses vm2 00:00:00:00:00:02 \
+    -- lb-add lb-test 66.66.66.66:666 42.42.42.2:4242 tcp        \
+    -- ls-lb-add ls lb-test
+
+ADD_NAMESPACES(vm1)
+ADD_VETH(vm1, vm1, br-int, "42.42.42.2/24", "00:00:00:00:00:01", "42.42.42.1")
+
+ADD_NAMESPACES(vm2)
+ADD_VETH(vm2, vm2, br-int, "42.42.42.3/24", "00:00:00:00:00:02", "42.42.42.1")
+
+# Wait for ovn-controller to catch up.
+wait_for_ports_up
+check ovn-nbctl --wait=hv sync
+
+# Start IPv4 TCP server on vm1.
+NETNS_DAEMONIZE([vm1], [nc -k -l 42.42.42.2 4242], [nc-vm1.pid])
+
+# Make sure connecting to the VIP works.
+NS_CHECK_EXEC([vm2], [nc 66.66.66.66 666 -p 2000 -z])
+
+# Start IPv4 TCP connection to VIP from vm2.
+NS_CHECK_EXEC([vm2], [nc 66.66.66.66 666 -p 2001 -z])
+
+# Check conntrack.  We expect two entries:
+# - one in vm1's zone (firewall)
+# - one in vm2's zone (dnat)
+AT_CHECK([ovs-appctl dpctl/dump-conntrack | grep 2001 |             \
+grep "orig=.src=42\.42\.42\.3" |                                    \
+sed -e 's/port=2001/port=<clnt_s_port>/g'                           \
+    -e 's/sport=4242,dport=[[0-9]]\+/sport=4242,dport=<rnd_port>/g' \
+    -e 's/state=[[0-9_A-Z]]*/state=<cleared>/g'                     \
+    -e 's/zone=[[0-9]]*/zone=<cleared>/' | sort], [0], [dnl
+tcp,orig=(src=42.42.42.3,dst=42.42.42.2,sport=<clnt_s_port>,dport=4242),reply=(src=42.42.42.2,dst=42.42.42.3,sport=4242,dport=<clnt_s_port>),zone=<cleared>,protoinfo=(state=<cleared>)
+tcp,orig=(src=42.42.42.3,dst=66.66.66.66,sport=<clnt_s_port>,dport=666),reply=(src=42.42.42.2,dst=42.42.42.3,sport=4242,dport=<clnt_s_port>),zone=<cleared>,labels=0x2,protoinfo=(state=<cleared>)
+])
+
+# Start IPv4 TCP connection to backend IP from vm2 which would require
+# additional source port translation to avoid a tuple conflict.
+NS_CHECK_EXEC([vm2], [nc 42.42.42.2 4242 -p 2001 -z])
+
+# Check conntrack.  We expect three entries:
+# - one in vm1's zone (firewall) - reused from the previous connection.
+# - one in vm2's zone (dnat) - still in TIME_WAIT after the previous connection.
+# - one in vm2's zone (firewall + additional all-zero SNAT)
+AT_CHECK([ovs-appctl dpctl/dump-conntrack | grep 2001 |             \
+grep "orig=.src=42\.42\.42\.3" |                                    \
+sed -e 's/port=2001/port=<clnt_s_port>/g'                           \
+    -e 's/sport=4242,dport=[[0-9]]\+/sport=4242,dport=<rnd_port>/g' \
+    -e 's/state=[[0-9_A-Z]]*/state=<cleared>/g'                     \
+    -e 's/zone=[[0-9]]*/zone=<cleared>/' | sort], [0], [dnl
+tcp,orig=(src=42.42.42.3,dst=42.42.42.2,sport=<clnt_s_port>,dport=4242),reply=(src=42.42.42.2,dst=42.42.42.3,sport=4242,dport=<clnt_s_port>),zone=<cleared>,protoinfo=(state=<cleared>)
+tcp,orig=(src=42.42.42.3,dst=42.42.42.2,sport=<clnt_s_port>,dport=4242),reply=(src=42.42.42.2,dst=42.42.42.3,sport=4242,dport=<rnd_port>),zone=<cleared>,protoinfo=(state=<cleared>)
+tcp,orig=(src=42.42.42.3,dst=66.66.66.66,sport=<clnt_s_port>,dport=666),reply=(src=42.42.42.2,dst=42.42.42.3,sport=4242,dport=<clnt_s_port>),zone=<cleared>,labels=0x2,protoinfo=(state=<cleared>)
+])
+
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD([
+AT_SETUP([ovn -- load-balancer and firewall tuple conflict IPv6])
+AT_SKIP_IF([test $HAVE_NC = no])
+AT_KEYWORDS([ovnlb])
+
+CHECK_CONNTRACK()
+CHECK_CONNTRACK_NAT()
+ovn_start
+OVS_TRAFFIC_VSWITCHD_START()
+OVS_CHECK_CT_ZERO_SNAT()
+ADD_BR([br-int])
+
+# Set external-ids in br-int needed for ovn-controller
+ovs-vsctl \
+        -- set Open_vSwitch . external-ids:system-id=hv1 \
+        -- set Open_vSwitch . external-ids:ovn-remote=unix:$ovs_base/ovn-sb/ovn-sb.sock \
+        -- set Open_vSwitch . external-ids:ovn-encap-type=geneve \
+        -- set Open_vSwitch . external-ids:ovn-encap-ip=169.0.0.1 \
+        -- set bridge br-int fail-mode=secure other-config:disable-in-band=true
+
+# Start ovn-controller
+start_daemon ovn-controller
+
+# Logical network:
+# 1 logical switch connetected to one logical router.
+# 2 VMs, one used as backend for a load balancer.
+
+check ovn-nbctl                                                  \
+    -- lr-add rtr                                                \
+    -- lrp-add rtr rtr-ls 00:00:00:00:01:00 4242::1/64           \
+    -- ls-add ls                                                 \
+    -- lsp-add ls ls-rtr                                         \
+    -- lsp-set-addresses ls-rtr 00:00:00:00:01:00                \
+    -- lsp-set-type ls-rtr router                                \
+    -- lsp-set-options ls-rtr router-port=rtr-ls                 \
+    -- lsp-add ls vm1 -- lsp-set-addresses vm1 00:00:00:00:00:01 \
+    -- lsp-add ls vm2 -- lsp-set-addresses vm2 00:00:00:00:00:02 \
+    -- lb-add lb-test [[6666::1]]:666 [[4242::2]]:4242 tcp       \
+    -- ls-lb-add ls lb-test
+
+ADD_NAMESPACES(vm1)
+ADD_VETH(vm1, vm1, br-int, "4242::2/64", "00:00:00:00:00:01", "4242::1")
+OVS_WAIT_UNTIL([test "$(ip netns exec vm1 ip a | grep 4242::2 | grep tentative)" = ""])
+
+ADD_NAMESPACES(vm2)
+ADD_VETH(vm2, vm2, br-int, "4242::3/64", "00:00:00:00:00:02", "4242::1")
+OVS_WAIT_UNTIL([test "$(ip netns exec vm2 ip a | grep 4242::3 | grep tentative)" = ""])
+
+# Wait for ovn-controller to catch up.
+wait_for_ports_up
+check ovn-nbctl --wait=hv sync
+
+# Start IPv6 TCP server on vm1.
+NETNS_DAEMONIZE([vm1], [nc -k -l 4242::2 4242], [nc-vm1.pid])
+
+# Make sure connecting to the VIP works.
+NS_CHECK_EXEC([vm2], [nc 6666::1 666 -p 2000 -z])
+
+# Start IPv6 TCP connection to VIP from vm2.
+NS_CHECK_EXEC([vm2], [nc 6666::1 666 -p 2001 -z])
+
+# Check conntrack.  We expect two entries:
+# - one in vm1's zone (firewall)
+# - one in vm2's zone (dnat)
+AT_CHECK([ovs-appctl dpctl/dump-conntrack | grep 2001 |             \
+grep "orig=.src=4242::3" |                                         \
+sed -e 's/port=2001/port=<clnt_s_port>/g'                           \
+    -e 's/sport=4242,dport=[[0-9]]\+/sport=4242,dport=<rnd_port>/g' \
+    -e 's/state=[[0-9_A-Z]]*/state=<cleared>/g'                     \
+    -e 's/zone=[[0-9]]*/zone=<cleared>/' | sort], [0], [dnl
+tcp,orig=(src=4242::3,dst=4242::2,sport=<clnt_s_port>,dport=4242),reply=(src=4242::2,dst=4242::3,sport=4242,dport=<clnt_s_port>),zone=<cleared>,protoinfo=(state=<cleared>)
+tcp,orig=(src=4242::3,dst=6666::1,sport=<clnt_s_port>,dport=666),reply=(src=4242::2,dst=4242::3,sport=4242,dport=<clnt_s_port>),zone=<cleared>,labels=0x2,protoinfo=(state=<cleared>)
+])
+
+# Start IPv6 TCP connection to backend IP from vm2 which would require
+# additional source port translation to avoid a tuple conflict.
+NS_CHECK_EXEC([vm2], [nc 4242::2 4242 -p 2001 -z])
+
+# Check conntrack.  We expect three entries:
+# - one in vm1's zone (firewall) - reused from the previous connection.
+# - one in vm2's zone (dnat) - still in TIME_WAIT after the previous connection.
+# - one in vm2's zone (firewall + additional all-zero SNAT)
+AT_CHECK([ovs-appctl dpctl/dump-conntrack | grep 2001 |             \
+grep "orig=.src=4242::3" |                                          \
+sed -e 's/port=2001/port=<clnt_s_port>/g'                           \
+    -e 's/sport=4242,dport=[[0-9]]\+/sport=4242,dport=<rnd_port>/g' \
+    -e 's/state=[[0-9_A-Z]]*/state=<cleared>/g'                     \
+    -e 's/zone=[[0-9]]*/zone=<cleared>/' | sort], [0], [dnl
+tcp,orig=(src=4242::3,dst=4242::2,sport=<clnt_s_port>,dport=4242),reply=(src=4242::2,dst=4242::3,sport=4242,dport=<clnt_s_port>),zone=<cleared>,protoinfo=(state=<cleared>)
+tcp,orig=(src=4242::3,dst=4242::2,sport=<clnt_s_port>,dport=4242),reply=(src=4242::2,dst=4242::3,sport=4242,dport=<rnd_port>),zone=<cleared>,protoinfo=(state=<cleared>)
+tcp,orig=(src=4242::3,dst=6666::1,sport=<clnt_s_port>,dport=666),reply=(src=4242::2,dst=4242::3,sport=4242,dport=<clnt_s_port>),zone=<cleared>,labels=0x2,protoinfo=(state=<cleared>)
+])
+
+AT_CLEANUP
+])
+
 # When a lport is released on a chassis, ovn-controller was
 # not clearing some of the flowss in the table 33 leading
 # to packet drops if ct() is hit.
@@ -5524,6 +5700,168 @@ icmp,orig=(src=172.16.0.1,dst=10.0.0.2,id=<cleared>,type=8,code=0),reply=(src=10
 # Like with conntrack entries, we shouldn't try to predict
 # port binding tunnel keys. So omit them from expected labels.
 AT_CHECK([ovs-appctl dpctl/dump-flows | grep 'ct_state(+new-est-rpl+trk).*ct(.*label=0x.*00000401020400000000/.*)' -c], [0], [dnl
+1
+])
+AT_CHECK([ovs-appctl dpctl/dump-flows | grep 'ct_state(-new+est+rpl+trk).*ct_label(0x.*00000401020400000000/.*)' -c], [0], [dnl
+1
+])
+
+ovs-ofctl dump-flows br-int
+
+OVS_APP_EXIT_AND_WAIT([ovn-controller])
+
+as ovn-sb
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+
+as ovn-nb
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+
+as northd
+OVS_APP_EXIT_AND_WAIT([ovn-northd])
+
+as
+OVS_TRAFFIC_VSWITCHD_STOP(["/failed to query port patch-.*/d
+/connection dropped.*/d"])
+
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD([
+AT_SETUP([ovn -- ECMP IPv6 symmetric reply])
+AT_KEYWORDS([ecmp])
+
+CHECK_CONNTRACK()
+ovn_start
+
+OVS_TRAFFIC_VSWITCHD_START()
+ADD_BR([br-int])
+
+# Set external-ids in br-int needed for ovn-controller
+ovs-vsctl \
+        -- set Open_vSwitch . external-ids:system-id=hv1 \
+        -- set Open_vSwitch . external-ids:ovn-remote=unix:$ovs_base/ovn-sb/ovn-sb.sock \
+        -- set Open_vSwitch . external-ids:ovn-encap-type=geneve \
+        -- set Open_vSwitch . external-ids:ovn-encap-ip=169.0.0.1 \
+        -- set bridge br-int fail-mode=secure other-config:disable-in-band=true
+
+# Start ovn-controller
+start_daemon ovn-controller
+
+# Logical network:
+# Alice is connected to gateway router R1. R1 is connected to two "external"
+# routers, R2 and R3 via an "ext" switch.
+# Bob is connected to both R2 and R3. R1 contains two ECMP routes, one through R2
+# and one through R3, to Bob.
+#
+#     alice -- R1 -- ext ---- R2
+#                     |         \
+#                     |           bob
+#                     |         /
+#                     + ----- R3
+#
+# For this test, Bob sends request traffic through R2 to Alice. We want to ensure that
+# all response traffic from Alice is routed through R2 as well.
+
+ovn-nbctl create Logical_Router name=R1 options:chassis=hv1
+ovn-nbctl create Logical_Router name=R2
+ovn-nbctl create Logical_Router name=R3
+
+ovn-nbctl ls-add alice
+ovn-nbctl ls-add bob
+ovn-nbctl ls-add ext
+
+# connect alice to R1
+ovn-nbctl lrp-add R1 alice 00:00:01:01:02:03 fd01::1/64
+ovn-nbctl lsp-add alice rp-alice -- set Logical_Switch_Port rp-alice \
+    type=router options:router-port=alice addresses='"00:00:01:01:02:03"'
+
+# connect bob to R2
+ovn-nbctl lrp-add R2 R2_bob 00:00:02:01:02:03 fd07::2/64
+ovn-nbctl lsp-add bob rp2-bob -- set Logical_Switch_Port rp2-bob \
+    type=router options:router-port=R2_bob addresses='"00:00:02:01:02:03"'
+
+# connect bob to R3
+ovn-nbctl lrp-add R3 R3_bob 00:00:02:01:02:04 fd07::3/64
+ovn-nbctl lsp-add bob rp3-bob -- set Logical_Switch_Port rp3-bob \
+    type=router options:router-port=R3_bob addresses='"00:00:02:01:02:04"'
+
+# Connect R1 to ext
+ovn-nbctl lrp-add R1 R1_ext 00:00:04:01:02:03 fd02::1/64
+ovn-nbctl lsp-add ext r1-ext -- set Logical_Switch_Port r1-ext \
+    type=router options:router-port=R1_ext addresses='"00:00:04:01:02:03"'
+
+# Connect R2 to ext
+ovn-nbctl lrp-add R2 R2_ext 00:00:04:01:02:04 fd02::2/64
+ovn-nbctl lsp-add ext r2-ext -- set Logical_Switch_Port r2-ext \
+    type=router options:router-port=R2_ext addresses='"00:00:04:01:02:04"'
+
+# Connect R3 to ext
+ovn-nbctl lrp-add R3 R3_ext 00:00:04:01:02:05 fd02::3/64
+ovn-nbctl lsp-add ext r3-ext -- set Logical_Switch_Port r3-ext \
+    type=router options:router-port=R3_ext addresses='"00:00:04:01:02:05"'
+
+# Install ECMP routes for alice.
+ovn-nbctl --ecmp-symmetric-reply --policy="src-ip" lr-route-add R1 fd01::/126 fd02::2
+ovn-nbctl --ecmp-symmetric-reply --policy="src-ip" lr-route-add R1 fd01::/126 fd02::3
+
+# Static Routes
+ovn-nbctl lr-route-add R2 fd01::/64 fd02::1
+ovn-nbctl lr-route-add R3 fd01::/64 fd02::1
+
+# Logical port 'alice1' in switch 'alice'.
+ADD_NAMESPACES(alice1)
+ADD_VETH(alice1, alice1, br-int, "fd01::2/64", "f0:00:00:01:02:04", \
+         "fd01::1")
+OVS_WAIT_UNTIL([test "$(ip netns exec alice1 ip a | grep fd01::2 | grep tentative)" = ""])
+ovn-nbctl lsp-add alice alice1 \
+-- lsp-set-addresses alice1 "f0:00:00:01:02:04 fd01::2"
+
+# Logical port 'bob1' in switch 'bob'.
+ADD_NAMESPACES(bob1)
+ADD_VETH(bob1, bob1, br-int, "fd07::1/64", "f0:00:00:01:02:06", \
+         "fd07::2")
+OVS_WAIT_UNTIL([test "$(ip netns exec bob1 ip a | grep fd07::1 | grep tentative)" = ""])
+ovn-nbctl lsp-add bob bob1 \
+-- lsp-set-addresses bob1 "f0:00:00:01:02:06 fd07::1"
+
+# Ensure ovn-controller is caught up
+ovn-nbctl --wait=hv sync
+
+on_exit 'ovs-ofctl dump-flows br-int'
+
+# Later in this test we will check for a datapath flow that matches:
+# "ct_state(+new-est-rpl+trk).*ct(.*label=0x200000401020400000000/.*)". Due
+# to the way OVS generates datapath flows with wildcards, ICMPv6 NS flows will
+# evict this datapath flow. In order to ensure that the flow does not
+# get evicted, we send one ping packet in order to carry out neighbor
+# discovery. We then flush the datpath to remove the NS flows so that the flow
+# "ct_state(+new-est-rpl+trk).*ct(.*label=0x200000401020400000000/.*)" will
+# be present when we check for it.
+NS_CHECK_EXEC([bob1], [ping -q -c 2 -i 0.3 -w 15 fd01::2 | FORMAT_PING], \
+[0], [dnl
+2 packets transmitted, 2 received, 0% packet loss, time 0ms
+])
+ovs-appctl dpctl/del-flows
+
+# 'bob1' should be able to ping 'alice1' directly.
+NS_CHECK_EXEC([bob1], [ping -q -c 20 -i 0.3 -w 15 fd01::2 | FORMAT_PING], \
+[0], [dnl
+20 packets transmitted, 20 received, 0% packet loss, time 0ms
+])
+
+# Ensure conntrack entry is present. We should not try to predict
+# the tunnel key for the output port, so we strip it from the labels
+# and just ensure that the known ethernet address is present.
+AT_CHECK([ovs-appctl dpctl/dump-conntrack | FORMAT_CT(fd01::2) | \
+sed -e 's/zone=[[0-9]]*/zone=<cleared>/' |
+sed -e 's/labels=0x[[0-9a-f]]*00000401020400000000/labels=0x00000401020400000000/'], [0], [dnl
+icmpv6,orig=(src=fd07::1,dst=fd01::2,id=<cleared>,type=128,code=0),reply=(src=fd01::2,dst=fd07::1,id=<cleared>,type=129,code=0),zone=<cleared>,labels=0x00000401020400000000
+])
+
+# Ensure datapaths show conntrack states as expected
+# Like with conntrack entries, we shouldn't try to predict
+# port binding tunnel keys. So omit them from expected labels.
+AT_CHECK([ovs-appctl dpctl/dump-flows | grep 'ct_state(+new-est-rpl+trk).*ct(.*label=0x200000401020400000000/.*)' -c], [0], [dnl
 1
 ])
 AT_CHECK([ovs-appctl dpctl/dump-flows | grep 'ct_state(-new+est+rpl+trk).*ct_label(0x.*00000401020400000000/.*)' -c], [0], [dnl
@@ -5901,5 +6239,246 @@ OVS_APP_EXIT_AND_WAIT([ovn-northd])
 as
 OVS_TRAFFIC_VSWITCHD_STOP(["/.*error receiving.*/d
 /.*terminating with signal 15.*/d"])
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD([
+AT_SETUP([ovn -- No ct_state matches in dp flows when no ACLs in an LS])
+AT_KEYWORDS([no ct_state match])
+ovn_start
+
+OVS_TRAFFIC_VSWITCHD_START()
+ADD_BR([br-int])
+
+# Set external-ids in br-int needed for ovn-controller
+ovs-vsctl \
+        -- set Open_vSwitch . external-ids:system-id=hv1 \
+        -- set Open_vSwitch . external-ids:ovn-remote=unix:$ovs_base/ovn-sb/ovn-sb.sock \
+        -- set Open_vSwitch . external-ids:ovn-encap-type=geneve \
+        -- set Open_vSwitch . external-ids:ovn-encap-ip=169.0.0.1 \
+        -- set bridge br-int fail-mode=secure other-config:disable-in-band=true
+
+# Start ovn-controller
+start_daemon ovn-controller
+
+check ovn-nbctl ls-add sw0
+
+check ovn-nbctl lsp-add sw0 sw0-p1
+check ovn-nbctl lsp-set-addresses sw0-p1 "50:54:00:00:00:03"
+check ovn-nbctl lsp-set-port-security sw0-p1 "50:54:00:00:00:03"
+
+check ovn-nbctl lsp-add sw0 sw0-p2
+check ovn-nbctl lsp-set-addresses sw0-p2 "50:54:00:00:00:04 10.0.0.4"
+check ovn-nbctl lsp-set-port-security sw0-p2 "50:54:00:00:00:04 10.0.0.4"
+
+
+# Create the second logical switch with one port and configure some ACLs.
+check ovn-nbctl ls-add sw1
+check ovn-nbctl lsp-add sw1 sw1-p1
+
+# Create port group and ACLs for sw1 ports.
+check ovn-nbctl pg-add pg1 sw1-p1
+check ovn-nbctl acl-add pg1 from-lport 1002 "ip" allow-related
+check ovn-nbctl acl-add pg1 to-lport 1002 "ip" allow-related
+
+OVN_POPULATE_ARP
+ovn-nbctl --wait=hv sync
+
+ADD_NAMESPACES(sw0-p1)
+ADD_VETH(sw0-p1, sw0-p1, br-int, "10.0.0.3/24", "50:54:00:00:00:03", \
+         "10.0.0.1")
+
+
+ADD_NAMESPACES(sw0-p2)
+ADD_VETH(sw0-p2, sw0-p2, br-int, "10.0.0.4/24", "50:54:00:00:00:04", \
+         "10.0.0.1")
+
+ADD_NAMESPACES(sw1-p1)
+ADD_VETH(sw1-p1, sw1-p1, br-int, "20.0.0.4/24", "30:54:00:00:00:04", \
+         "20.0.0.1")
+
+wait_for_ports_up
+
+NS_CHECK_EXEC([sw0-p1], [ping -q -c 3 -i 0.3 -w 2 10.0.0.4 | FORMAT_PING], \
+[0], [dnl
+3 packets transmitted, 3 received, 0% packet loss, time 0ms
+])
+
+ovs-appctl dpctl/dump-flows
+
+# sw1-p1 may send IPv6 traffic.  So filter this out.  Since sw1-p1 has
+# ACLs configured, the datapath flows for the packets from sw1-p1 will have
+# matches on ct_state and ct_label fields.
+# Since sw0 doesn't have any ACLs, there should be no match on ct fields.
+AT_CHECK([ovs-appctl dpctl/dump-flows | grep ct_state | grep -v ipv6 -c], [1], [dnl
+0
+])
+
+AT_CHECK([ovs-appctl dpctl/dump-flows | grep ct_label | grep -v ipv6 -c], [1], [dnl
+0
+])
+
+# Add an ACL to sw0.
+check ovn-nbctl --wait=hv acl-add sw0 to-lport 1002 ip allow-related
+
+NS_CHECK_EXEC([sw0-p1], [ping -q -c 3 -i 0.3 -w 2 10.0.0.4 | FORMAT_PING], \
+[0], [dnl
+3 packets transmitted, 3 received, 0% packet loss, time 0ms
+])
+
+ovs-appctl dpctl/dump-flows
+
+AT_CHECK([ovs-appctl dpctl/dump-flows | grep ct_state | grep -v ipv6 -c], [0], [ignore])
+
+AT_CHECK([ovs-appctl dpctl/dump-flows | grep ct_label | grep -v ipv6 -c], [0], [ignore])
+
+# Clear ACL for sw0
+check ovn-nbctl --wait=hv clear logical_switch sw0 acls
+
+check ovs-appctl dpctl/del-flows
+
+check ovn-nbctl --wait=hv sync
+
+NS_CHECK_EXEC([sw0-p1], [ping -q -c 3 -i 0.3 -w 2 10.0.0.4 | FORMAT_PING], \
+[0], [dnl
+3 packets transmitted, 3 received, 0% packet loss, time 0ms
+])
+
+ovs-appctl dpctl/dump-flows
+
+AT_CHECK([ovs-appctl dpctl/dump-flows | grep ct_state | grep -v ipv6 -c], [1], [dnl
+0
+])
+
+AT_CHECK([ovs-appctl dpctl/dump-flows | grep ct_label | grep -v ipv6 -c], [1], [dnl
+0
+])
+
+OVS_APP_EXIT_AND_WAIT([ovn-controller])
+
+as ovn-sb
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+
+as ovn-nb
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+
+as northd
+OVS_APP_EXIT_AND_WAIT([NORTHD_TYPE])
+
+as
+OVS_TRAFFIC_VSWITCHD_STOP(["/failed to query port patch-.*/d
+/connection dropped.*/d"])
+
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD([
+AT_SETUP(ovn -- DNAT LR hairpin IPv4)
+AT_KEYWORDS(hairpin)
+
+ovn_start
+
+OVS_TRAFFIC_VSWITCHD_START()
+ADD_BR([br-int])
+
+# Set external-ids in br-int needed for ovn-controller
+ovs-vsctl \
+        -- set Open_vSwitch . external-ids:system-id=hv1 \
+        -- set Open_vSwitch . external-ids:ovn-remote=unix:$ovs_base/ovn-sb/ovn-sb.sock \
+        -- set Open_vSwitch . external-ids:ovn-encap-type=geneve \
+        -- set Open_vSwitch . external-ids:ovn-encap-ip=169.0.0.1 \
+        -- set bridge br-int fail-mode=secure other-config:disable-in-band=true
+
+start_daemon ovn-controller
+
+# Logical network:
+# Two VMs
+#   * VM1 with IP address 192.168.100.5
+#   * VM2 with IP address 192.168.100.6
+# The VMs connect to logical switch ls1.
+#
+# An external router with IP address 172.18.1.2. We simulate this with a network namespace.
+# There will be no traffic going here in this test.
+# The external router connects to logical switch ls-pub
+#
+# One logical router (lr1) connects to ls1 and ls-pub. The router port connected to ls-pub is
+# a gateway port.
+#   * The subnet connected to ls1 is 192.168.100.0/24. The Router IP address is 192.168.100.1
+#   * The subnet connected to ls-pub is 172.18.1.0/24. The Router IP address is 172.168.1.1
+# lr1 has the following attributes:
+#   * It has a "default" static route that sends traffic out the gateway router port.
+#   * It has a DNAT rule that translates 172.18.2.10 to 192.168.100.6 (VM2)
+#
+# In this test, we want to ensure that a ping from VM1 to IP address 172.18.2.10 reaches VM2.
+
+ovn-nbctl ls-add ls1
+ovn-nbctl lsp-add ls1 vm1 -- lsp-set-addresses vm1 "00:00:00:00:00:05 192.168.100.5"
+ovn-nbctl lsp-add ls1 vm2 -- lsp-set-addresses vm2 "00:00:00:00:00:06 192.168.100.6"
+
+ovn-nbctl ls-add ls-pub
+ovn-nbctl lsp-add ls-pub ext-router -- lsp-set-addresses ext-router "00:00:00:00:01:02 172.18.1.2"
+
+ovn-nbctl lr-add lr1
+ovn-nbctl lrp-add lr1 lr1-ls1 00:00:00:00:00:01 192.168.100.1/24
+ovn-nbctl lsp-add ls1 ls1-lr1                      \
+    -- lsp-set-type ls1-lr1 router                 \
+    -- lsp-set-addresses ls1-lr1 00:00:00:00:00:01 \
+    -- lsp-set-options ls1-lr1 router-port=lr1-ls1
+
+ovn-nbctl lrp-add lr1 lr1-ls-pub 00:00:00:00:01:01 172.18.1.1/24
+ovn-nbctl lrp-set-gateway-chassis lr1-ls-pub hv1
+ovn-nbctl lsp-add ls-pub ls-pub-lr1                      \
+    -- lsp-set-type ls-pub-lr1 router                    \
+    -- lsp-set-addresses ls-pub-lr1 00:00:00:00:01:01    \
+    -- lsp-set-options ls-pub-lr1 router-port=lr1-ls-pub
+
+ovn-nbctl lr-nat-add lr1 snat 172.18.1.1 192.168.100.0/24
+ovn-nbctl lr-nat-add lr1 dnat_and_snat 172.18.2.10 192.168.100.6
+ovn-nbctl lr-route-add lr1 0.0.0.0/0 172.18.1.2
+
+#ls1_uuid=$(fetch_column Port_Binding datapath logical_port=vm1)
+#ovn-sbctl create MAC_Binding ip=172.18.2.10 datapath=$ls1_uuid logical_port=vm2 mac="00:00:00:00:00:06"
+
+OVN_POPULATE_ARP
+ovn-nbctl --wait=hv sync
+
+ADD_NAMESPACES(vm1)
+ADD_VETH(vm1, vm1, br-int, "192.168.100.5/24", "00:00:00:00:00:05", \
+         "192.168.100.1")
+
+ADD_NAMESPACES(vm2)
+ADD_VETH(vm2, vm2, br-int, "192.168.100.6/24", "00:00:00:00:00:06", \
+         "192.168.100.1")
+
+ADD_NAMESPACES(ext-router)
+ADD_VETH(ext-router, ext-router, br-int, "172.18.1.2/24", "00:00:00:00:01:02", \
+         "172.18.1.1")
+
+# Let's take a quick look at the logical flows
+ovn-sbctl lflow-list
+
+# Let's check what ovn-trace says...
+ovn-trace ls1 'inport == "vm1" && eth.src == 00:00:00:00:00:05 && ip4.src == 192.168.100.5 && eth.dst == 00:00:00:00:00:01 && ip4.dst == 172.18.2.10 && ip.ttl == 32'
+
+# A ping from vm1 should hairpin in lr1 and successfully DNAT to vm2
+NS_CHECK_EXEC([vm1], [ping -q -c 3 -i 0.3 -w 2 172.18.2.10 | FORMAT_PING], \
+[0], [dnl
+3 packets transmitted, 3 received, 0% packet loss, time 0ms
+])
+kill $(pidof ovn-controller)
+
+as ovn-sb
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+
+as ovn-nb
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+
+as northd
+OVS_APP_EXIT_AND_WAIT([NORTHD_TYPE])
+
+as
+OVS_TRAFFIC_VSWITCHD_STOP(["/.*error receiving.*/d
+/.*terminating with signal 15.*/d"])
+
 AT_CLEANUP
 ])

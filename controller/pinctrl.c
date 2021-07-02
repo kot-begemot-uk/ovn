@@ -2698,6 +2698,106 @@ destroy_dns_cache(void)
     }
 }
 
+/* Populates dns_answer struct with base data.
+ * Copy the answer section
+ * Format of the answer section is
+ *  - NAME     -> The domain name
+ *  - TYPE     -> 2 octets containing one of the RR type codes
+ *  - CLASS    -> 2 octets which specify the class of the data
+ *                in the RDATA field.
+ *  - TTL      -> 32 bit unsigned int specifying the time
+ *                interval (in secs) that the resource record
+ *                 may be cached before it should be discarded.
+ *  - RDLENGTH -> 16 bit integer specifying the length of the
+ *                RDATA field.
+ *  - RDATA    -> a variable length string of octets that
+ *                describes the resource.
+ */
+static void
+dns_build_base_answer(
+    struct ofpbuf *dns_answer, const uint8_t *in_queryname,
+    uint16_t query_length, int query_type)
+{
+    ofpbuf_put(dns_answer, in_queryname, query_length);
+    put_be16(dns_answer, htons(query_type));
+    put_be16(dns_answer, htons(DNS_CLASS_IN));
+    put_be32(dns_answer, htonl(DNS_DEFAULT_RR_TTL));
+}
+
+/* Populates dns_answer struct with a TYPE A answer. */
+static void
+dns_build_a_answer(
+    struct ofpbuf *dns_answer, const uint8_t *in_queryname,
+    uint16_t query_length, const ovs_be32 addr)
+{
+    dns_build_base_answer(dns_answer, in_queryname, query_length,
+                          DNS_QUERY_TYPE_A);
+    put_be16(dns_answer, htons(sizeof(ovs_be32)));
+    put_be32(dns_answer, addr);
+}
+
+/* Populates dns_answer struct with a TYPE AAAA answer. */
+static void
+dns_build_aaaa_answer(
+    struct ofpbuf *dns_answer, const uint8_t *in_queryname,
+    uint16_t query_length, const struct in6_addr *addr)
+{
+    dns_build_base_answer(dns_answer, in_queryname, query_length,
+                          DNS_QUERY_TYPE_AAAA);
+    put_be16(dns_answer, htons(sizeof(*addr)));
+    ofpbuf_put(dns_answer, addr, sizeof(*addr));
+}
+
+/* Populates dns_answer struct with a TYPE PTR answer. */
+static void
+dns_build_ptr_answer(
+    struct ofpbuf *dns_answer, const uint8_t *in_queryname,
+    uint16_t query_length, const char *answer_data)
+{
+    char *encoded_answer;
+    uint16_t encoded_answer_length;
+
+    dns_build_base_answer(dns_answer, in_queryname, query_length,
+                          DNS_QUERY_TYPE_PTR);
+
+    /* Initialize string 2 chars longer than real answer:
+     * first label length and terminating zero-length label.
+     * If the answer_data is - vm1tst.ovn.org, it will be encoded as
+     *  - 0010 (Total length which is 16)
+     *  - 06766d31747374 (vm1tst)
+     *  - 036f766e (ovn)
+     *  - 036f7267 (org
+     *  - 00 (zero length field) */
+    encoded_answer_length = strlen(answer_data) + 2;
+    encoded_answer = (char *)xzalloc(encoded_answer_length);
+
+    put_be16(dns_answer, htons(encoded_answer_length));
+    uint8_t label_len_index = 0;
+    uint16_t label_len = 0;
+    char *encoded_answer_ptr = (char *)encoded_answer + 1;
+    while (*answer_data) {
+        if (*answer_data == '.') {
+            /* Label has ended.  Update the length of the label. */
+            encoded_answer[label_len_index] = label_len;
+            label_len_index += (label_len + 1);
+            label_len = 0; /* Init to 0 for the next label. */
+        } else {
+            *encoded_answer_ptr =  *answer_data;
+            label_len++;
+        }
+        encoded_answer_ptr++;
+        answer_data++;
+    }
+
+    /* This is required for the last label if it doesn't end with '.' */
+    if (label_len) {
+        encoded_answer[label_len_index] = label_len;
+    }
+
+    ofpbuf_put(dns_answer, encoded_answer, encoded_answer_length);
+    free(encoded_answer);
+}
+
 /* Called with in the pinctrl_handler thread context. */
 static void
 pinctrl_handle_dns_lookup(
@@ -2793,15 +2893,16 @@ pinctrl_handle_dns_lookup(
     }
 
     uint16_t query_type = ntohs(*ALIGNED_CAST(const ovs_be16 *, in_dns_data));
-    /* Supported query types - A, AAAA and ANY */
+    /* Supported query types - A, AAAA, ANY and PTR */
     if (!(query_type == DNS_QUERY_TYPE_A || query_type == DNS_QUERY_TYPE_AAAA
-          || query_type == DNS_QUERY_TYPE_ANY)) {
+          || query_type == DNS_QUERY_TYPE_ANY
+          || query_type == DNS_QUERY_TYPE_PTR)) {
         ds_destroy(&query_name);
         goto exit;
     }
 
     uint64_t dp_key = ntohll(pin->flow_metadata.flow.metadata);
-    const char *answer_ips = NULL;
+    const char *answer_data = NULL;
     struct shash_node *iter;
     SHASH_FOR_EACH (iter, &dns_cache) {
         struct dns_data *d = iter->data;
@@ -2811,75 +2912,57 @@ pinctrl_handle_dns_lookup(
                  * lowercase to perform case insensitive lookup
                  */
                 char *query_name_lower = str_tolower(ds_cstr(&query_name));
-                answer_ips = smap_get(&d->records, query_name_lower);
+                answer_data = smap_get(&d->records, query_name_lower);
                 free(query_name_lower);
-                if (answer_ips) {
+                if (answer_data) {
                     break;
                 }
             }
         }
 
-        if (answer_ips) {
+        if (answer_data) {
             break;
         }
     }
 
     ds_destroy(&query_name);
-    if (!answer_ips) {
+    if (!answer_data) {
         goto exit;
     }
 
-    struct lport_addresses ip_addrs;
-    if (!extract_ip_addresses(answer_ips, &ip_addrs)) {
-        goto exit;
-    }
 
     uint16_t ancount = 0;
     uint64_t dns_ans_stub[128 / 8];
     struct ofpbuf dns_answer = OFPBUF_STUB_INITIALIZER(dns_ans_stub);
 
-    if (query_type == DNS_QUERY_TYPE_A || query_type == DNS_QUERY_TYPE_ANY) {
-        for (size_t i = 0; i < ip_addrs.n_ipv4_addrs; i++) {
-            /* Copy the answer section */
-            /* Format of the answer section is
-             *  - NAME     -> The domain name
-             *  - TYPE     -> 2 octets containing one of the RR type codes
-             *  - CLASS    -> 2 octets which specify the class of the data
-             *                in the RDATA field.
-             *  - TTL      -> 32 bit unsigned int specifying the time
-             *                interval (in secs) that the resource record
-             *                 may be cached before it should be discarded.
-             *  - RDLENGTH -> 16 bit integer specifying the length of the
-             *                RDATA field.
-             *  - RDATA    -> a variable length string of octets that
-             *                describes the resource. In our case it will
-             *                be IP address of the domain name.
-             */
-            ofpbuf_put(&dns_answer, in_queryname, idx);
-            put_be16(&dns_answer, htons(DNS_QUERY_TYPE_A));
-            put_be16(&dns_answer, htons(DNS_CLASS_IN));
-            put_be32(&dns_answer, htonl(DNS_DEFAULT_RR_TTL));
-            put_be16(&dns_answer, htons(sizeof(ovs_be32)));
-            put_be32(&dns_answer, ip_addrs.ipv4_addrs[i].addr);
-            ancount++;
+    if (query_type == DNS_QUERY_TYPE_PTR) {
+        dns_build_ptr_answer(&dns_answer, in_queryname, idx, answer_data);
+        ancount++;
+    } else {
+        struct lport_addresses ip_addrs;
+        if (!extract_ip_addresses(answer_data, &ip_addrs)) {
+            goto exit;
         }
-    }
 
-    if (query_type == DNS_QUERY_TYPE_AAAA ||
-        query_type == DNS_QUERY_TYPE_ANY) {
-        for (size_t i = 0; i < ip_addrs.n_ipv6_addrs; i++) {
-            ofpbuf_put(&dns_answer, in_queryname, idx);
-            put_be16(&dns_answer, htons(DNS_QUERY_TYPE_AAAA));
-            put_be16(&dns_answer, htons(DNS_CLASS_IN));
-            put_be32(&dns_answer, htonl(DNS_DEFAULT_RR_TTL));
-            const struct in6_addr *ip6 = &ip_addrs.ipv6_addrs[i].addr;
-            put_be16(&dns_answer, htons(sizeof *ip6));
-            ofpbuf_put(&dns_answer, ip6, sizeof *ip6);
-            ancount++;
+        if (query_type == DNS_QUERY_TYPE_A ||
+            query_type == DNS_QUERY_TYPE_ANY) {
+            for (size_t i = 0; i < ip_addrs.n_ipv4_addrs; i++) {
+                dns_build_a_answer(&dns_answer, in_queryname, idx,
+                                   ip_addrs.ipv4_addrs[i].addr);
+                ancount++;
+            }
         }
-    }
 
-    destroy_lport_addresses(&ip_addrs);
+        if (query_type == DNS_QUERY_TYPE_AAAA ||
+            query_type == DNS_QUERY_TYPE_ANY) {
+            for (size_t i = 0; i < ip_addrs.n_ipv6_addrs; i++) {
+                dns_build_aaaa_answer(&dns_answer, in_queryname, idx,
+                                      &ip_addrs.ipv6_addrs[i].addr);
+                ancount++;
+            }
+        }
+        destroy_lport_addresses(&ip_addrs);
+    }
 
     if (!ancount) {
         ofpbuf_uninit(&dns_answer);
@@ -6819,54 +6902,71 @@ next:
 static bool
 pinctrl_check_bfd_msg(const struct flow *ip_flow, struct dp_packet *pkt_in)
 {
+    static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(30, 30);
     if (ip_flow->dl_type != htons(ETH_TYPE_IP) &&
         ip_flow->dl_type != htons(ETH_TYPE_IPV6)) {
+        VLOG_DBG_RL(&rl, "BFD action on non-IP packet (%"PRIx16")",
+                    ntohs(ip_flow->dl_type));
         return false;
     }
 
     if (ip_flow->nw_proto != IPPROTO_UDP) {
+        VLOG_DBG_RL(&rl, "BFD action on non-UDP packet %02x",
+                    ip_flow->nw_proto);
         return false;
     }
 
     struct udp_header *udp_hdr = dp_packet_l4(pkt_in);
     if (udp_hdr->udp_dst != htons(BFD_DEST_PORT)) {
+        VLOG_DBG_RL(&rl, "BFD action on wrong UDP dst port (%"PRIx16")",
+                    ntohs(udp_hdr->udp_dst));
         return false;
     }
 
     const struct bfd_msg *msg = dp_packet_get_udp_payload(pkt_in);
     uint8_t version = msg->vers_diag >> 5;
     if (version != BFD_VERSION) {
+        VLOG_DBG_RL(&rl, "BFD action: unsupported version %d", version);
         return false;
     }
 
     enum bfd_flags flags = msg->flags & BFD_FLAGS_MASK;
     if (flags & BFD_FLAG_AUTH) {
         /* AUTH not supported yet */
+        VLOG_DBG_RL(&rl, "BFD action: AUTH not supported yet");
         return false;
     }
 
     if (msg->length < BFD_PACKET_LEN) {
+        VLOG_DBG_RL(&rl, "BFD action: packet is too short %d", msg->length);
         return false;
     }
 
     if (!msg->mult) {
+        VLOG_DBG_RL(&rl, "BFD action: multiplier not set");
         return false;
     }
 
     if (flags & BFD_FLAG_MULTIPOINT) {
+        VLOG_DBG_RL(&rl, "BFD action: MULTIPOINT not supported yet");
         return false;
     }
 
     if (!msg->my_disc) {
+        VLOG_DBG_RL(&rl, "BFD action: my_disc not set");
         return false;
     }
 
     if ((flags & BFD_FLAG_FINAL) && (flags & BFD_FLAG_POLL)) {
+        VLOG_DBG_RL(&rl, "BFD action: wrong flags combination %08x", flags);
         return false;
     }
 
     enum bfd_state peer_state = msg->flags >> 6;
     if (peer_state >= BFD_STATE_INIT && !msg->your_disc) {
+        VLOG_DBG_RL(&rl,
+                    "BFD action: remote state is %s and your_disc is not set",
+                    bfd_get_status(peer_state));
         return false;
     }
 
@@ -6879,8 +6979,6 @@ pinctrl_handle_bfd_msg(struct rconn *swconn, const struct flow *ip_flow,
     OVS_REQUIRES(pinctrl_mutex)
 {
     if (!pinctrl_check_bfd_msg(ip_flow, pkt_in)) {
-        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
-        VLOG_WARN_RL(&rl, "BFD packet discarded");
         return;
     }
 
@@ -6894,9 +6992,9 @@ pinctrl_handle_bfd_msg(struct rconn *swconn, const struct flow *ip_flow,
     const struct bfd_msg *msg = dp_packet_get_udp_payload(pkt_in);
     struct bfd_entry *entry =
         pinctrl_find_bfd_monitor_entry_by_disc(ip_src, msg->your_disc);
-    free(ip_src);
 
     if (!entry) {
+        free(ip_src);
         return;
     }
 
@@ -6908,6 +7006,13 @@ pinctrl_handle_bfd_msg(struct rconn *swconn, const struct flow *ip_flow,
                                                entry->local_min_rx);
 
     enum bfd_state peer_state = msg->flags >> 6;
+
+    static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(30, 30);
+    VLOG_DBG_RL(&rl, "rx BFD packets from %s, remote state %s, local state %s",
+                ip_src, bfd_get_status(peer_state),
+                bfd_get_status(entry->state));
+    free(ip_src);
+
     if (peer_state == BFD_STATE_ADMIN_DOWN &&
         entry->state >= BFD_STATE_INIT) {
         entry->state = BFD_STATE_DOWN;

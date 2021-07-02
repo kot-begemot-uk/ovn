@@ -818,9 +818,9 @@ read_address_sets(void)
 
     const struct sbrec_address_set *sbas;
     SBREC_ADDRESS_SET_FOR_EACH (sbas, ovnsb_idl) {
-        expr_const_sets_add(&address_sets, sbas->name,
-                           (const char *const *) sbas->addresses,
-                           sbas->n_addresses, true);
+        expr_const_sets_add_integers(&address_sets, sbas->name,
+                                     (const char *const *) sbas->addresses,
+                                     sbas->n_addresses);
     }
 }
 
@@ -831,9 +831,9 @@ read_port_groups(void)
 
     const struct sbrec_port_group *sbpg;
     SBREC_PORT_GROUP_FOR_EACH (sbpg, ovnsb_idl) {
-        expr_const_sets_add(&port_groups, sbpg->name,
-                           (const char *const *) sbpg->ports,
-                           sbpg->n_ports, false);
+        expr_const_sets_add_strings(&port_groups, sbpg->name,
+                                    (const char *const *) sbpg->ports,
+                                    sbpg->n_ports, NULL);
     }
 }
 
@@ -973,7 +973,7 @@ parse_lflow_for_datapath(const struct sbrec_logical_flow *sblf,
             match = expr_simplify(match);
             match = expr_evaluate_condition(match,
                                             ovntrace_is_chassis_resident,
-                                            NULL, NULL);
+                                            NULL);
         }
 
         struct ovntrace_flow *flow = xzalloc(sizeof *flow);
@@ -2297,10 +2297,20 @@ execute_ct_nat(const struct ovnact_ct_nat *ct_nat,
         if (ct_nat->family == AF_INET) {
             ds_put_format(&s, "(ip4.%s="IP_FMT")", direction,
                           IP_ARGS(ct_nat->ipv4));
+            if (is_dst) {
+                ct_flow.nw_dst = ct_nat->ipv4;
+            } else {
+                ct_flow.nw_src = ct_nat->ipv4;
+            }
         } else {
             ds_put_format(&s, "(ip6.%s=", direction);
             ipv6_format_addr(&ct_nat->ipv6, &s);
             ds_put_char(&s, ')');
+            if (is_dst) {
+                ct_flow.ipv6_dst = ct_nat->ipv6;
+            } else {
+                ct_flow.ipv6_src = ct_nat->ipv6;
+            }
         }
 
         uint8_t state = is_dst ? CS_DST_NAT : CS_SRC_NAT;

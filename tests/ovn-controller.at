@@ -151,23 +151,24 @@ sysid=$(ovs-vsctl get Open_vSwitch . external_ids:system-id)
 check_datapath_type () {
     datapath_type=$1
     chassis_datapath_type=$(ovn-sbctl get Chassis ${sysid} other_config:datapath-type | sed -e 's/"//g') #"
-    test "${datapath_type}" = "${chassis_datapath_type}"
+    ovs_datapath_type=$(ovs-vsctl get Bridge br-int datapath-type)
+    test "${datapath_type}" = "${chassis_datapath_type}" && test "${datapath_type}" = "${ovs_datapath_type}"
 }
 
-OVS_WAIT_UNTIL([check_datapath_type ""])
+OVS_WAIT_UNTIL([check_datapath_type system])
 
 ovs-vsctl set Bridge br-int datapath-type=foo
 OVS_WAIT_UNTIL([check_datapath_type foo])
 
 # Change "ovn-bridge-mappings" value. It should not change the "datapath-type".
 ovs-vsctl set Open_vSwitch . external_ids:ovn-bridge-mappings=foo-mapping
-check_datapath_type foo
+AT_CHECK([check_datapath_type foo])
 
 ovs-vsctl set Bridge br-int datapath-type=bar
 OVS_WAIT_UNTIL([check_datapath_type bar])
 
 ovs-vsctl set Bridge br-int datapath-type=\"\"
-OVS_WAIT_UNTIL([check_datapath_type ""])
+OVS_WAIT_UNTIL([check_datapath_type system])
 
 # Set the datapath_type in external_ids:ovn-bridge-datapath-type.
 ovs-vsctl set Open_vSwitch . external_ids:ovn-bridge-datapath-type=foo
@@ -176,11 +177,9 @@ OVS_WAIT_UNTIL([check_datapath_type foo])
 # Change the br-int's datapath type to bar.
 # It should be reset to foo since ovn-bridge-datapath-type is configured.
 ovs-vsctl set Bridge br-int datapath-type=bar
-OVS_WAIT_UNTIL([test foo = `ovs-vsctl get Bridge br-int datapath-type`])
 OVS_WAIT_UNTIL([check_datapath_type foo])
 
 ovs-vsctl set Open_vSwitch . external_ids:ovn-bridge-datapath-type=foobar
-OVS_WAIT_UNTIL([test foobar = `ovs-vsctl get Bridge br-int datapath-type`])
 OVS_WAIT_UNTIL([check_datapath_type foobar])
 
 expected_iface_types=$(ovs-vsctl get Open_vSwitch . iface_types | tr -d '[[]] ""')
@@ -546,6 +545,59 @@ primary lport : [[lsp1]]
 ])
     done
 done
+
+OVN_CLEANUP([hv1])
+AT_CLEANUP
+
+AT_SETUP([ovn-controller - ssl files change when using command line options])
+AT_KEYWORDS([ovn])
+AT_SKIP_IF([test "$HAVE_OPENSSL" = no])
+PKIDIR="$(cd $abs_top_builddir/tests && pwd)"
+AT_SKIP_IF([expr "$PKIDIR" : ".*[[ 	'\"
+\\]]"])
+ovn_start
+
+net_add n1
+sim_add hv1
+ovs-vsctl add-br br-phys
+ovn_attach n1 br-phys 192.168.0.1
+
+key=testpki-hv1-privkey.pem
+cert=testpki-hv1-cert.pem
+cacert=testpki-cacert.pem
+
+key2=testpki-hv2-privkey.pem
+cert3=testpki-hv3-cert.pem
+
+# Use mismatched key and cert when restarting ovn-controller
+cp $PKIDIR/$key2 $key
+cp $PKIDIR/$cert3 $cert
+cp $PKIDIR/$cacert $cacert
+
+# Restart ovn-controller using command line options for SSL parameters
+OVS_APP_EXIT_AND_WAIT([ovn-controller])
+check ovs-vsctl del-ssl
+start_daemon ovn-controller -p $key -c $cert -C $cacert
+
+# SSL should not connect because of key and cert mismatch
+OVS_WAIT_UNTIL([ovn-appctl -t ovn-controller connection-status], [0], [not connected])
+
+# Modify the files with the correct key and cert, and reconnect should succeed
+cp $PKIDIR/$key $key
+cp $PKIDIR/$cert $cert
+
+OVS_WAIT_UNTIL([ovn-appctl -t ovn-controller connection-status], [0], [connected])
+
+# Remove the files and expect the connection to drop
+rm $key $cert
+OVS_WAIT_UNTIL([ovn-appctl -t ovn-controller connection-status], [0], [not connected])
+
+# Restore the files again and expect the connection to recover
+cp $PKIDIR/$key $key
+cp $PKIDIR/$cert $cert
+OVS_WAIT_UNTIL([ovn-appctl -t ovn-controller connection-status], [0], [connected])
+
+cat hv1/ovn-controller.log
 
 OVN_CLEANUP([hv1])
 AT_CLEANUP

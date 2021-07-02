@@ -11,9 +11,9 @@ jobs:
   build-linux:
     env:
       dependencies: |
-        automake libtool gcc bc libjemalloc1 libjemalloc-dev    \
+        automake libtool gcc bc libjemalloc2 libjemalloc-dev    \
         libssl-dev llvm-dev libelf-dev libnuma-dev libpcap-dev  \
-        selinux-policy-dev
+        selinux-policy-dev ncat
       m32_dependecies: gcc-multilib
       CC:          ${{ matrix.compiler }}
       LIBS:        ${{ matrix.libs }}
@@ -23,7 +23,7 @@ jobs:
       ASAN:        ${{ matrix.asan }}
 
     name: linux ${{ join(matrix.*, ' ') }}
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-20.04
 
     strategy:
       fail-fast: false
@@ -35,7 +35,7 @@ jobs:
             opts:         --disable-ssl
 
           - compiler:     gcc
-            testsuite:    test
+            testsuite:    system-test
           - compiler:     clang
             testsuite:    test
             asan:         asan
@@ -76,6 +76,9 @@ jobs:
     - name: update APT cache
       run:  sudo apt update
 
+    - name: remove netcat-openbsd
+      run:  sudo apt remove -y netcat-openbsd
+
     - name: install required dependencies
       run:  sudo apt install -y ${{ env.dependencies }}
 
@@ -86,6 +89,12 @@ jobs:
     - name: install 32-bit dependencies
       if:   matrix.m32 != ''
       run:  sudo apt install -y ${{ env.m32_dependecies }}
+
+    - name: fix up /etc/hosts
+      # https://github.com/actions/virtual-environments/issues/3353
+      run:  |
+        cat /etc/hosts
+        sudo sed -i "/don't remove this line/d" /etc/hosts || true
 
     - name: update PATH
       run:  |
@@ -113,6 +122,9 @@ jobs:
         mkdir logs
         cp config.log ./logs/
         cp -r ./*/_build/sub/tests/testsuite.* ./logs/ || true
+        # System tests are run as root, need to adjust permissions.
+        sudo chmod -R +r ./tests/system-kmod-testsuite.* || true
+        cp -r ./tests/system-kmod-testsuite.* ./logs/ || true
         tar -czvf logs.tgz logs/
 
     - name: upload logs on failure

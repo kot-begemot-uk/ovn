@@ -35,6 +35,7 @@ Name                               Email
 ================================== ===============================================
 Aaron Conole                       aconole@redhat.com
 Aaron Rosen                        arosen@clemson.edu
+Aidan Shribman                     aidan.shribman@gmail.com
 Alan Pevec                         alan.pevec@redhat.com
 Alexander Duyck                    alexander.h.duyck@redhat.com
 Alexandru Copot                    alex.mihai.c@gmail.com
@@ -141,6 +142,7 @@ Eric Sesterhenn                    eric.sesterhenn@lsexperts.de
 Ethan J. Jackson                   ejj@eecs.berkeley.edu
 Ethan Rahn                         erahn@arista.com
 Eziz Durdyyev                      ezizdurdy@gmail.com
+Fabrizio D'Angelo                  fdangelo@redhat.com
 Flavio Fernandes                   flavio@flaviof.com
 Flavio Leitner                     fbl@redhat.com
 Francesco Fusco                    ffusco@redhat.com
@@ -423,6 +425,7 @@ xieyanker                          xjsisnice@gmail.com
 xushengping                        shengping.xu@huawei.com
 yinpeijun                          yinpeijun@huawei.com
 zangchuanqiang                     zangchuanqiang@huawei.com
+zhang yanxian                      zhangyanxian@pmlabs.com.cn
 zhaojingjing                       zhao.jingjing1@zte.com.cn
 zhongbaisong                       zhongbaisong@huawei.com
 zhaozhanxu                         zhaozhanxu@163.com

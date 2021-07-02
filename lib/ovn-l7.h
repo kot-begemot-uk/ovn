@@ -45,6 +45,14 @@ struct bfd_msg {
 };
 BUILD_ASSERT_DECL(BFD_PACKET_LEN == sizeof(struct bfd_msg));
 
+#define DNS_QUERY_TYPE_A        0x01
+#define DNS_QUERY_TYPE_AAAA     0x1c
+#define DNS_QUERY_TYPE_ANY      0xff
+#define DNS_QUERY_TYPE_PTR      0x0c
+
+#define DNS_CLASS_IN            0x01
+#define DNS_DEFAULT_RR_TTL      3600
+
 /* Generic options map which is used to store dhcpv4 opts and dhcpv6 opts. */
 struct gen_opts_map {
     struct hmap_node hmap_node;
@@ -73,6 +81,7 @@ struct gen_opts_map {
 #define DHCP_OPT_DNS_SERVER  DHCP_OPTION("dns_server", 6, "ipv4")
 #define DHCP_OPT_LOG_SERVER  DHCP_OPTION("log_server", 7, "ipv4")
 #define DHCP_OPT_LPR_SERVER  DHCP_OPTION("lpr_server", 9, "ipv4")
+#define DHCP_OPT_HOSTNAME    DHCP_OPTION("hostname", 12, "str")
 #define DHCP_OPT_DOMAIN_NAME DHCP_OPTION("domain_name", 15, "str")
 #define DHCP_OPT_SWAP_SERVER DHCP_OPTION("swap_server", 16, "ipv4")
 

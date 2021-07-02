@@ -1061,11 +1061,12 @@ expr_constant_set_destroy(struct expr_constant_set *cs)
 }
 
 /* Adds an constant set named 'name' to 'const_sets', replacing any existing
- * constant set entry with the given name. */
+ * constant set entry with the given name. The 'values' must be strings that
+ * can be converted to integers or masked integers, such as IP addresses.
+ * Values that can't be converted are skipped. */
 void
-expr_const_sets_add(struct shash *const_sets, const char *name,
-                    const char *const *values, size_t n_values,
-                    bool convert_to_integer)
+expr_const_sets_add_integers(struct shash *const_sets, const char *name,
+                             const char *const *values, size_t n_values)
 {
     /* Replace any existing entry for this name. */
     expr_const_sets_remove(const_sets, name);
@@ -1074,35 +1075,59 @@ expr_const_sets_add(struct shash *const_sets, const char *name,
     cs->in_curlies = true;
     cs->n_values = 0;
     cs->values = xmalloc(n_values * sizeof *cs->values);
-    if (convert_to_integer) {
-        cs->type = EXPR_C_INTEGER;
-        for (size_t i = 0; i < n_values; i++) {
-            /* Use the lexer to convert each constant set into the proper
-             * integer format. */
-            struct lexer lex;
-            lexer_init(&lex, values[i]);
-            lexer_get(&lex);
-            if (lex.token.type != LEX_T_INTEGER
-                && lex.token.type != LEX_T_MASKED_INTEGER) {
-                VLOG_WARN("Invalid constant set entry: '%s', token type: %d",
-                          values[i], lex.token.type);
-            } else {
-                union expr_constant *c = &cs->values[cs->n_values++];
-                c->value = lex.token.value;
-                c->format = lex.token.format;
-                c->masked = lex.token.type == LEX_T_MASKED_INTEGER;
-                if (c->masked) {
-                    c->mask = lex.token.mask;
-                }
-            }
-            lexer_destroy(&lex);
-        }
-    } else {
-        cs->type = EXPR_C_STRING;
-        for (size_t i = 0; i < n_values; i++) {
+    cs->type = EXPR_C_INTEGER;
+    for (size_t i = 0; i < n_values; i++) {
+        /* Use the lexer to convert each constant set into the proper
+         * integer format. */
+        struct lexer lex;
+        lexer_init(&lex, values[i]);
+        lexer_get(&lex);
+        if (lex.token.type != LEX_T_INTEGER
+            && lex.token.type != LEX_T_MASKED_INTEGER) {
+            VLOG_WARN("Invalid constant set entry: '%s', token type: %d",
+                      values[i], lex.token.type);
+        } else {
             union expr_constant *c = &cs->values[cs->n_values++];
-            c->string = xstrdup(values[i]);
+            c->value = lex.token.value;
+            c->format = lex.token.format;
+            c->masked = lex.token.type == LEX_T_MASKED_INTEGER;
+            if (c->masked) {
+                c->mask = lex.token.mask;
+            }
         }
+        lexer_destroy(&lex);
+    }
+
+    shash_add(const_sets, name, cs);
+}
+
+/* Adds an constant set named 'name' to 'const_sets', replacing any existing
+ * constant set entry with the given name. Unlike expr_const_sets_add_integers,
+ * the 'values' will not be converted but stored as is.
+ * 'filter', if not NULL, specifies a set of eligible values that are allowed
+ * to be added from 'values'. */
+void
+expr_const_sets_add_strings(struct shash *const_sets, const char *name,
+                            const char *const *values, size_t n_values,
+                            const struct sset *filter)
+{
+    /* Replace any existing entry for this name. */
+    expr_const_sets_remove(const_sets, name);
+
+    struct expr_constant_set *cs = xzalloc(sizeof *cs);
+    cs->in_curlies = true;
+    cs->n_values = 0;
+    cs->values = xmalloc(n_values * sizeof *cs->values);
+    cs->type = EXPR_C_STRING;
+    for (size_t i = 0; i < n_values; i++) {
+        if (filter && !sset_find(filter, values[i])) {
+            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(100, 10);
+            VLOG_DBG_RL(&rl, "Skip constant set entry '%s' for '%s'",
+                        values[i], name);
+            continue;
+        }
+        union expr_constant *c = &cs->values[cs->n_values++];
+        c->string = xstrdup(values[i]);
     }
 
     shash_add(const_sets, name, cs);
@@ -2096,16 +2121,13 @@ static struct expr *
 expr_evaluate_condition__(struct expr *expr,
                           bool (*is_chassis_resident)(const void *c_aux,
                                                       const char *port_name),
-                          const void *c_aux, bool *condition_present)
+                          const void *c_aux)
 {
     bool result;
 
     switch (expr->cond.type) {
     case EXPR_COND_CHASSIS_RESIDENT:
         result = is_chassis_resident(c_aux, expr->cond.string);
-        if (condition_present != NULL) {
-            *condition_present = true;
-        }
         break;
 
     default:
@@ -2121,7 +2143,7 @@ struct expr *
 expr_evaluate_condition(struct expr *expr,
                         bool (*is_chassis_resident)(const void *c_aux,
                                                     const char *port_name),
-                        const void *c_aux, bool *condition_present)
+                        const void *c_aux)
 {
     struct expr *sub, *next;
 
@@ -2131,15 +2153,14 @@ expr_evaluate_condition(struct expr *expr,
          LIST_FOR_EACH_SAFE (sub, next, node, &expr->andor) {
             ovs_list_remove(&sub->node);
             struct expr *e = expr_evaluate_condition(sub, is_chassis_resident,
-                                                     c_aux, condition_present);
+                                                     c_aux);
             e = expr_fix(e);
             expr_insert_andor(expr, next, e);
         }
         return expr_fix(expr);
 
     case EXPR_T_CONDITION:
-        return expr_evaluate_condition__(expr, is_chassis_resident, c_aux,
-                                         condition_present);
+        return expr_evaluate_condition__(expr, is_chassis_resident, c_aux);
 
     case EXPR_T_CMP:
     case EXPR_T_BOOLEAN:
@@ -2452,7 +2473,7 @@ crush_and_numeric(struct expr *expr, const struct expr_symbol *symbol)
             free(or);
             return cmp;
         } else {
-            return or;
+            return crush_cmps(or, symbol);
         }
     } else {
         /* Transform "x && (a0 || a1) && (b0 || b1) && ..." into
@@ -3492,7 +3513,7 @@ expr_parse_microflow__(struct lexer *lexer,
 
     e = expr_simplify(e);
     e = expr_evaluate_condition(e, microflow_is_chassis_resident_cb,
-                                NULL, NULL);
+                                NULL);
     e = expr_normalize(e);
 
     struct match m = MATCH_CATCHALL_INITIALIZER;

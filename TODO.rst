@@ -53,8 +53,6 @@ OVN To-do List
 
 * Hitless upgrade, especially for data plane.
 
-* Use OpenFlow "bundles" for transactional data plane updates.
-
 * Dynamic IP to MAC binding enhancements.
 
   OVN has basic support for establishing IP to MAC bindings dynamically, using
@@ -166,3 +164,9 @@ OVN To-do List
     to find a way of determining if routing has already been executed (on a
     different hypervisor) for the IP multicast packet being processed locally
     in the router pipeline.
+
+* ovn-controller Incremental processing
+
+  * physical.c has a global simap -localvif_to_ofport which stores the
+    local OVS interfaces and the ofport numbers. Move this to the engine data
+    of the engine data node - ed_type_pflow_output.
